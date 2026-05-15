@@ -28,11 +28,8 @@ A robust, automated installer for setting up a DNSTT (SlowDNS) tunnel server on 
 To install the server directly on your VPS, run the following automated command:
 
 ```bash
-wget -qO unida-installer.sh https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPOSITORY/main/unida-installer.sh
-sudo bash unida-installer.sh
+wget -qO unida.sh https://raw.githubusercontent.com/Seven7388/Unida/main/public/unida-installer.sh && sudo bash unida.sh
 ```
-
-*(You will need to replace the URL above with the raw URL to your own GitHub file).*
 
 ### DNS Configuration Options During Setup
 
