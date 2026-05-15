@@ -120,9 +120,22 @@ echo "==> MTU   : ${MTU}"
 sleep 1
 
 echo "==> Kuzima old dnstt/slowdns services kama zipo..."
-for svc in dnstt-smart dnstt dnstt-server dnstt-b dnstt-proxy dnsttloc slowdns dnstt-unida dnstt-unida-proxy; do
+for svc in dnstt-smart dnstt dnstt-server dnstt-b dnstt-proxy dnsttloc slowdns dnstt-unida dnstt-unida-proxy badvpn-udpgw bind9 dnsmasq; do
   systemctl disable --now "${svc}.service" >/dev/null 2>&1 || true
 done
+
+echo "==> Clearing required ports (Killing any blocking processes)..."
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k 53/udp >/dev/null 2>&1 || true
+  fuser -k 53/tcp >/dev/null 2>&1 || true
+  fuser -k 5300/udp >/dev/null 2>&1 || true
+  fuser -k 7300/tcp >/dev/null 2>&1 || true
+fi
+if command -v lsof >/dev/null 2>&1; then
+  kill -9 $(lsof -t -i:53 -sUDP:LISTEN) 2>/dev/null || true
+  kill -9 $(lsof -t -i:5300 -sUDP:LISTEN) 2>/dev/null || true
+  kill -9 $(lsof -t -i:7300 -sTCP:LISTEN) 2>/dev/null || true
+fi
 
 # Free port 53 from systemd-resolved
 if [ -f /etc/systemd/resolved.conf ]; then
@@ -212,16 +225,16 @@ WantedBy=multi-user.target
 EOF
 
 echo "==> Kuunda EDNS proxy (512 <-> 1800)..."
-cat >/usr/local/bin/dnstt-edns-proxy.py <<'PY'
+cat >/usr/local/bin/dnstt-edns-proxy.py <<EOF_PY
 #!/usr/bin/env python3
 import socket, threading, struct
 
 LISTEN_HOST="0.0.0.0"
-LISTEN_PORT=53
+LISTEN_PORT=${PROXY_PORT}
 UPSTREAM_HOST="127.0.0.1"
-UPSTREAM_PORT=5300
+UPSTREAM_PORT=${DNSTT_PORT}
 EXTERNAL_EDNS_SIZE=512
-INTERNAL_EDNS_SIZE=1800
+INTERNAL_EDNS_SIZE=${MTU}
 
 def patch_edns_udp_size(data: bytes, new_size: int) -> bytes:
     if len(data) < 12: return data
@@ -298,7 +311,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-PY
+EOF_PY
 chmod +x /usr/local/bin/dnstt-edns-proxy.py
 
 cat >/etc/systemd/system/dnstt-unida-proxy.service <<EOF
@@ -537,6 +550,9 @@ sysctl -p >/dev/null 2>&1
 ETH=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
 if [ -n "$ETH" ]; then
   iptables -t nat -A POSTROUTING -o "$ETH" -j MASQUERADE
+  if [ "${PROXY_PORT}" != "53" ]; then
+    iptables -t nat -A PREROUTING -i "$ETH" -p udp --dport 53 -j REDIRECT --to-ports "${PROXY_PORT}"
+  fi
   iptables-save > /etc/iptables.up.rules
 
   # Ensure it restores on boot
@@ -566,6 +582,7 @@ fi
 if command -v ufw >/dev/null 2>&1; then
   ufw allow 22/tcp >/dev/null 2>&1 || true
   ufw allow 53/udp >/dev/null 2>&1 || true
+  ufw allow ${PROXY_PORT}/udp >/dev/null 2>&1 || true
   ufw allow 7300/tcp >/dev/null 2>&1 || true
   ufw reload >/dev/null 2>&1 || true
 fi

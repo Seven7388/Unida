@@ -6,6 +6,8 @@ A robust, automated installer for setting up a DNSTT (SlowDNS) tunnel server on 
 
 - **Instant Setup:** Downloads the core DNSTT server binary, creates systemd background services, and generates keys automatically.
 - **Advanced Networking:** Automatically configures IPv4 forwarding (`ip_forward`), `iptables` NAT Masquerading, and SSH port forwarding (`AllowTcpForwarding`, `GatewayPorts`) so that clients instantly have internet access without extra manual configuration.
+- **Port Collision Prevention:** Automatically stops conflicting services (like `bind9`, `dnsmasq`) and proactively kills any zombie processes blocking required ports (`53`, `5300`, `7300`) ensuring a clean setup.
+- **Smart Port Routing:** If you choose to run the EDNS proxy on a custom port, `iptables` rules will automatically route default port 53 traffic incoming from apps like HTTP Injector directly to your custom port, guaranteeing client compatibility.
 - **BadVPN UDPGW:** Compiles and runs a dedicated UDP over TCP Gateway for handling VoIP calls (WhatsApp) and online gaming across the DNS tunnel seamlessly (runs on port 7300).
 - **EDNS Proxy:** Includes an intelligent Python-based EDNS UDP size proxy (`512` <-> `1800`) to ensure DNS requests pass through strict firewalls and routers smoothly.
 - **Single-File Installer:** The installer script seamlessly embeds the management terminal tool, meaning you only need one script to install everything perfectly.
