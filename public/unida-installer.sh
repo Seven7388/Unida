@@ -58,12 +58,12 @@ if [ -z "$TDOMAIN" ]; then
       read -rp "Enter Cloudflare API Token (Requires Edit Zone DNS permission): " CF_TOKEN
       read -rp "Enter your Base Domain (e.g. yours.com): " BASE_DOMAIN
       
-      # Disable pipefail temporarily because `head -c 4` and `grep | head` can trigger SIGPIPE and kill the script under `set -e`
+      # Disable pipefail temporarily because `head -c 1` and `grep | head` can trigger SIGPIPE and kill the script under `set -e`
       set +euo pipefail
       
-      RANDOM_STR=$(tr -dc a-z0-9 </dev/urandom | head -c 4)
-      NS_PREFIX="ns-${RANDOM_STR}"
-      TUN_PREFIX="tun-${RANDOM_STR}"
+      RANDOM_STR=$(tr -dc a-z0-9 </dev/urandom | head -c 1)
+      NS_PREFIX="n${RANDOM_STR}"
+      TUN_PREFIX="t${RANDOM_STR}"
       
       echo "[*] Automatically generated Name Server prefix: ${NS_PREFIX}"
       echo "[*] Automatically generated Tunnel prefix: ${TUN_PREFIX}"
