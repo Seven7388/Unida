@@ -137,9 +137,9 @@ if command -v fuser >/dev/null 2>&1; then
   fuser -k 7300/tcp >/dev/null 2>&1 || true
 fi
 if command -v lsof >/dev/null 2>&1; then
-  kill -9 $(lsof -t -i:53 -sUDP:LISTEN 2>/dev/null) 2>/dev/null || true
-  kill -9 $(lsof -t -i:5300 -sUDP:LISTEN 2>/dev/null) 2>/dev/null || true
-  kill -9 $(lsof -t -i:7300 -sTCP:LISTEN 2>/dev/null) 2>/dev/null || true
+  kill -9 $(lsof -t -i:53 -sUDP:LISTEN) 2>/dev/null || true
+  kill -9 $(lsof -t -i:5300 -sUDP:LISTEN) 2>/dev/null || true
+  kill -9 $(lsof -t -i:7300 -sTCP:LISTEN) 2>/dev/null || true
 fi
 
 # Free port 53 from systemd-resolved
@@ -161,28 +161,10 @@ if [ -f /etc/systemd/resolved.conf ]; then
 fi
 
 echo "==> Installing packages..."
-echo "    (Please wait, this may take a moment...)"
 apt-get update -y >/dev/null 2>&1
-DEBIAN_FRONTEND=noninteractive apt-get install -y curl python3 wget git cmake make gcc g++ build-essential dante-server >/dev/null 2>&1 || true
-
-echo "==> Configuring Lightweight SOCKS5 Server (Dante)..."
-ETH=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
-cat >/etc/danted.conf <<EOF
-logoutput: syslog
-user.privileged: root
-user.unprivileged: nobody
-internal: 127.0.0.1 port = 1080
-external: $ETH
-socksmethod: none
-clientmethod: none
-client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
-socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
-EOF
-systemctl restart danted >/dev/null 2>&1 || true
-systemctl enable danted >/dev/null 2>&1 || true
+DEBIAN_FRONTEND=noninteractive apt-get install -y curl python3 wget git cmake make gcc g++ build-essential >/dev/null 2>&1 || true
 
 echo "==> Kupakua and Compiling BadVPN UDPGW (UDP via TCP)..."
-echo "    (Please wait 1-3 minutes while BadVPN compiles from source...)"
 if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
   cd /tmp
   git clone https://github.com/ambrop72/badvpn.git >/dev/null 2>&1 || true
@@ -239,20 +221,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=-/etc/default/dnstt-unida
-ExecStart=/usr/local/bin/dnstt-server -udp 127.0.0.1:${DNSTT_PORT} -mtu ${MTU} -privkey-file /etc/dnstt/server.key ${TDOMAIN} 127.0.0.1:\${BACKEND_PORT}
+ExecStart=/usr/local/bin/dnstt-server -udp 127.0.0.1:${DNSTT_PORT} -mtu ${MTU} -privkey-file /etc/dnstt/server.key ${TDOMAIN} 127.0.0.1:22
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-cat >/etc/default/dnstt-unida <<EOF
-# Backend port: 22 (SSH), 1080 (SOCKS5), or custom proxy (VLESS/Xray/Shadowsocks)
-BACKEND_PORT=22
-EOF
-
 
 echo "==> Kuunda EDNS proxy (512 <-> 1800)..."
 cat >/usr/local/bin/dnstt-edns-proxy.py <<EOF_PY
@@ -367,12 +342,6 @@ cat >/usr/local/bin/unida <<'EOF_MANAGER'
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$(id -u)" -ne 0 ]; then
-    echo "[-] Unida Manager needs root privileges!"
-    echo "    Please run: sudo unida"
-    exit 1
-fi
-
 clear_screen() {
     clear
 }
@@ -479,45 +448,6 @@ show_key() {
     pause
 }
 
-change_backend() {
-    header
-    echo "--- Change Tunnel Backend Protocol ---"
-    CURRENT_PORT=\$(grep '^BACKEND_PORT=' /etc/default/dnstt-unida | cut -d= -f2)
-    
-    echo "Current Backend Port: \${CURRENT_PORT}"
-    if [ "\$CURRENT_PORT" == "22" ]; then
-        echo "Active Mode: SSH Forwarding Mode (Default)"
-    elif [ "\$CURRENT_PORT" == "1080" ]; then
-        echo "Active Mode: Pure SOCKS5 Mode (Reduced Overhead)"
-    else
-        echo "Active Mode: Custom TCP Proxy Mode (VLESS/Shadowsocks/etc)"
-    fi
-    echo "==============================================="
-    echo "1) SSH Mode (Port 22) - Full VPN capabilities"
-    echo "2) SOCKS5 Mode (Port 1080) - Lightweight, reduced overhead"
-    echo "3) Custom Port (e.g., Xray/VLESS port)"
-    read -rp "Select backend mode [1-3]: " b_choice
-    
-    NEW_PORT=""
-    if [ "\$b_choice" == "1" ]; then
-        NEW_PORT="22"
-    elif [ "\$b_choice" == "2" ]; then
-        NEW_PORT="1080"
-        echo "[!] SOCKS5 Mode activated. Ensure your client app uses SOCKS proxy settings."
-    elif [ "\$b_choice" == "3" ]; then
-        read -rp "Enter your preferred custom TCP port: " NEW_PORT
-        if ! [[ "\$NEW_PORT" =~ ^[0-9]+$ ]]; then echo "[-] Invalid port"; pause; return; fi
-    else
-        echo "[-] Invalid choice."
-        pause; return
-    fi
-    
-    sed -i "s/^BACKEND_PORT=.*/BACKEND_PORT=\${NEW_PORT}/" /etc/default/dnstt-unida
-    systemctl restart dnstt-unida
-    echo "[+] Backend updated to port \${NEW_PORT} successfully!"
-    pause
-}
-
 change_mtu() {
     header
     echo "--- Change MTU Size ---"
@@ -580,12 +510,11 @@ main_menu() {
         echo "  5) View Live Logs"
         echo "  6) Restart DNSTT Services"
         echo "  7) Show Server Public Key"
-        echo "  8) Change Backend Target (SOCKS5/SSH/VLESS)"
-        echo "  9) Change MTU Size"
-        echo " 10) Uninstall Unida Server"
+        echo "  8) Change MTU Size"
+        echo "  9) Uninstall Unida Server"
         echo "  0) Exit"
         echo "==============================================="
-        read -rp "Select an option [0-10]: " choice
+        read -rp "Select an option [0-9]: " choice
         case $choice in
             1) create_user ;;
             2) delete_user ;;
@@ -594,9 +523,8 @@ main_menu() {
             5) view_logs ;;
             6) restart_services ;;
             7) show_key ;;
-            8) change_backend ;;
-            9) change_mtu ;;
-            10) uninstall_unida ;;
+            8) change_mtu ;;
+            9) uninstall_unida ;;
             0) exit 0 ;;
             *) echo "Invalid option"; sleep 1 ;;
         esac
