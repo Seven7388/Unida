@@ -166,7 +166,10 @@ apt-get update -y >/dev/null 2>&1
 DEBIAN_FRONTEND=noninteractive apt-get install -y curl python3 wget git cmake make gcc g++ build-essential dante-server >/dev/null 2>&1 || true
 
 echo "==> Configuring Lightweight SOCKS5 Server (Dante)..."
-ETH=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
+ETH=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+if [ -z "$ETH" ]; then
+    ETH=$(ip route get 8.8.8.8 | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
+fi
 cat >/etc/danted.conf <<EOF
 logoutput: syslog
 user.privileged: root
@@ -175,8 +178,14 @@ internal: 127.0.0.1 port = 1080
 external: $ETH
 socksmethod: none
 clientmethod: none
-client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
-socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+
+client pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+}
+
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+}
 EOF
 systemctl restart danted >/dev/null 2>&1 || true
 systemctl enable danted >/dev/null 2>&1 || true
@@ -482,12 +491,12 @@ show_key() {
 change_backend() {
     header
     echo "--- Change Tunnel Backend Protocol ---"
-    CURRENT_PORT=\$(grep '^BACKEND_PORT=' /etc/default/dnstt-unida | cut -d= -f2)
+    CURRENT_PORT=$(grep '^BACKEND_PORT=' /etc/default/dnstt-unida | cut -d= -f2)
     
-    echo "Current Backend Port: \${CURRENT_PORT}"
-    if [ "\$CURRENT_PORT" == "22" ]; then
+    echo "Current Backend Port: ${CURRENT_PORT}"
+    if [ "$CURRENT_PORT" == "22" ]; then
         echo "Active Mode: SSH Forwarding Mode (Default)"
-    elif [ "\$CURRENT_PORT" == "1080" ]; then
+    elif [ "$CURRENT_PORT" == "1080" ]; then
         echo "Active Mode: Pure SOCKS5 Mode (Reduced Overhead)"
     else
         echo "Active Mode: Custom TCP Proxy Mode (VLESS/Shadowsocks/etc)"
@@ -499,22 +508,22 @@ change_backend() {
     read -rp "Select backend mode [1-3]: " b_choice
     
     NEW_PORT=""
-    if [ "\$b_choice" == "1" ]; then
+    if [ "$b_choice" == "1" ]; then
         NEW_PORT="22"
-    elif [ "\$b_choice" == "2" ]; then
+    elif [ "$b_choice" == "2" ]; then
         NEW_PORT="1080"
         echo "[!] SOCKS5 Mode activated. Ensure your client app uses SOCKS proxy settings."
-    elif [ "\$b_choice" == "3" ]; then
+    elif [ "$b_choice" == "3" ]; then
         read -rp "Enter your preferred custom TCP port: " NEW_PORT
-        if ! [[ "\$NEW_PORT" =~ ^[0-9]+$ ]]; then echo "[-] Invalid port"; pause; return; fi
+        if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]]; then echo "[-] Invalid port"; pause; return; fi
     else
         echo "[-] Invalid choice."
         pause; return
     fi
     
-    sed -i "s/^BACKEND_PORT=.*/BACKEND_PORT=\${NEW_PORT}/" /etc/default/dnstt-unida
+    sed -i "s/^BACKEND_PORT=.*/BACKEND_PORT=${NEW_PORT}/" /etc/default/dnstt-unida
     systemctl restart dnstt-unida
-    echo "[+] Backend updated to port \${NEW_PORT} successfully!"
+    echo "[+] Backend updated to port ${NEW_PORT} successfully!"
     pause
 }
 
