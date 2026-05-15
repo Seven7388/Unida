@@ -58,6 +58,9 @@ if [ -z "$TDOMAIN" ]; then
       read -rp "Enter Cloudflare API Token (Requires Edit Zone DNS permission): " CF_TOKEN
       read -rp "Enter your Base Domain (e.g. yours.com): " BASE_DOMAIN
       
+      # Disable pipefail temporarily because `head -c 4` and `grep | head` can trigger SIGPIPE and kill the script under `set -e`
+      set +euo pipefail
+      
       RANDOM_STR=$(tr -dc a-z0-9 </dev/urandom | head -c 4)
       NS_PREFIX="ns-${RANDOM_STR}"
       TUN_PREFIX="tun-${RANDOM_STR}"
@@ -72,6 +75,8 @@ if [ -z "$TDOMAIN" ]; then
       ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=${BASE_DOMAIN}" \
         -H "Authorization: Bearer ${CF_TOKEN}" \
         -H "Content-Type: application/json" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+        
+      set -euo pipefail
         
       if [ -z "$ZONE_ID" ]; then
           echo "[-] Failed to get Zone ID. Please check your API Token and Domain."
