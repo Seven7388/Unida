@@ -13,7 +13,7 @@ fi
 
 # Default values
 TDOMAIN=""
-MTU="1800"
+MTU="512"
 DNSTT_PORT="5300"
 PROXY_PORT="53"
 
@@ -26,7 +26,7 @@ while getopts "d:m:p:h" opt; do
     h)
       echo "Usage: $0 -d <domain> [-m <mtu>] [-p <internal_port>]"
       echo "  -d  DNS tunnel domain (e.g., ns.example.com)"
-      echo "  -m  MTU size (default: 1800)"
+      echo "  -m  MTU size (default: 512)"
       echo "  -p  Internal DNSTT port (default: 5300)"
       exit 0
       ;;
@@ -170,6 +170,9 @@ ETH=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
 if [ -z "$ETH" ]; then
     ETH=$(ip route get 8.8.8.8 | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
 fi
+if [ -z "$ETH" ]; then
+    ETH="eth0"
+fi
 cat >/etc/danted.conf <<EOF
 logoutput: syslog
 user.privileged: root
@@ -181,10 +184,12 @@ clientmethod: none
 
 client pass {
     from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: error
 }
 
 socks pass {
     from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: error
 }
 EOF
 systemctl restart danted >/dev/null 2>&1 || true
@@ -530,9 +535,9 @@ change_backend() {
 change_mtu() {
     header
     echo "--- Change MTU Size ---"
-    current_mtu=$(grep -o '-mtu [0-9]*' /etc/systemd/system/dnstt-unida.service | awk '{print $2}')
+    current_mtu=$(grep "mtu" /etc/systemd/system/dnstt-unida.service | sed -n 's/.*-mtu \([0-9]*\).*/\1/p')
     echo "Current MTU: ${current_mtu:-Unknown}"
-    read -rp "Enter new MTU size (e.g., 1800, 1200): " NEW_MTU
+    read -rp "Enter new MTU size (e.g., 512, 1200): " NEW_MTU
     if [ -z "$NEW_MTU" ] || ! [[ "$NEW_MTU" =~ ^[0-9]+$ ]]; then
         echo "[-] Invalid MTU size."
         pause; return
