@@ -1,3 +1,9 @@
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "==> Configuring Management CLI (unida)..."
+cat >/usr/local/bin/unida <<'EOF_MANAGER'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -240,9 +246,3 @@ main_menu() {
 if [ "$#" -gt 0 ]; then
     # Keep old command-line behavior just in case
     case "$1" in
-        useradd) shift; [ -n "${1:-}" ] && { useradd -m -s /bin/false "$1"; [ -n "${2:-}" ] && echo "$1:$2" | chpasswd || passwd "$1"; } ;;
-        *) main_menu ;;
-    esac
-else
-    main_menu
-fi

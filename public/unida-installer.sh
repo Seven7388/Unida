@@ -221,7 +221,9 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 1000 --max-connections-for-client 10
+LimitNOFILE=1048576
+LimitNPROC=1048576
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 1000 --max-connections-for-client 10 --client-socket-sndbuf 100000 --client-socket-rcvbuf 100000
 Restart=always
 
 [Install]
@@ -253,6 +255,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+LimitNOFILE=1048576
+LimitNPROC=1048576
 EnvironmentFile=-/etc/default/dnstt-unida
 ExecStart=/usr/local/bin/dnstt-server -udp 127.0.0.1:${DNSTT_PORT} -mtu ${MTU} -privkey-file /etc/dnstt/server.key ${TDOMAIN} 127.0.0.1:\${BACKEND_PORT}
 Restart=always
@@ -366,6 +370,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+LimitNOFILE=1048576
+LimitNPROC=1048576
 ExecStart=/usr/bin/python3 /usr/local/bin/dnstt-edns-proxy.py
 Restart=always
 RestartSec=1
@@ -635,6 +641,21 @@ sed -i '/net.ipv4.ip_forward/s/^#//g' /etc/sysctl.conf
 if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf; then
   echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 fi
+if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
+  echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+fi
+if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
+  echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+fi
+if ! grep -q "net.ipv4.tcp_window_scaling=1" /etc/sysctl.conf; then
+  cat >> /etc/sysctl.conf <<EOF_SYSCTL
+net.ipv4.tcp_window_scaling=1
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 16384 16777216
+EOF_SYSCTL
+fi
 sysctl -p >/dev/null 2>&1
 
 # Setup IPTables Masquerade for internet access through the VPN/SSH Tunnel
@@ -660,6 +681,11 @@ sed -i 's/^#AllowTcpForwarding.*/AllowTcpForwarding yes/g' /etc/ssh/sshd_config
 sed -i 's/^#GatewayPorts.*/GatewayPorts yes/g' /etc/ssh/sshd_config
 if ! grep -q "^AllowTcpForwarding yes" /etc/ssh/sshd_config; then echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config; fi
 if ! grep -q "^GatewayPorts yes" /etc/ssh/sshd_config; then echo "GatewayPorts yes" >> /etc/ssh/sshd_config; fi
+if ! grep -q "^TCPKeepAlive yes" /etc/ssh/sshd_config; then echo "TCPKeepAlive yes" >> /etc/ssh/sshd_config; fi
+if ! grep -q "^ClientAliveInterval" /etc/ssh/sshd_config; then echo "ClientAliveInterval 120" >> /etc/ssh/sshd_config; fi
+if ! grep -q "^ClientAliveCountMax" /etc/ssh/sshd_config; then echo "ClientAliveCountMax 2" >> /etc/ssh/sshd_config; fi
+systemctl restart ssh >/dev/null 2>&1 || true
+systemctl restart sshd >/dev/null 2>&1 || true
 systemctl restart sshd || systemctl restart ssh || true
 
 echo "==> Starting services..."
