@@ -654,6 +654,10 @@ net.core.rmem_max=16777216
 net.core.wmem_max=16777216
 net.ipv4.tcp_rmem=4096 87380 16777216
 net.ipv4.tcp_wmem=4096 16384 16777216
+net.ipv4.udp_mem=65536 131072 262144
+net.ipv4.udp_rmem_min=16384
+net.ipv4.udp_wmem_min=16384
+net.core.optmem_max=65536
 EOF_SYSCTL
 fi
 sysctl -p >/dev/null 2>&1
@@ -684,6 +688,10 @@ if ! grep -q "^GatewayPorts yes" /etc/ssh/sshd_config; then echo "GatewayPorts y
 if ! grep -q "^TCPKeepAlive yes" /etc/ssh/sshd_config; then echo "TCPKeepAlive yes" >> /etc/ssh/sshd_config; fi
 if ! grep -q "^ClientAliveInterval" /etc/ssh/sshd_config; then echo "ClientAliveInterval 120" >> /etc/ssh/sshd_config; fi
 if ! grep -q "^ClientAliveCountMax" /etc/ssh/sshd_config; then echo "ClientAliveCountMax 2" >> /etc/ssh/sshd_config; fi
+sed -i 's/^#UseDNS.*/UseDNS no/g' /etc/ssh/sshd_config
+if ! grep -q "^UseDNS no" /etc/ssh/sshd_config; then echo "UseDNS no" >> /etc/ssh/sshd_config; fi
+sed -i 's/^#IPQoS.*/IPQoS lowdelay throughput/g' /etc/ssh/sshd_config
+if ! grep -q "^IPQoS lowdelay throughput" /etc/ssh/sshd_config; then echo "IPQoS lowdelay throughput" >> /etc/ssh/sshd_config; fi
 systemctl restart ssh >/dev/null 2>&1 || true
 systemctl restart sshd >/dev/null 2>&1 || true
 systemctl restart sshd || systemctl restart ssh || true
