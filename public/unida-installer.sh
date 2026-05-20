@@ -223,7 +223,7 @@ After=network.target
 Type=simple
 LimitNOFILE=1048576
 LimitNPROC=1048576
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 1000 --max-connections-for-client 10 --client-socket-sndbuf 100000 --client-socket-rcvbuf 100000
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 1000 --max-connections-for-client 10
 Restart=always
 
 [Install]
@@ -692,6 +692,10 @@ sed -i 's/^#UseDNS.*/UseDNS no/g' /etc/ssh/sshd_config
 if ! grep -q "^UseDNS no" /etc/ssh/sshd_config; then echo "UseDNS no" >> /etc/ssh/sshd_config; fi
 sed -i 's/^#IPQoS.*/IPQoS lowdelay throughput/g' /etc/ssh/sshd_config
 if ! grep -q "^IPQoS lowdelay throughput" /etc/ssh/sshd_config; then echo "IPQoS lowdelay throughput" >> /etc/ssh/sshd_config; fi
+sed -i 's/^#MaxSessions.*/MaxSessions 500/g' /etc/ssh/sshd_config
+if ! grep -q "^MaxSessions" /etc/ssh/sshd_config; then echo "MaxSessions 500" >> /etc/ssh/sshd_config; fi
+sed -i 's/^#MaxStartups.*/MaxStartups 100:30:500/g' /etc/ssh/sshd_config
+if ! grep -q "^MaxStartups" /etc/ssh/sshd_config; then echo "MaxStartups 100:30:500" >> /etc/ssh/sshd_config; fi
 systemctl restart ssh >/dev/null 2>&1 || true
 systemctl restart sshd >/dev/null 2>&1 || true
 systemctl restart sshd || systemctl restart ssh || true
