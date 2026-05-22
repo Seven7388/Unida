@@ -246,6 +246,44 @@ fi
 chmod 600 /etc/dnstt/server.key
 chmod 644 /etc/dnstt/server.pub
 
+echo "==> Kusakinisha Xray-core (VLESS TCP) kwenye port 10080..."
+bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1 || true
+if [ -f /usr/local/bin/xray ]; then
+  XRAY_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "1a2b3c4d-5e6f-7g8h-9i0j-1k2l3m4n5o6p")
+  cat >/usr/local/etc/xray/config.json <<EOF
+{
+  "inbounds": [
+    {
+      "port": 10080,
+      "listen": "127.0.0.1",
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$XRAY_UUID",
+            "level": 0
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {}
+    }
+  ]
+}
+EOF
+  systemctl enable --now xray >/dev/null 2>&1 || true
+  systemctl restart xray >/dev/null 2>&1 || true
+  echo "${XRAY_UUID}" > /etc/dnstt/xray_uuid.txt
+fi
+
 echo "==> Kuunda service /etc/systemd/system/dnstt-unida.service..."
 cat >/etc/systemd/system/dnstt-unida.service <<EOF
 [Unit]
@@ -602,6 +640,9 @@ show_v2ray_details() {
     # Get Server PubKey
     PUBKEY=$(cat /etc/dnstt/server.pub 2>/dev/null || echo "Unknown")
     
+    # Get Xray UUID
+    XRAY_UUID=$(cat /etc/dnstt/xray_uuid.txt 2>/dev/null || echo "Not Installed/Not Found")
+
     echo "To configure V2Ray DNSTT (SlowDNS) in your VPN App (e.g., HTTP Custom, v2ray config):"
     echo ""
     echo "[DNSTT / SlowDNS Settings]"
@@ -610,18 +651,18 @@ show_v2ray_details() {
     echo "DNSTT Local Port : Usually 1080, 53, or an internal app port depending on your app."
     echo ""
     echo "[V2Ray / VLESS Settings]"
-    echo "Note: Unida provides the DNSTT bridge. You must have Xray or V2Ray installed on your server, and route DNSTT to it."
+    echo "Note: Unida has automatically installed Xray Core (VLESS TCP) listening locally on port 10080!"
     echo "Server IP        : 127.0.0.1 (Because DNSTT terminates locally and forwards to your V2Ray core locally)"
     echo "SNI / Bug        : ${NS_DOMAIN} or 127.0.0.1"
     echo "Port             : The local port where DNSTT listens inside your VPN App (e.g., 53 or 1080)"
-    echo "UUID             : <Your V2Ray UUID>"
-    echo "Protocol         : VLESS / VMESS / Trojan"
-    echo "Transport        : tcp (or ws depending on your V2Ray config)"
+    echo "UUID             : ${XRAY_UUID}"
+    echo "Protocol         : VLESS"
+    echo "Transport        : tcp"
     echo "==============================================="
     echo ""
     echo "IMPORTANT:"
-    echo "If you use V2Ray, make sure you change the Unida Backend target (Option 8 in Manager) "
-    echo "to the Local Port where your V2Ray/Xray server is listening!"
+    echo "Since Unida installed Xray on Port 10080, make sure you change the Unida Backend target (Option 8 in Manager) "
+    echo "to Local Port 10080! By default, Unida points to SSH (22). You MUST change it to 10080 for VLESS to work."
     echo ""
     pause
 }
@@ -629,9 +670,8 @@ show_v2ray_details() {
 update_unida() {
     header
     echo "--- Update Unida System ---"
-    echo "This will download the latest script from your provided GitHub Raw URL and update all services."
-    read -rp "Enter the direct URL to your raw unida-installer.sh: " INSTALL_URL
-    if [ -z "$INSTALL_URL" ]; then return; fi
+    echo "This will download the latest script from GitHub and update all services."
+    INSTALL_URL="https://raw.githubusercontent.com/Seven7388/Unida/main/public/unida-installer.sh"
     
     # Extract current parameters
     NS_DOMAIN=$(grep "ExecStart=" /etc/systemd/system/dnstt-unida.service | sed -n 's/.*server\.key \([^ ]*\) .*/\1/p' || echo "")

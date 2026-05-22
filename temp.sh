@@ -1,3 +1,41 @@
+    try:
+        upstream_data = patch_edns_udp_size(data, INTERNAL_EDNS_SIZE)
+        upstream_sock.sendto(upstream_data, (UPSTREAM_HOST, UPSTREAM_PORT))
+        resp, _ = upstream_sock.recvfrom(4096)
+        resp_patched = patch_edns_udp_size(resp, EXTERNAL_EDNS_SIZE)
+        server_sock.sendto(resp_patched, client_addr)
+    except Exception:
+        pass
+    finally:
+        upstream_sock.close()
+
+def main():
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server_sock.bind((LISTEN_HOST, LISTEN_PORT))
+    print(f"[Unida EDNS proxy] Listening on {LISTEN_HOST}:{LISTEN_PORT}, upstream {UPSTREAM_HOST}:{UPSTREAM_PORT}")
+    while True:
+        data, client_addr = server_sock.recvfrom(4096)
+        threading.Thread(target=handle_request, args=(server_sock, data, client_addr), daemon=True).start()
+
+if __name__ == "__main__":
+    main()
+EOF_PY
+chmod +x /usr/local/bin/dnstt-edns-proxy.py
+
+cat >/etc/systemd/system/dnstt-unida-proxy.service <<EOF
+[Unit]
+Description=Unida DNSTT EDNS Proxy (512<->1800)
+After=network-online.target dnstt-unida.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+LimitNOFILE=1048576
+LimitNPROC=1048576
+ExecStart=/usr/bin/python3 /usr/local/bin/dnstt-edns-proxy.py
+Restart=always
+RestartSec=1
+User=root
 Group=root
 
 [Install]
@@ -208,40 +246,3 @@ uninstall_unida() {
         exit 0
     else
         echo "Uninstallation cancelled."
-        pause
-    fi
-}
-
-show_v2ray_details() {
-    header
-    echo "--- V2Ray / SlowDNS DNSTT App Details ---"
-    
-    # Get NS Domain
-    NS_DOMAIN=$(grep "ExecStart=" /etc/systemd/system/dnstt-unida.service | sed -n 's/.*server\.key \([^ ]*\) .*/\1/p' || echo "Unknown")
-    
-    # Get Server PubKey
-    PUBKEY=$(cat /etc/dnstt/server.pub 2>/dev/null || echo "Unknown")
-    
-    echo "To configure V2Ray DNSTT (SlowDNS) in your VPN App (e.g., HTTP Custom, v2ray config):"
-    echo ""
-    echo "[DNSTT / SlowDNS Settings]"
-    echo "NS Domain        : ${NS_DOMAIN}"
-    echo "Public Key (Pub) : ${PUBKEY}"
-    echo "DNSTT Local Port : Usually 1080, 53, or an internal app port depending on your app."
-    echo ""
-    echo "[V2Ray / VLESS Settings]"
-    echo "Note: Unida provides the DNSTT bridge. You must have Xray or V2Ray installed on your server, and route DNSTT to it."
-    echo "Server IP        : 127.0.0.1 (Because DNSTT terminates locally and forwards to your V2Ray core locally)"
-    echo "SNI / Bug        : ${NS_DOMAIN} or 127.0.0.1"
-    echo "Port             : The local port where DNSTT listens inside your VPN App (e.g., 53 or 1080)"
-    echo "UUID             : <Your V2Ray UUID>"
-    echo "Protocol         : VLESS / VMESS / Trojan"
-    echo "Transport        : tcp (or ws depending on your V2Ray config)"
-    echo "==============================================="
-    echo ""
-    echo "IMPORTANT:"
-    echo "If you use V2Ray, make sure you change the Unida Backend target (Option 8 in Manager) "
-    echo "to the Local Port where your V2Ray/Xray server is listening!"
-    echo ""
-    pause
-}
