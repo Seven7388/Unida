@@ -658,6 +658,9 @@ net.ipv4.udp_mem=65536 131072 262144
 net.ipv4.udp_rmem_min=16384
 net.ipv4.udp_wmem_min=16384
 net.core.optmem_max=65536
+net.core.netdev_max_backlog=65536
+net.core.somaxconn=65535
+net.ipv4.ip_local_port_range=1024 65535
 EOF_SYSCTL
 fi
 sysctl -p >/dev/null 2>&1
@@ -696,6 +699,14 @@ sed -i 's/^#MaxSessions.*/MaxSessions 500/g' /etc/ssh/sshd_config
 if ! grep -q "^MaxSessions" /etc/ssh/sshd_config; then echo "MaxSessions 500" >> /etc/ssh/sshd_config; fi
 sed -i 's/^#MaxStartups.*/MaxStartups 100:30:500/g' /etc/ssh/sshd_config
 if ! grep -q "^MaxStartups" /etc/ssh/sshd_config; then echo "MaxStartups 100:30:500" >> /etc/ssh/sshd_config; fi
+sed -i 's/^#LoginGraceTime.*/LoginGraceTime 120/g' /etc/ssh/sshd_config
+if ! grep -q "^LoginGraceTime" /etc/ssh/sshd_config; then echo "LoginGraceTime 120" >> /etc/ssh/sshd_config; fi
+sed -i '/^Ciphers/d' /etc/ssh/sshd_config
+echo "Ciphers chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes192-ctr,aes256-ctr" >> /etc/ssh/sshd_config
+sed -i '/^MACs/d' /etc/ssh/sshd_config
+echo "MACs umac-128-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128@openssh.com,hmac-sha2-256" >> /etc/ssh/sshd_config
+sed -i '/^KexAlgorithms/d' /etc/ssh/sshd_config
+echo "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256" >> /etc/ssh/sshd_config
 systemctl restart ssh >/dev/null 2>&1 || true
 systemctl restart sshd >/dev/null 2>&1 || true
 systemctl restart sshd || systemctl restart ssh || true
