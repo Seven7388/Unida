@@ -1,3 +1,5 @@
+Group=root
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -210,39 +212,36 @@ uninstall_unida() {
     fi
 }
 
-main_menu() {
-    while true; do
-        header
-        echo "  1) Create new SSH User"
-        echo "  2) Delete SSH User"
-        echo "  3) List all SSH Users"
-        echo "  4) Show DNSTT Tunnel Status"
-        echo "  5) View Live Logs"
-        echo "  6) Restart DNSTT Services"
-        echo "  7) Show Server Public Key"
-        echo "  8) Change Backend Target (SOCKS5/SSH/VLESS)"
-        echo "  9) Change MTU Size"
-        echo " 10) Uninstall Unida Server"
-        echo "  0) Exit"
-        echo "==============================================="
-        read -rp "Select an option [0-10]: " choice
-        case $choice in
-            1) create_user ;;
-            2) delete_user ;;
-            3) list_users ;;
-            4) show_status ;;
-            5) view_logs ;;
-            6) restart_services ;;
-            7) show_key ;;
-            8) change_backend ;;
-            9) change_mtu ;;
-            10) uninstall_unida ;;
-            0) exit 0 ;;
-            *) echo "Invalid option"; sleep 1 ;;
-        esac
-    done
+show_v2ray_details() {
+    header
+    echo "--- V2Ray / SlowDNS DNSTT App Details ---"
+    
+    # Get NS Domain
+    NS_DOMAIN=$(grep "ExecStart=" /etc/systemd/system/dnstt-unida.service | sed -n 's/.*server\.key \([^ ]*\) .*/\1/p' || echo "Unknown")
+    
+    # Get Server PubKey
+    PUBKEY=$(cat /etc/dnstt/server.pub 2>/dev/null || echo "Unknown")
+    
+    echo "To configure V2Ray DNSTT (SlowDNS) in your VPN App (e.g., HTTP Custom, v2ray config):"
+    echo ""
+    echo "[DNSTT / SlowDNS Settings]"
+    echo "NS Domain        : ${NS_DOMAIN}"
+    echo "Public Key (Pub) : ${PUBKEY}"
+    echo "DNSTT Local Port : Usually 1080, 53, or an internal app port depending on your app."
+    echo ""
+    echo "[V2Ray / VLESS Settings]"
+    echo "Note: Unida provides the DNSTT bridge. You must have Xray or V2Ray installed on your server, and route DNSTT to it."
+    echo "Server IP        : 127.0.0.1 (Because DNSTT terminates locally and forwards to your V2Ray core locally)"
+    echo "SNI / Bug        : ${NS_DOMAIN} or 127.0.0.1"
+    echo "Port             : The local port where DNSTT listens inside your VPN App (e.g., 53 or 1080)"
+    echo "UUID             : <Your V2Ray UUID>"
+    echo "Protocol         : VLESS / VMESS / Trojan"
+    echo "Transport        : tcp (or ws depending on your V2Ray config)"
+    echo "==============================================="
+    echo ""
+    echo "IMPORTANT:"
+    echo "If you use V2Ray, make sure you change the Unida Backend target (Option 8 in Manager) "
+    echo "to the Local Port where your V2Ray/Xray server is listening!"
+    echo ""
+    pause
 }
-
-if [ "$#" -gt 0 ]; then
-    # Keep old command-line behavior just in case
-    case "$1" in

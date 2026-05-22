@@ -266,10 +266,12 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+if [ ! -f /etc/default/dnstt-unida ]; then
 cat >/etc/default/dnstt-unida <<EOF
 # Backend port: 22 (SSH), 1080 (SOCKS5), or custom proxy (VLESS/Xray/Shadowsocks)
 BACKEND_PORT=22
 EOF
+fi
 
 
 echo "==> Kuunda EDNS proxy (512 <-> 1800)..."
@@ -590,6 +592,73 @@ uninstall_unida() {
     fi
 }
 
+show_v2ray_details() {
+    header
+    echo "--- V2Ray / SlowDNS DNSTT App Details ---"
+    
+    # Get NS Domain
+    NS_DOMAIN=$(grep "ExecStart=" /etc/systemd/system/dnstt-unida.service | sed -n 's/.*server\.key \([^ ]*\) .*/\1/p' || echo "Unknown")
+    
+    # Get Server PubKey
+    PUBKEY=$(cat /etc/dnstt/server.pub 2>/dev/null || echo "Unknown")
+    
+    echo "To configure V2Ray DNSTT (SlowDNS) in your VPN App (e.g., HTTP Custom, v2ray config):"
+    echo ""
+    echo "[DNSTT / SlowDNS Settings]"
+    echo "NS Domain        : ${NS_DOMAIN}"
+    echo "Public Key (Pub) : ${PUBKEY}"
+    echo "DNSTT Local Port : Usually 1080, 53, or an internal app port depending on your app."
+    echo ""
+    echo "[V2Ray / VLESS Settings]"
+    echo "Note: Unida provides the DNSTT bridge. You must have Xray or V2Ray installed on your server, and route DNSTT to it."
+    echo "Server IP        : 127.0.0.1 (Because DNSTT terminates locally and forwards to your V2Ray core locally)"
+    echo "SNI / Bug        : ${NS_DOMAIN} or 127.0.0.1"
+    echo "Port             : The local port where DNSTT listens inside your VPN App (e.g., 53 or 1080)"
+    echo "UUID             : <Your V2Ray UUID>"
+    echo "Protocol         : VLESS / VMESS / Trojan"
+    echo "Transport        : tcp (or ws depending on your V2Ray config)"
+    echo "==============================================="
+    echo ""
+    echo "IMPORTANT:"
+    echo "If you use V2Ray, make sure you change the Unida Backend target (Option 8 in Manager) "
+    echo "to the Local Port where your V2Ray/Xray server is listening!"
+    echo ""
+    pause
+}
+
+update_unida() {
+    header
+    echo "--- Update Unida System ---"
+    echo "This will download the latest script from your provided GitHub Raw URL and update all services."
+    read -rp "Enter the direct URL to your raw unida-installer.sh: " INSTALL_URL
+    if [ -z "$INSTALL_URL" ]; then return; fi
+    
+    # Extract current parameters
+    NS_DOMAIN=$(grep "ExecStart=" /etc/systemd/system/dnstt-unida.service | sed -n 's/.*server\.key \([^ ]*\) .*/\1/p' || echo "")
+    MTU_VAL=$(grep "ExecStart=" /etc/systemd/system/dnstt-unida.service | sed -n 's/.*-mtu \([0-9]*\).*/\1/p' || echo "512")
+    
+    if [ -z "$NS_DOMAIN" ]; then
+        echo "[-] Could not parse current NS domain. Please reinstall manually."
+        pause; return
+    fi
+    
+    echo "[+] Downloading update from $INSTALL_URL"
+    wget -O /tmp/unida-update.sh "$INSTALL_URL"
+    if [ $? -ne 0 ]; then
+        echo "[-] Failed to download update file. Check URL."
+        pause; return
+    fi
+    chmod +x /tmp/unida-update.sh
+    echo "[+] Starting update in background... Please wait and check logs if needed."
+    
+    # Run the script with current domain and MTU
+    # Using nohup so the manager can exit safely since it's going to be overwritten
+    nohup /tmp/unida-update.sh -d "$NS_DOMAIN" -m "$MTU_VAL" > /tmp/unida-update.log 2>&1 &
+    
+    echo "[+] Update triggered! Unida manager will now exit. Please wait 30 seconds."
+    exit 0
+}
+
 main_menu() {
     while true; do
         header
@@ -602,10 +671,12 @@ main_menu() {
         echo "  7) Show Server Public Key"
         echo "  8) Change Backend Target (SOCKS5/SSH/VLESS)"
         echo "  9) Change MTU Size"
-        echo " 10) Uninstall Unida Server"
+        echo " 10) Show V2Ray/SlowDNS App Details"
+        echo " 11) Update Unida System (From URL)"
+        echo " 12) Uninstall Unida Server"
         echo "  0) Exit"
         echo "==============================================="
-        read -rp "Select an option [0-10]: " choice
+        read -rp "Select an option [0-12]: " choice
         case $choice in
             1) create_user ;;
             2) delete_user ;;
@@ -616,7 +687,9 @@ main_menu() {
             7) show_key ;;
             8) change_backend ;;
             9) change_mtu ;;
-            10) uninstall_unida ;;
+            10) show_v2ray_details ;;
+            11) update_unida ;;
+            12) uninstall_unida ;;
             0) exit 0 ;;
             *) echo "Invalid option"; sleep 1 ;;
         esac
