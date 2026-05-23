@@ -165,19 +165,6 @@ echo "    (Please wait, this may take a moment...)"
 apt-get update -y >/dev/null 2>&1
 DEBIAN_FRONTEND=noninteractive apt-get install -y curl python3 wget git cmake make gcc g++ build-essential dante-server >/dev/null 2>&1 || true
 
-echo "==> Configuring SSH to support legacy clients (like HTTP Custom)..."
-cat >>/etc/ssh/sshd_config <<'SSH_EOF'
-
-# --- Unida Legacy SSH Support ---
-KexAlgorithms +diffie-hellman-group1-sha1,diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1
-HostKeyAlgorithms +ssh-rsa,ssh-dss
-PubkeyAcceptedKeyTypes +ssh-rsa,ssh-dss
-Ciphers +aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc
-MACs +hmac-sha1,hmac-sha1-96,hmac-md5,hmac-md5-96
-# --------------------------------
-SSH_EOF
-systemctl restart sshd >/dev/null 2>&1 || true
-
 echo "==> Configuring Lightweight SOCKS5 Server (Dante)..."
 ETH=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
 if [ -z "$ETH" ]; then
@@ -755,7 +742,7 @@ EOF
 update_unida() {
     header
     echo "--- Update Unida System ---"
-    echo "This will download the latest script from GitHub and update all services."
+    echo "This will download the latest script from GitHub and check for differences."
     INSTALL_URL="https://raw.githubusercontent.com/Seven7388/Unida/main/public/unida-installer.sh"
     
     # Extract current parameters
@@ -767,23 +754,38 @@ update_unida() {
         pause; return
     fi
     
-    echo "[+] Recent Updates Included in Latest Version:"
-    echo "    - EDNS Size Optimization (up to 1800 for better throughput)"
-    echo "    - BBR Network Congestion Control enabled automatically"
-    echo "    - Legacy SSH Compatibility (HTTP Custom, older clients)"
-    echo "    - Improved SSH Key Algorithms & Ciphers"
-    echo "    - Synchronous Update Process (you can now see the result)"
-    echo ""
-    echo "[+] Downloading and applying update... Please wait."
+    LOCAL_INSTALLER="/etc/dnstt/unida-installer.sh"
+    REMOTE_INSTALLER="/tmp/unida-installer-new.sh"
+    
+    echo "[+] Checking for updates from GitHub..."
+    if ! curl -sL "$INSTALL_URL" -o "$REMOTE_INSTALLER"; then
+        echo "[-] Failed to fetch update from GitHub. Please check your internet."
+        pause; return
+    fi
+    
+    if [ -f "$LOCAL_INSTALLER" ]; then
+        if cmp -s "$LOCAL_INSTALLER" "$REMOTE_INSTALLER"; then
+            echo "[+] No updates found. You are already running the latest version!"
+            rm -f "$REMOTE_INSTALLER"
+            pause; return
+        else
+            echo "[+] New version found! Applying update..."
+        fi
+    else
+        echo "[+] No local cache found. Proceeding with update to establish baseline."
+    fi
+    
     echo "--------------------------------------------------------"
     
     # Run the script with current domain and MTU synchronously
-    if curl -sL "$INSTALL_URL" | bash -s -- -d "$NS_DOMAIN" -m "$MTU_VAL"; then
+    if bash "$REMOTE_INSTALLER" -d "$NS_DOMAIN" -m "$MTU_VAL"; then
         echo "--------------------------------------------------------"
         echo "[+] Update completed successfully!"
+        mv -f "$REMOTE_INSTALLER" "$LOCAL_INSTALLER"
     else
         echo "--------------------------------------------------------"
-        echo "[-] Update failed. Please check your internet connection and try again."
+        echo "[-] Update failed. Please check your internet connection."
+        rm -f "$REMOTE_INSTALLER"
     fi
     
     pause
@@ -915,11 +917,13 @@ echo "Ciphers chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@op
 sed -i '/^MACs/d' /etc/ssh/sshd_config
 echo "MACs umac-128-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128@openssh.com,hmac-sha2-256,hmac-sha1,hmac-sha1-96,hmac-md5,hmac-md5-96" >> /etc/ssh/sshd_config
 sed -i '/^KexAlgorithms/d' /etc/ssh/sshd_config
-echo "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256,diffie-hellman-group1-sha1,diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1" >> /etc/ssh/sshd_config
+echo "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha256,diffie-hellman-group14-sha1,diffie-hellman-group1-sha1,diffie-hellman-group-exchange-sha1" >> /etc/ssh/sshd_config
 sed -i '/^HostKeyAlgorithms/d' /etc/ssh/sshd_config
 echo "HostKeyAlgorithms +ssh-rsa,ssh-dss" >> /etc/ssh/sshd_config
 sed -i '/^PubkeyAcceptedKeyTypes/d' /etc/ssh/sshd_config
 echo "PubkeyAcceptedKeyTypes +ssh-rsa,ssh-dss" >> /etc/ssh/sshd_config
+sed -i '/^PubkeyAcceptedAlgorithms/d' /etc/ssh/sshd_config
+echo "PubkeyAcceptedAlgorithms +ssh-rsa,ssh-dss" >> /etc/ssh/sshd_config
 systemctl restart ssh >/dev/null 2>&1 || true
 systemctl restart sshd >/dev/null 2>&1 || true
 systemctl restart sshd || systemctl restart ssh || true
@@ -961,3 +965,6 @@ echo "    Add SSH user    : unida useradd username password"
 echo "    Check status    : unida status"
 echo "    See all commands: unida help"
 echo "==============================================="
+
+# Cache installer for future update checks
+curl -sL "https://raw.githubusercontent.com/Seven7388/Unida/main/public/unida-installer.sh" -o /etc/dnstt/unida-installer.sh 2>/dev/null || true
