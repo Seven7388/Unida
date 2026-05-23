@@ -904,11 +904,11 @@ if ! grep -q "^MaxStartups" /etc/ssh/sshd_config; then echo "MaxStartups 100:30:
 sed -i 's/^#LoginGraceTime.*/LoginGraceTime 120/g' /etc/ssh/sshd_config
 if ! grep -q "^LoginGraceTime" /etc/ssh/sshd_config; then echo "LoginGraceTime 120" >> /etc/ssh/sshd_config; fi
 sed -i '/^Ciphers/d' /etc/ssh/sshd_config
-echo "Ciphers chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes192-ctr,aes256-ctr" >> /etc/ssh/sshd_config
+echo "Ciphers chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes192-ctr,aes256-ctr,aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc" >> /etc/ssh/sshd_config
 sed -i '/^MACs/d' /etc/ssh/sshd_config
-echo "MACs umac-128-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128@openssh.com,hmac-sha2-256" >> /etc/ssh/sshd_config
+echo "MACs umac-128-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128@openssh.com,hmac-sha2-256,hmac-sha1,hmac-sha1-96,hmac-md5,hmac-md5-96" >> /etc/ssh/sshd_config
 sed -i '/^KexAlgorithms/d' /etc/ssh/sshd_config
-echo "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256" >> /etc/ssh/sshd_config
+echo "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256,diffie-hellman-group1-sha1,diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1" >> /etc/ssh/sshd_config
 systemctl restart ssh >/dev/null 2>&1 || true
 systemctl restart sshd >/dev/null 2>&1 || true
 systemctl restart sshd || systemctl restart ssh || true
