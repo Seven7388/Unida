@@ -170,6 +170,8 @@ cat >>/etc/ssh/sshd_config <<'SSH_EOF'
 
 # --- Unida Legacy SSH Support ---
 KexAlgorithms +diffie-hellman-group1-sha1,diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1
+HostKeyAlgorithms +ssh-rsa,ssh-dss
+PubkeyAcceptedKeyTypes +ssh-rsa,ssh-dss
 Ciphers +aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc
 MACs +hmac-sha1,hmac-sha1-96,hmac-md5,hmac-md5-96
 # --------------------------------
@@ -765,18 +767,10 @@ update_unida() {
         pause; return
     fi
     
-    echo "[+] Downloading update from $INSTALL_URL"
-    wget -O /tmp/unida-update.sh "$INSTALL_URL"
-    if [ $? -ne 0 ]; then
-        echo "[-] Failed to download update file. Check URL."
-        pause; return
-    fi
-    chmod +x /tmp/unida-update.sh
-    echo "[+] Starting update in background... Please wait and check logs if needed."
+    echo "[+] Starting update in background... Please wait and check your server."
     
-    # Run the script with current domain and MTU
-    # Using nohup so the manager can exit safely since it's going to be overwritten
-    nohup /tmp/unida-update.sh -d "$NS_DOMAIN" -m "$MTU_VAL" > /tmp/unida-update.log 2>&1 &
+    # Run the script with current domain and MTU by downloading and piping directly to bash, detaching properly
+    nohup bash -c "wget -qO- $INSTALL_URL | bash -s -- -d \"$NS_DOMAIN\" -m \"$MTU_VAL\"" > /tmp/unida-update.log 2>&1 &
     
     echo "[+] Update triggered! Unida manager will now exit. Please wait 30 seconds."
     exit 0
@@ -909,6 +903,10 @@ sed -i '/^MACs/d' /etc/ssh/sshd_config
 echo "MACs umac-128-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128@openssh.com,hmac-sha2-256,hmac-sha1,hmac-sha1-96,hmac-md5,hmac-md5-96" >> /etc/ssh/sshd_config
 sed -i '/^KexAlgorithms/d' /etc/ssh/sshd_config
 echo "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256,diffie-hellman-group1-sha1,diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1" >> /etc/ssh/sshd_config
+sed -i '/^HostKeyAlgorithms/d' /etc/ssh/sshd_config
+echo "HostKeyAlgorithms +ssh-rsa,ssh-dss" >> /etc/ssh/sshd_config
+sed -i '/^PubkeyAcceptedKeyTypes/d' /etc/ssh/sshd_config
+echo "PubkeyAcceptedKeyTypes +ssh-rsa,ssh-dss" >> /etc/ssh/sshd_config
 systemctl restart ssh >/dev/null 2>&1 || true
 systemctl restart sshd >/dev/null 2>&1 || true
 systemctl restart sshd || systemctl restart ssh || true
