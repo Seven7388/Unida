@@ -165,6 +165,17 @@ echo "    (Please wait, this may take a moment...)"
 apt-get update -y >/dev/null 2>&1
 DEBIAN_FRONTEND=noninteractive apt-get install -y curl python3 wget git cmake make gcc g++ build-essential dante-server >/dev/null 2>&1 || true
 
+echo "==> Configuring SSH to support legacy clients (like HTTP Custom)..."
+cat >>/etc/ssh/sshd_config <<'SSH_EOF'
+
+# --- Unida Legacy SSH Support ---
+KexAlgorithms +diffie-hellman-group1-sha1,diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1
+Ciphers +aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc
+MACs +hmac-sha1,hmac-sha1-96,hmac-md5,hmac-md5-96
+# --------------------------------
+SSH_EOF
+systemctl restart sshd >/dev/null 2>&1 || true
+
 echo "==> Configuring Lightweight SOCKS5 Server (Dante)..."
 ETH=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
 if [ -z "$ETH" ]; then
@@ -246,7 +257,7 @@ fi
 chmod 600 /etc/dnstt/server.key
 chmod 644 /etc/dnstt/server.pub
 
-echo "==> Kusakinisha Xray-core (VLESS TCP) kwenye port 10080..."
+echo "==> Kusakinisha Xray-core (VLESS na VMESS TCP)..."
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1 || true
 if [ -f /usr/local/bin/xray ]; then
   XRAY_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "1a2b3c4d-5e6f-7g8h-9i0j-1k2l3m4n5o6p")
@@ -265,6 +276,22 @@ if [ -f /usr/local/bin/xray ]; then
           }
         ],
         "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    },
+    {
+      "port": 10081,
+      "listen": "127.0.0.1",
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "$XRAY_UUID",
+            "alterId": 0
+          }
+        ]
       },
       "streamSettings": {
         "network": "tcp"
@@ -504,6 +531,9 @@ show_status() {
     echo ""
     echo "--- BadVPN UDPGW Status ---"
     systemctl status badvpn-udpgw.service --no-pager 2>/dev/null || true
+    echo ""
+    echo "--- Xray Core Status ---"
+    systemctl status xray.service --no-pager 2>/dev/null || true
     pause
 }
 
@@ -513,12 +543,14 @@ view_logs() {
     echo "1) Main Tunnel Logs"
     echo "2) EDNS Proxy Logs"
     echo "3) BadVPN UDPGW Logs"
+    echo "4) Xray Core Logs"
     echo "0) Back"
     read -rp "Select option: " log_choice
     case $log_choice in
         1) journalctl -u dnstt-unida.service -f ;;
         2) journalctl -u dnstt-unida-proxy.service -f ;;
         3) journalctl -u badvpn-udpgw.service -f ;;
+        4) journalctl -u xray.service -f ;;
         0) return ;;
         *) echo "Invalid option." ;;
     esac
@@ -527,7 +559,7 @@ view_logs() {
 restart_services() {
     header
     echo "[+] Restarting services..."
-    systemctl restart dnstt-unida.service dnstt-unida-proxy.service badvpn-udpgw.service 2>/dev/null || true
+    systemctl restart dnstt-unida.service dnstt-unida-proxy.service badvpn-udpgw.service xray.service 2>/dev/null || true
     echo "[+] Services restarted successfully."
     pause
 }
@@ -643,26 +675,69 @@ show_v2ray_details() {
     # Get Xray UUID
     XRAY_UUID=$(cat /etc/dnstt/xray_uuid.txt 2>/dev/null || echo "Not Installed/Not Found")
 
-    echo "To configure V2Ray DNSTT (SlowDNS) in your VPN App (e.g., HTTP Custom, v2ray config):"
-    echo ""
-    echo "[DNSTT / SlowDNS Settings]"
-    echo "NS Domain        : ${NS_DOMAIN}"
-    echo "Public Key (Pub) : ${PUBKEY}"
-    echo "DNSTT Local Port : Usually 1080, 53, or an internal app port depending on your app."
-    echo ""
-    echo "[V2Ray / VLESS Settings]"
-    echo "Note: Unida has automatically installed Xray Core (VLESS TCP) listening locally on port 10080!"
-    echo "Server IP        : 127.0.0.1 (Because DNSTT terminates locally and forwards to your V2Ray core locally)"
-    echo "SNI / Bug        : ${NS_DOMAIN} or 127.0.0.1"
-    echo "Port             : The local port where DNSTT listens inside your VPN App (e.g., 53 or 1080)"
-    echo "UUID             : ${XRAY_UUID}"
-    echo "Protocol         : VLESS"
-    echo "Transport        : tcp"
     echo "==============================================="
+    echo "       VLESS & VMESS JSON CONFIGURATIONS       "
+    echo "   Copy and paste these JSON blocks directly!  "
+    echo "==============================================="
+    echo "Note: The port '1080' below is the default DNSTT local proxy port."
+    echo "If your VPN app's DNSTT listens on a different port, change it in the JSON."
     echo ""
-    echo "IMPORTANT:"
-    echo "Since Unida installed Xray on Port 10080, make sure you change the Unida Backend target (Option 8 in Manager) "
-    echo "to Local Port 10080! By default, Unida points to SSH (22). You MUST change it to 10080 for VLESS to work."
+    echo "---> VLESS CLIENT JSON <---"
+    cat <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [ { "port": 10808, "listen": "127.0.0.1", "protocol": "socks", "settings": { "auth": "noauth", "udp": true } } ],
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "127.0.0.1",
+            "port": 1080,
+            "users": [
+              { "id": "${XRAY_UUID}", "encryption": "none", "level": 0 }
+            ]
+          }
+        ]
+      },
+      "streamSettings": { "network": "tcp" }
+    }
+  ]
+}
+EOF
+    echo ""
+    echo "---> VMESS CLIENT JSON <---"
+    cat <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [ { "port": 10808, "listen": "127.0.0.1", "protocol": "socks", "settings": { "auth": "noauth", "udp": true } } ],
+  "outbounds": [
+    {
+      "protocol": "vmess",
+      "settings": {
+        "vnext": [
+          {
+            "address": "127.0.0.1",
+            "port": 1080,
+            "users": [
+              { "id": "${XRAY_UUID}", "alterId": 0, "security": "auto" }
+            ]
+          }
+        ]
+      },
+      "streamSettings": { "network": "tcp" }
+    }
+  ]
+}
+EOF
+    echo ""
+    echo "==============================================="
+    echo "IMPORTANT REMINDER:"
+    echo "If you use VLESS, set Unida Backend (Option 8) to port: 10080"
+    echo "If you use VMESS, set Unida Backend (Option 8) to port: 10081"
+    echo "DNSTT MUST be running in your VPN app for the above '127.0.0.1:1080' to work!"
+    echo "==============================================="
     echo ""
     pause
 }
