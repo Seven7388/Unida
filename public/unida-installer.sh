@@ -348,15 +348,16 @@ LISTEN_HOST="0.0.0.0"
 LISTEN_PORT=${PROXY_PORT}
 UPSTREAM_HOST="127.0.0.1"
 UPSTREAM_PORT=${DNSTT_PORT}
-EXTERNAL_EDNS_SIZE=512
+EXTERNAL_EDNS_SIZE=1800
 INTERNAL_EDNS_SIZE=${MTU}
 
-def patch_edns_udp_size(data: bytes, new_size: int) -> bytes:
-    if len(data) < 12: return data
+def extract_and_patch_edns(data: bytes, new_size: int):
+    """Returns (patched_data, original_edns_size_from_client)."""
+    if len(data) < 12: return data, None
     try:
         qdcount, ancount, nscount, arcount = struct.unpack("!HHHH", data[4:12])
     except struct.error:
-        return data
+        return data, None
 
     offset = 12
 
@@ -374,7 +375,7 @@ def patch_edns_udp_size(data: bytes, new_size: int) -> bytes:
 
     for _ in range(qdcount):
         offset = skip_name(data, offset)
-        if offset + 4 > len(data): return data
+        if offset + 4 > len(data): return data, None
         offset += 4
 
     def skip_rrs(count, buf, off):
@@ -393,23 +394,29 @@ def patch_edns_udp_size(data: bytes, new_size: int) -> bytes:
     new_data = bytearray(data)
     for _ in range(arcount):
         offset = skip_name(data, offset)
-        if offset + 10 > len(data): return data
+        if offset + 10 > len(data): return data, None
         rtype = struct.unpack("!H", data[offset:offset+2])[0]
         if rtype == 41:
+            orig_size = struct.unpack("!H", data[offset+2:offset+4])[0]
             new_data[offset+2:offset+4] = struct.pack("!H", new_size)
-            return bytes(new_data)
+            return bytes(new_data), orig_size
         rdlen = struct.unpack("!H", data[offset+8:offset+10])[0]
         offset += 10 + rdlen
-    return data
+    return data, None
 
 def handle_request(server_sock, data, client_addr):
     upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     upstream_sock.settimeout(5.0)
     try:
-        upstream_data = patch_edns_udp_size(data, INTERNAL_EDNS_SIZE)
+        upstream_data, orig_size = extract_and_patch_edns(data, INTERNAL_EDNS_SIZE)
         upstream_sock.sendto(upstream_data, (UPSTREAM_HOST, UPSTREAM_PORT))
         resp, _ = upstream_sock.recvfrom(4096)
-        resp_patched = patch_edns_udp_size(resp, EXTERNAL_EDNS_SIZE)
+        
+        # Optimize by providing the maximum supported EDNS size (at least 1800).
+        # This addresses previous capability drops while honoring clients asking for more.
+        final_size = max(orig_size if orig_size else 0, EXTERNAL_EDNS_SIZE)
+        
+        resp_patched, _ = extract_and_patch_edns(resp, final_size)
         server_sock.sendto(resp_patched, client_addr)
     except Exception:
         pass
@@ -467,7 +474,7 @@ clear_screen() {
 header() {
     clear_screen
     echo "==============================================="
-    echo "       Unida DNSTT Manager CLI"
+    echo "       Unida DNSTT Manager CLI v1.4"
     echo "==============================================="
 }
 
@@ -558,9 +565,10 @@ view_logs() {
 
 restart_services() {
     header
-    echo "[+] Restarting services..."
+    echo "[+] Enabling and restarting services..."
+    systemctl enable --now dnstt-unida.service dnstt-unida-proxy.service badvpn-udpgw.service xray.service 2>/dev/null || true
     systemctl restart dnstt-unida.service dnstt-unida-proxy.service badvpn-udpgw.service xray.service 2>/dev/null || true
-    echo "[+] Services restarted successfully."
+    echo "[+] Services enabled and restarted successfully."
     pause
 }
 
@@ -823,7 +831,10 @@ fi
 EOF_MANAGER
 chmod +x /usr/local/bin/unida
 
-echo "==> Configuring Network Forwarding and IPTables for Internet Access..."
+echo "==> Configuring Network Forwarding, BBR Congestion Control, and IPTables for Internet Access..."
+# Enable BBR kernel module (or fall back if unavailable)
+modprobe tcp_bbr >/dev/null 2>&1 || true
+
 # Enable IPv4 forwarding
 sed -i '/net.ipv4.ip_forward/s/^#//g' /etc/sysctl.conf
 if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf; then
@@ -832,8 +843,11 @@ fi
 if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
   echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
 fi
-if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
+if ! grep -q "net.ipv4.tcp_congestion_control=" /etc/sysctl.conf; then
+  # Prefer BBR, fallback to cubic or reno depending on kernel support
   echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+else
+  sed -i 's/^net.ipv4.tcp_congestion_control=.*/net.ipv4.tcp_congestion_control=bbr/' /etc/sysctl.conf
 fi
 if ! grep -q "net.ipv4.tcp_window_scaling=1" /etc/sysctl.conf; then
   cat >> /etc/sysctl.conf <<EOF_SYSCTL
