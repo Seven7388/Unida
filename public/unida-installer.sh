@@ -767,13 +767,26 @@ update_unida() {
         pause; return
     fi
     
-    echo "[+] Starting update in background... Please wait and check your server."
+    echo "[+] Recent Updates Included in Latest Version:"
+    echo "    - EDNS Size Optimization (up to 1800 for better throughput)"
+    echo "    - BBR Network Congestion Control enabled automatically"
+    echo "    - Legacy SSH Compatibility (HTTP Custom, older clients)"
+    echo "    - Improved SSH Key Algorithms & Ciphers"
+    echo "    - Synchronous Update Process (you can now see the result)"
+    echo ""
+    echo "[+] Downloading and applying update... Please wait."
+    echo "--------------------------------------------------------"
     
-    # Run the script with current domain and MTU by downloading and piping directly to bash, detaching properly
-    nohup bash -c "wget -qO- $INSTALL_URL | bash -s -- -d \"$NS_DOMAIN\" -m \"$MTU_VAL\"" > /tmp/unida-update.log 2>&1 &
+    # Run the script with current domain and MTU synchronously
+    if curl -sL "$INSTALL_URL" | bash -s -- -d "$NS_DOMAIN" -m "$MTU_VAL"; then
+        echo "--------------------------------------------------------"
+        echo "[+] Update completed successfully!"
+    else
+        echo "--------------------------------------------------------"
+        echo "[-] Update failed. Please check your internet connection and try again."
+    fi
     
-    echo "[+] Update triggered! Unida manager will now exit. Please wait 30 seconds."
-    exit 0
+    pause
 }
 
 main_menu() {
