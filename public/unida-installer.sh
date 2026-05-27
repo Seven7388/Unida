@@ -791,6 +791,65 @@ update_unida() {
     pause
 }
 
+add_tunnel() {
+    header
+    echo "--- Add Tunnel ---"
+    echo "  1) Stunnel (SSL/TLS wrapping for SSH)"
+    echo "  0) Back to main menu"
+    read -rp "Select tunnel type: " tun_type
+    case $tun_type in
+        1)
+            echo "==> Installing and configuring Stunnel on port 443 -> 22..."
+            apt-get update >/dev/null 2>&1
+            apt-get install -y stunnel4 >/dev/null 2>&1
+            openssl genrsa -out /etc/stunnel/stunnel.key 2048 >/dev/null 2>&1
+            openssl req -new -key /etc/stunnel/stunnel.key -out /etc/stunnel/stunnel.csr -subj "/C=US/ST=State/L=City/O=Unida/OU=IT/CN=unida.net" >/dev/null 2>&1
+            openssl x509 -req -days 365 -in /etc/stunnel/stunnel.csr -signkey /etc/stunnel/stunnel.key -out /etc/stunnel/stunnel.crt >/dev/null 2>&1
+            cat /etc/stunnel/stunnel.key /etc/stunnel/stunnel.crt > /etc/stunnel/stunnel.pem
+            cat > /etc/stunnel/stunnel.conf <<EOF
+pid = /var/run/stunnel4.pid
+cert = /etc/stunnel/stunnel.pem
+client = no
+socket = a:SO_REUSEADDR=1
+socket = l:TCP_NODELAY=1
+socket = r:TCP_NODELAY=1
+
+[ssh]
+accept = 443
+connect = 127.0.0.1:22
+EOF
+            sed -i 's/ENABLED=0/ENABLED=1/' /etc/default/stunnel4
+            systemctl enable stunnel4 >/dev/null 2>&1
+            systemctl restart stunnel4 >/dev/null 2>&1
+            echo "[+] Stunnel configured successfully on port 443"
+            ;;
+        0) return ;;
+        *) echo "Invalid option" ;;
+    esac
+    pause
+}
+
+remove_tunnel() {
+    header
+    echo "--- Remove Tunnel ---"
+    echo "  1) Stunnel"
+    echo "  0) Back to main menu"
+    read -rp "Select tunnel to remove: " tun_type
+    case $tun_type in
+        1)
+            echo "==> Removing Stunnel..."
+            systemctl stop stunnel4 >/dev/null 2>&1
+            systemctl disable stunnel4 >/dev/null 2>&1
+            apt-get purge -y stunnel4 >/dev/null 2>&1
+            rm -rf /etc/stunnel
+            echo "[+] Stunnel removed successfully"
+            ;;
+        0) return ;;
+        *) echo "Invalid option" ;;
+    esac
+    pause
+}
+
 main_menu() {
     while true; do
         header
@@ -806,9 +865,11 @@ main_menu() {
         echo " 10) Show V2Ray/SlowDNS App Details"
         echo " 11) Update Unida System (From URL)"
         echo " 12) Uninstall Unida Server"
+        echo " 13) Add Tunnel"
+        echo " 14) Remove Tunnel"
         echo "  0) Exit"
         echo "==============================================="
-        read -rp "Select an option [0-12]: " choice
+        read -rp "Select an option [0-14]: " choice
         case $choice in
             1) create_user ;;
             2) delete_user ;;
@@ -822,6 +883,8 @@ main_menu() {
             10) show_v2ray_details ;;
             11) update_unida ;;
             12) uninstall_unida ;;
+            13) add_tunnel ;;
+            14) remove_tunnel ;;
             0) exit 0 ;;
             *) echo "Invalid option"; sleep 1 ;;
         esac
@@ -913,11 +976,11 @@ if ! grep -q "^MaxStartups" /etc/ssh/sshd_config; then echo "MaxStartups 100:30:
 sed -i 's/^#LoginGraceTime.*/LoginGraceTime 120/g' /etc/ssh/sshd_config
 if ! grep -q "^LoginGraceTime" /etc/ssh/sshd_config; then echo "LoginGraceTime 120" >> /etc/ssh/sshd_config; fi
 sed -i '/^Ciphers/d' /etc/ssh/sshd_config
-echo "Ciphers chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes192-ctr,aes256-ctr,aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc" >> /etc/ssh/sshd_config
+echo "Ciphers +aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc" >> /etc/ssh/sshd_config
 sed -i '/^MACs/d' /etc/ssh/sshd_config
-echo "MACs umac-128-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128@openssh.com,hmac-sha2-256,hmac-sha1,hmac-sha1-96,hmac-md5,hmac-md5-96" >> /etc/ssh/sshd_config
+echo "MACs +hmac-sha1,hmac-sha1-96,hmac-md5,hmac-md5-96" >> /etc/ssh/sshd_config
 sed -i '/^KexAlgorithms/d' /etc/ssh/sshd_config
-echo "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha256,diffie-hellman-group14-sha1,diffie-hellman-group1-sha1,diffie-hellman-group-exchange-sha1" >> /etc/ssh/sshd_config
+echo "KexAlgorithms +diffie-hellman-group1-sha1,diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1" >> /etc/ssh/sshd_config
 sed -i '/^HostKeyAlgorithms/d' /etc/ssh/sshd_config
 echo "HostKeyAlgorithms +ssh-rsa,ssh-dss" >> /etc/ssh/sshd_config
 sed -i '/^PubkeyAcceptedKeyTypes/d' /etc/ssh/sshd_config
