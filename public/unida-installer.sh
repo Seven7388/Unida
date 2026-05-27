@@ -758,7 +758,7 @@ update_unida() {
     REMOTE_INSTALLER="/tmp/unida-installer-new.sh"
     
     echo "[+] Checking for updates from GitHub..."
-    if ! curl -sL "$INSTALL_URL" -o "$REMOTE_INSTALLER"; then
+    if ! curl -sL "$INSTALL_URL?t=$(date +%s)" -o "$REMOTE_INSTALLER"; then
         echo "[-] Failed to fetch update from GitHub. Please check your internet."
         pause; return
     fi
