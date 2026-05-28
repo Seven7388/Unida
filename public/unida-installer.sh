@@ -1537,6 +1537,9 @@ if command -v ufw >/dev/null 2>&1; then
   ufw allow 53/udp >/dev/null 2>&1 || true
   ufw allow ${PROXY_PORT}/udp >/dev/null 2>&1 || true
   ufw allow 7300/tcp >/dev/null 2>&1 || true
+  if [ -f /etc/default/ufw ]; then
+    sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/g' /etc/default/ufw
+  fi
   ufw reload >/dev/null 2>&1 || true
 fi
 
