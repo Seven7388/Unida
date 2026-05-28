@@ -795,8 +795,17 @@ add_tunnel() {
     header
     echo "--- Add Tunnel ---"
     echo "  1) Stunnel (SSL/TLS wrapping for SSH)"
+    echo "  2) WebSocket (Fake WS / HTTP Proxy on Port 80)"
+    echo "  3) SOCKS5 Proxy (Port 1080)"
+    echo "  4) DoT (DNS over TLS) Guide"
+    echo "  5) DoH (DNS over HTTPS) Guide"
+    echo "  6) Slipstream / QUIC Guide"
     echo "  0) Back to main menu"
-    read -rp "Select tunnel type: " tun_type
+    read -rp "Select tunnel type [0-6]: " tun_type
+    
+    IPV4=$(curl -s4 icanhazip.com || hostname -I | awk '{print $1}')
+    NS_DOMAIN=$(grep "ExecStart=" /etc/systemd/system/dnstt-unida.service 2>/dev/null | sed -n 's/.*server\.key \([^ ]*\) .*/\1/p' || echo "yourdomain.com")
+
     case $tun_type in
         1)
             echo "==> Installing and configuring Stunnel on port 443 -> 22..."
@@ -821,7 +830,150 @@ EOF
             sed -i 's/ENABLED=0/ENABLED=1/' /etc/default/stunnel4
             systemctl enable stunnel4 >/dev/null 2>&1
             systemctl restart stunnel4 >/dev/null 2>&1
+            echo ""
+            echo "============================================="
             echo "[+] Stunnel configured successfully on port 443"
+            echo "============================================="
+            echo "VPN Setup Info (HTTP Custom / Injector):"
+            echo " Server IP : $IPV4"
+            echo " Port      : 443"
+            echo " Option    : Check 'SSL' or 'TLS'"
+            echo " Payload   : Not needed (uncheck Use Payload)"
+            echo " SNI/Host  : sni.your-bug.com (optional)"
+            echo "============================================="
+            ;;
+        2)
+            echo "==> Installing WebSocket (Fake WS) Proxy on port 80..."
+            apt-get install -y python3 >/dev/null 2>&1
+            cat > /usr/local/bin/ws-proxy.py <<'EOF'
+import socket, threading, sys
+def handle_client(c):
+    t = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        t.connect(('127.0.0.1', 22))
+        req = c.recv(4096)
+        if b"HTTP" in req:
+            c.send(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+        else:
+            t.send(req)
+        def fwd(src, dst):
+            try:
+                while True:
+                    data = src.recv(4096)
+                    if not data: break
+                    dst.send(data)
+            except: pass
+        threading.Thread(target=fwd, args=(c,t)).start()
+        threading.Thread(target=fwd, args=(t,c)).start()
+    except: c.close()
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', 80))
+s.listen(100)
+while True:
+    client, addr = s.accept()
+    threading.Thread(target=handle_client, args=(client,)).start()
+EOF
+            cat > /etc/systemd/system/ws-proxy.service <<EOF
+[Unit]
+Description=Fake WebSocket Proxy
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/ws-proxy.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload
+            systemctl enable --now ws-proxy >/dev/null 2>&1
+            echo ""
+            echo "============================================="
+            echo "[+] WebSocket Proxy configured successfully on port 80"
+            echo "============================================="
+            echo "VPN Setup Info (HTTP Custom / Injector):"
+            echo " Server IP : $IPV4"
+            echo " Port      : 80"
+            echo " Option    : Enable 'Payload' or 'HTTP Proxy'"
+            echo " Payload   : GET / HTTP/1.1[crlf]Host: domain.com[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]"
+            echo "============================================="
+            ;;
+        3)
+            echo "==> Installing SOCKS5 Proxy (Dante) on port 1080..."
+            apt-get update >/dev/null 2>&1
+            apt-get install -y dante-server >/dev/null 2>&1
+            ETH=$(ip route get 8.8.8.8 | awk -- '{print $5}' | head -n1)
+            cat > /etc/danted.conf <<EOF
+logoutput: syslog
+user.privileged: root
+user.unprivileged: nobody
+internal: 0.0.0.0 port = 1080
+external: ${ETH:-eth0}
+socksmethod: username none
+clientmethod: none
+client pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect error
+}
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect error
+}
+EOF
+            systemctl enable danted >/dev/null 2>&1
+            systemctl restart danted >/dev/null 2>&1
+            echo ""
+            echo "============================================="
+            echo "[+] SOCKS5 configured successfully on port 1080"
+            echo "============================================="
+            echo "VPN Setup Info:"
+            echo " Proxy Type: SOCKS5"
+            echo " Server IP : $IPV4"
+            echo " Port      : 1080"
+            echo " Auth      : None"
+            echo "============================================="
+            ;;
+        4)
+            echo ""
+            echo "============================================="
+            echo "[*] DoT (DNS over TLS) Configuration Guide"
+            echo "============================================="
+            echo " The Unida DNSTT server operates directly on UDP 53."
+            echo " To use DoT in your VPN application (e.g., HTTP Custom / app with SlowDNS module):"
+            echo " 1. Set Nameserver (NS) : $NS_DOMAIN"
+            echo " 2. Set DNS Resolver    : 1.1.1.1:853  (Cloudflare DoT)"
+            echo " 3. Option              : Enable 'SlowDNS' or 'DNS Tunnel' mode."
+            echo " 4. Check               : Check 'Use DoT / DNS over TLS' if available."
+            echo "============================================="
+            ;;
+        5)
+            echo ""
+            echo "============================================="
+            echo "[*] DoH (DNS over HTTPS) Configuration Guide"
+            echo "============================================="
+            echo " The Unida DNSTT server operates directly on UDP 53."
+            echo " To use DoH in your VPN application (e.g., HTTP Injector / ShadowSocks):"
+            echo " 1. Set Nameserver (NS) : $NS_DOMAIN"
+            echo " 2. Set DNS Resolver    : https://cloudflare-dns.com/dns-query"
+            echo " 3. Option              : Enable 'SlowDNS' or 'DNS Tunnel' mode."
+            echo " 4. Check               : Ensure the resolver uses HTTPS prefix."
+            echo " 5. Port Config         : The tunnel will route over HTTP port 443 natively via Cloudflare."
+            echo "============================================="
+            ;;
+        6)
+            echo ""
+            echo "============================================="
+            echo "[*] Slipstream / DNS QUIC Configuration Guide"
+            echo "============================================="
+            echo " The Unida DNSTT server operates directly on UDP 53."
+            echo " To use DoQ (DNS over QUIC) / Slipstream in your VPN application:"
+            echo " 1. Set Nameserver (NS) : $NS_DOMAIN"
+            echo " 2. Set DNS Resolver    : quic://dns.adguard.com"
+            echo " 3. Option              : Enable 'SlowDNS' or 'DNS Tunnel' mode."
+            echo " 4. Note                : Make sure your client binary supports quic:// prefix."
+            echo "============================================="
             ;;
         0) return ;;
         *) echo "Invalid option" ;;
@@ -958,6 +1110,9 @@ EOF
 fi
 
 # Enable required SSH forwarding features
+sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+if ! grep -q "^PasswordAuthentication yes" /etc/ssh/sshd_config; then echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config; fi
 sed -i 's/^#AllowTcpForwarding.*/AllowTcpForwarding yes/g' /etc/ssh/sshd_config
 sed -i 's/^#GatewayPorts.*/GatewayPorts yes/g' /etc/ssh/sshd_config
 if ! grep -q "^AllowTcpForwarding yes" /etc/ssh/sshd_config; then echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config; fi
@@ -1000,11 +1155,7 @@ if [ -f /etc/systemd/system/badvpn-udpgw.service ]; then
 fi
 
 if command -v ufw >/dev/null 2>&1; then
-  ufw allow 22/tcp >/dev/null 2>&1 || true
-  ufw allow 53/udp >/dev/null 2>&1 || true
-  ufw allow ${PROXY_PORT}/udp >/dev/null 2>&1 || true
-  ufw allow 7300/tcp >/dev/null 2>&1 || true
-  ufw reload >/dev/null 2>&1 || true
+  ufw --force disable >/dev/null 2>&1 || true
 fi
 
 IPV4=$(curl -s4 icanhazip.com || hostname -I | awk '{print $1}')
