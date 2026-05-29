@@ -1505,6 +1505,20 @@ sed -i 's/^#ClientAliveCountMax.*/ClientAliveCountMax 5/g' /etc/ssh/sshd_config
 if ! grep -q "^ClientAliveCountMax" /etc/ssh/sshd_config; then echo "ClientAliveCountMax 5" >> /etc/ssh/sshd_config; else sed -i 's/^ClientAliveCountMax.*/ClientAliveCountMax 5/g' /etc/ssh/sshd_config; fi
 sed -i 's/^#UseDNS.*/UseDNS no/g' /etc/ssh/sshd_config
 if ! grep -q "^UseDNS no" /etc/ssh/sshd_config; then echo "UseDNS no" >> /etc/ssh/sshd_config; fi
+
+cat > /etc/issue.net << 'EOF_BANNER'
+<br>
+<div style="text-align:center">
+  <font color="#00FFFF"><b>🚀 UNIDA 🚀</b></font><br>
+  <font color="#FFFFFF">by</font><br>
+  <font color="#FF0000"><b>Sixbravo</b></font> <font color="#FFFFFF">&amp;</font> <font color="#FFFF00"><b>BunyaBoy</b></font>
+</div>
+<br>
+EOF_BANNER
+
+sed -i 's/^#Banner.*/Banner \/etc\/issue.net/g' /etc/ssh/sshd_config
+if ! grep -q "^Banner /etc/issue.net" /etc/ssh/sshd_config; then echo "Banner /etc/issue.net" >> /etc/ssh/sshd_config; fi
+
 sed -i 's/^#IPQoS.*/IPQoS cs0 cs0/g' /etc/ssh/sshd_config
 sed -i 's/^IPQoS lowdelay throughput/IPQoS cs0 cs0/g' /etc/ssh/sshd_config
 if ! grep -q "^IPQoS cs0 cs0" /etc/ssh/sshd_config; then echo "IPQoS cs0 cs0" >> /etc/ssh/sshd_config; fi
