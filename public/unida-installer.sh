@@ -223,7 +223,7 @@ After=network.target
 Type=simple
 LimitNOFILE=1048576
 LimitNPROC=1048576
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 1000 --max-connections-for-client 16
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 10000 --max-connections-for-client 30
 Restart=always
 
 [Install]
@@ -1424,6 +1424,21 @@ tcp_bbr
 EOF
 modprobe tcp_bbr >/dev/null 2>&1 || true
 
+# Limit Configurations
+cat > /etc/security/limits.d/unida.conf <<EOF
+* soft nofile 1048576
+* hard nofile 1048576
+* soft nproc 1048576
+* hard nproc 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+root soft nproc 1048576
+root hard nproc 1048576
+EOF
+echo "session required pam_limits.so" >> /etc/pam.d/common-session
+echo "fs.file-max = 1048576" >> /etc/sysctl.conf
+echo "fs.inotify.max_user_instances = 8192" >> /etc/sysctl.conf
+
 # Enable IPv4 forwarding
 sed -i '/net.ipv4.ip_forward/s/^#//g' /etc/sysctl.conf
 if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf; then
@@ -1522,10 +1537,10 @@ if ! grep -q "^Banner /etc/issue.net" /etc/ssh/sshd_config; then echo "Banner /e
 sed -i 's/^#IPQoS.*/IPQoS cs0 cs0/g' /etc/ssh/sshd_config
 sed -i 's/^IPQoS lowdelay throughput/IPQoS cs0 cs0/g' /etc/ssh/sshd_config
 if ! grep -q "^IPQoS cs0 cs0" /etc/ssh/sshd_config; then echo "IPQoS cs0 cs0" >> /etc/ssh/sshd_config; fi
-sed -i 's/^#MaxSessions.*/MaxSessions 500/g' /etc/ssh/sshd_config
-if ! grep -q "^MaxSessions" /etc/ssh/sshd_config; then echo "MaxSessions 500" >> /etc/ssh/sshd_config; fi
-sed -i 's/^#MaxStartups.*/MaxStartups 100:30:500/g' /etc/ssh/sshd_config
-if ! grep -q "^MaxStartups" /etc/ssh/sshd_config; then echo "MaxStartups 100:30:500" >> /etc/ssh/sshd_config; fi
+sed -i 's/^#MaxSessions.*/MaxSessions 10000/g' /etc/ssh/sshd_config
+if ! grep -q "^MaxSessions" /etc/ssh/sshd_config; then echo "MaxSessions 10000" >> /etc/ssh/sshd_config; else sed -i 's/^MaxSessions.*/MaxSessions 10000/g' /etc/ssh/sshd_config; fi
+sed -i 's/^#MaxStartups.*/MaxStartups 1000:30:10000/g' /etc/ssh/sshd_config
+if ! grep -q "^MaxStartups" /etc/ssh/sshd_config; then echo "MaxStartups 1000:30:10000" >> /etc/ssh/sshd_config; else sed -i 's/^MaxStartups.*/MaxStartups 1000:30:10000/g' /etc/ssh/sshd_config; fi
 sed -i 's/^#LoginGraceTime.*/LoginGraceTime 120/g' /etc/ssh/sshd_config
 if ! grep -q "^LoginGraceTime" /etc/ssh/sshd_config; then echo "LoginGraceTime 120" >> /etc/ssh/sshd_config; fi
 systemctl daemon-reload
