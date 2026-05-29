@@ -1466,11 +1466,27 @@ net.ipv4.udp_wmem_min=16384
 net.core.optmem_max=65536
 net.core.netdev_max_backlog=65536
 net.core.somaxconn=65535
+net.ipv4.tcp_max_syn_backlog=65536
+net.ipv4.tcp_max_tw_buckets=1440000
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_keepalive_time=300
+net.ipv4.tcp_keepalive_probes=5
+net.ipv4.tcp_keepalive_intvl=15
+net.ipv4.tcp_syncookies=1
 net.ipv4.ip_local_port_range=1024 65535
 EOF_SYSCTL
 fi
 sed -i 's/16777216/67108864/g' /etc/sysctl.conf
 sysctl -p >/dev/null 2>&1
+
+cat > /etc/cron.d/unida-autoclean << 'EOF_CRON'
+# UNIDA Auto Cleaner - Clears RAM and drops stalled connections every 4 hours
+0 */4 * * * root /bin/sync && /usr/bin/echo 3 > /proc/sys/vm/drop_caches && /bin/systemctl restart badvpn-udpgw 2>/dev/null && /bin/systemctl restart dnstt-unida 2>/dev/null
+EOF_CRON
+chmod 644 /etc/cron.d/unida-autoclean
+systemctl restart cron 2>/dev/null || systemctl restart crond 2>/dev/null || true
+
 
 
 # Setup IPTables Masquerade for internet access through the VPN/SSH Tunnel
