@@ -1537,6 +1537,12 @@ if ! grep -q "^ClientAliveCountMax" /etc/ssh/sshd_config; then echo "ClientAlive
 sed -i 's/^#UseDNS.*/UseDNS no/g' /etc/ssh/sshd_config
 if ! grep -q "^UseDNS no" /etc/ssh/sshd_config; then echo "UseDNS no" >> /etc/ssh/sshd_config; fi
 
+# Enable Legacy SSH Algorithms for older VPN clients (HTTP Custom, etc)
+if ! grep -q "^KexAlgorithms" /etc/ssh/sshd_config; then echo "KexAlgorithms +diffie-hellman-group1-sha1,diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1,diffie-hellman-group-exchange-sha256" >> /etc/ssh/sshd_config; fi
+if ! grep -q "^Ciphers" /etc/ssh/sshd_config; then echo "Ciphers +aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc" >> /etc/ssh/sshd_config; fi
+if ! grep -q "^HostKeyAlgorithms" /etc/ssh/sshd_config; then echo "HostKeyAlgorithms +ssh-rsa,ssh-dss" >> /etc/ssh/sshd_config; fi
+if ! grep -q "^PubkeyAcceptedKeyTypes" /etc/ssh/sshd_config; then echo "PubkeyAcceptedKeyTypes +ssh-rsa,ssh-dss" >> /etc/ssh/sshd_config; fi
+
 cat > /etc/issue.net << 'EOF_BANNER'
 <br>
 <div style="text-align:center">
