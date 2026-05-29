@@ -1380,9 +1380,10 @@ main_menu() {
         echo " 13) Add Tunnel"
         echo " 14) Remove Tunnel"
         echo " 15) Run Diagnostics (Port Check & BBR)"
+        echo " 16) Refresh & Optimize Tunnels"
         echo "  0) Exit"
         echo "==============================================="
-        read -rp "Select an option [0-15]: " choice
+        read -rp "Select an option [0-16]: " choice
         case $choice in
             1) create_user ;;
             2) delete_user ;;
@@ -1399,6 +1400,16 @@ main_menu() {
             13) add_tunnel ;;
             14) remove_tunnel ;;
             15) run_diagnostics ;;
+            16)
+                header
+                echo "[+] Running Auto-Clean and Speed Optimizer..."
+                if [ -x /usr/local/bin/speed-optimizer ]; then
+                    /usr/local/bin/speed-optimizer
+                else
+                    echo "[-] speed-optimizer not found. Installing..."
+                fi
+                pause
+                ;;
             0) exit 0 ;;
             *) echo "Invalid option"; sleep 1 ;;
         esac
@@ -1654,6 +1665,8 @@ sync; echo 3 > /proc/sys/vm/drop_caches
 echo "🔄 Restarting Tunneling Services to clear stalled connections..."
 systemctl restart badvpn-udpgw 2>/dev/null || true
 systemctl restart sshd 2>/dev/null || true
+systemctl restart stunnel4 2>/dev/null || true
+systemctl restart xray 2>/dev/null || true
 systemctl restart dnstt-unida 2>/dev/null || true
 
 echo "✅ Optimization Complete! Your Network should be faster and stable."
@@ -1674,7 +1687,7 @@ CRON_FILE="/etc/cron.d/unida-autoclean"
 
 cat > "$CRON_FILE" << 'EOF'
 # UNIDA Auto Cleaner - Clears RAM and restarts stalled services every 4 hours
-0 */4 * * * root /bin/sync && /usr/bin/echo 3 > /proc/sys/vm/drop_caches && /bin/systemctl restart badvpn-udpgw 2>/dev/null && /bin/systemctl restart dnstt-unida 2>/dev/null
+0 */4 * * * root /bin/sync && /usr/bin/echo 3 > /proc/sys/vm/drop_caches && /bin/systemctl restart badvpn-udpgw sshd stunnel4 xray dnstt-unida 2>/dev/null
 EOF
 
 chmod 644 "$CRON_FILE"
