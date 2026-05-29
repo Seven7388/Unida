@@ -331,7 +331,7 @@ fi
 echo "==> Kuunda EDNS proxy (512 <-> 1800)..."
 cat >/usr/local/bin/dnstt-edns-proxy.py <<EOF_PY
 #!/usr/bin/env python3
-import socket, threading, struct
+import socket, struct, concurrent.futures
 
 LISTEN_HOST="0.0.0.0"
 LISTEN_PORT=${PROXY_PORT}
@@ -395,14 +395,13 @@ def extract_and_patch_edns(data: bytes, new_size: int):
 
 def handle_request(server_sock, data, client_addr):
     upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    upstream_sock.settimeout(5.0)
+    upstream_sock.settimeout(2.0)
     try:
         upstream_data, orig_size = extract_and_patch_edns(data, INTERNAL_EDNS_SIZE)
         upstream_sock.sendto(upstream_data, (UPSTREAM_HOST, UPSTREAM_PORT))
         resp, _ = upstream_sock.recvfrom(4096)
         
         # Optimize by providing the maximum supported EDNS size (at least 1800).
-        # This addresses previous capability drops while honoring clients asking for more.
         final_size = max(orig_size if orig_size else 0, EXTERNAL_EDNS_SIZE)
         
         resp_patched, _ = extract_and_patch_edns(resp, final_size)
@@ -414,11 +413,20 @@ def handle_request(server_sock, data, client_addr):
 
 def main():
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8388608)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8388608)
+    except: pass
     server_sock.bind((LISTEN_HOST, LISTEN_PORT))
     print(f"[Unida EDNS proxy] Listening on {LISTEN_HOST}:{LISTEN_PORT}, upstream {UPSTREAM_HOST}:{UPSTREAM_PORT}")
-    while True:
-        data, client_addr = server_sock.recvfrom(4096)
-        threading.Thread(target=handle_request, args=(server_sock, data, client_addr), daemon=True).start()
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2048) as executor:
+        while True:
+            try:
+                data, client_addr = server_sock.recvfrom(4096)
+                executor.submit(handle_request, server_sock, data, client_addr)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
@@ -1485,6 +1493,10 @@ net.ipv4.tcp_keepalive_time=300
 net.ipv4.tcp_keepalive_probes=5
 net.ipv4.tcp_keepalive_intvl=15
 net.ipv4.tcp_syncookies=1
+net.netfilter.nf_conntrack_max=2000000
+net.netfilter.nf_conntrack_tcp_timeout_established=7200
+net.netfilter.nf_conntrack_udp_timeout=30
+net.netfilter.nf_conntrack_udp_timeout_stream=60
 net.ipv4.ip_local_port_range=1024 65535
 EOF_SYSCTL
 fi
@@ -1641,11 +1653,15 @@ net.core.wmem_max = 16777216
 net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
 
-# Connection Limits
+# Connection Limits and UDP tuning
 net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 65536
 net.ipv4.tcp_max_syn_backlog = 65536
 net.ipv4.tcp_max_tw_buckets = 1440000
+net.netfilter.nf_conntrack_max = 2000000
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+net.netfilter.nf_conntrack_udp_timeout = 30
+net.netfilter.nf_conntrack_udp_timeout_stream = 60
 
 # Aggressive Timeout and Keepalive (fixes dropping connections over time)
 net.ipv4.tcp_keepalive_time = 300
