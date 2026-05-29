@@ -1503,8 +1503,11 @@ if ! grep -q "^ClientAliveInterval" /etc/ssh/sshd_config; then echo "ClientAlive
 if ! grep -q "^ClientAliveCountMax" /etc/ssh/sshd_config; then echo "ClientAliveCountMax 2" >> /etc/ssh/sshd_config; fi
 sed -i 's/^#UseDNS.*/UseDNS no/g' /etc/ssh/sshd_config
 if ! grep -q "^UseDNS no" /etc/ssh/sshd_config; then echo "UseDNS no" >> /etc/ssh/sshd_config; fi
-sed -i 's/^#IPQoS.*/IPQoS lowdelay throughput/g' /etc/ssh/sshd_config
-if ! grep -q "^IPQoS lowdelay throughput" /etc/ssh/sshd_config; then echo "IPQoS lowdelay throughput" >> /etc/ssh/sshd_config; fi
+sed -i 's/^#IPQoS.*/IPQoS cs0 cs0/g' /etc/ssh/sshd_config
+sed -i 's/^IPQoS lowdelay throughput/IPQoS cs0 cs0/g' /etc/ssh/sshd_config
+if ! grep -q "^IPQoS cs0 cs0" /etc/ssh/sshd_config; then echo "IPQoS cs0 cs0" >> /etc/ssh/sshd_config; fi
+if ! grep -q "^KexAlgorithms" /etc/ssh/sshd_config; then echo "KexAlgorithms curve25519-sha256@libssh.org,ecdh-sha2-nistp256,diffie-hellman-group14-sha256" >> /etc/ssh/sshd_config; fi
+if ! grep -q "^MACs" /etc/ssh/sshd_config; then echo "MACs hmac-sha2-256,hmac-sha1" >> /etc/ssh/sshd_config; fi
 sed -i 's/^#MaxSessions.*/MaxSessions 500/g' /etc/ssh/sshd_config
 if ! grep -q "^MaxSessions" /etc/ssh/sshd_config; then echo "MaxSessions 500" >> /etc/ssh/sshd_config; fi
 sed -i 's/^#MaxStartups.*/MaxStartups 100:30:500/g' /etc/ssh/sshd_config
