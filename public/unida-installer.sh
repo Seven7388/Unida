@@ -723,27 +723,13 @@ show_v2ray_details() {
           }
         ]
       },
-      "streamSettings": { "network": "tcp" },
-      "mux": {
-        "enabled": true,
-        "concurrency": 16
-      }
+      "streamSettings": { "network": "tcp" }
     }
-  ],
-  "routing": {
-    "domainStrategy": "AsIs",
-    "rules": [
-      {
-        "type": "field",
-        "outboundTag": "fragment",
-        "network": "tcp"
-      }
-    ]
-  }
+  ]
 }
 EOF
-    echo "Note: The above VLESS config includes 'mux' (channels/concurrency) for faster routing!"
-    echo "Note: Some apps support 'fragment' under streamSettings -> sockopt to bypass DPI."
+    echo "Note: The port '1080' above is the default DNSTT local proxy port."
+    echo "If your VPN app's DNSTT listens on a different port, change it in the JSON (e.g. some apps choose random ports)."
     echo ""
     echo "---> VMESS CLIENT JSON <---"
     cat <<EOF
