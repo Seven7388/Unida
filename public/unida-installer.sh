@@ -689,6 +689,15 @@ show_v2ray_details() {
     XRAY_UUID=$(cat /etc/dnstt/xray_uuid.txt 2>/dev/null || echo "Not Installed/Not Found")
 
     echo "==============================================="
+    echo "            DNSTT & V2RAY DETAILS              "
+    echo "==============================================="
+    echo "  DNS Nameserver (Your Domain): ${NS_DOMAIN}"
+    echo "  Public Key: ${PUBKEY}"
+    echo "  VLESS/VMESS UUID: ${XRAY_UUID}"
+    echo "  V2Ray Target Port: 443 (Usually Ignored via DNSTT)"
+    echo "  Network / Transport: TCP"
+    echo "  Security: None (Plain)"
+    echo "==============================================="
     echo "       VLESS & VMESS JSON CONFIGURATIONS       "
     echo "   Copy and paste these JSON blocks directly!  "
     echo "==============================================="
