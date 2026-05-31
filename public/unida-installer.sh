@@ -768,6 +768,24 @@ EOF
     echo "DNSTT MUST be running in your VPN app for the above '127.0.0.1:1080' to work!"
     echo "==============================================="
     echo ""
+    
+    CURRENT_PORT=$(grep '^BACKEND_PORT=' /etc/default/dnstt-unida | cut -d= -f2)
+    if [ "$CURRENT_PORT" != "10080" ] && [ "$CURRENT_PORT" != "10081" ]; then
+        read -rp "Would you like to automatically switch your DNSTT Backend to VLESS (Port 10080)? [y/N]: " enable_v2ray
+        if [[ "$enable_v2ray" =~ ^[Yy]$ ]]; then
+            echo "[+] Modifying backend port to 10080 (VLESS TCP)..."
+            sed -i 's/^BACKEND_PORT=.*/BACKEND_PORT=10080/g' /etc/default/dnstt-unida
+            cat > /etc/default/dnstt-unida-proxy <<EOF_PROXY
+PROXY_PORT=10080
+EOF_PROXY
+            echo "[+] Restarting services..."
+            systemctl daemon-reload
+            systemctl restart dnstt-unida.service dnstt-unida-proxy.service 2>/dev/null || true
+            echo "[+] V2Ray / VLESS Backend is now ACTIVE."
+        fi
+    else
+        echo "[+] DNSTT is currently forwarding to V2Ray on Port ${CURRENT_PORT} (VLESS/VMESS ACTIVE)."
+    fi
     pause
 }
 
@@ -844,8 +862,9 @@ add_tunnel() {
     echo "  5) DoH (DNS over HTTPS) Guide"
     echo "  6) Slipstream / QUIC Guide"
     echo "  7) Install ALL Tunnels (Multi-Protocol)"
+    echo "  8) Install V2Ray/Xray (VLESS/VMESS)"
     echo "  0) Back to main menu"
-    read -rp "Select tunnel type [0-7]: " tun_type
+    read -rp "Select tunnel type [0-8]: " tun_type
     
     IPV4=$(curl -s4 icanhazip.com || hostname -I | awk '{print $1}')
     NS_DOMAIN=$(grep "ExecStart=" /etc/systemd/system/dnstt-unida.service 2>/dev/null | sed -n 's/.*server\.key \([^ ]*\) .*/\1/p' || echo "yourdomain.com")
@@ -1230,6 +1249,10 @@ EOF
             echo " => DNS over QUIC : Port 853 (UDP)"
             echo "============================================="
             ;;
+        8)
+            echo "==> Configuring V2Ray/Xray (VLESS/VMESS) DNSTT Tunnel..."
+            show_v2ray_details
+            ;;
         0) return ;;
         *) echo "Invalid option" ;;
     esac
@@ -1382,7 +1405,7 @@ main_menu() {
         echo "  7) Show Server Public Key"
         echo "  8) Change Backend Target (SOCKS5/SSH/VLESS)"
         echo "  9) Change MTU Size"
-        echo " 10) Show V2Ray/SlowDNS App Details"
+        echo " 10) V2Ray DNSTT Configs & Setup"
         echo " 11) Update Unida System (From URL)"
         echo " 12) Uninstall Unida Server"
         echo " 13) Add Tunnel"
