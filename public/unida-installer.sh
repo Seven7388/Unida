@@ -247,7 +247,8 @@ chmod 600 /etc/dnstt/server.key
 chmod 644 /etc/dnstt/server.pub
 
 echo "==> Kusakinisha Xray-core (VLESS na VMESS TCP)..."
-bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1 || true
+curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/install-xray.sh
+bash /tmp/install-xray.sh install
 if [ -f /usr/local/bin/xray ]; then
   XRAY_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "1a2b3c4d-5e6f-7g8h-9i0j-1k2l3m4n5o6p")
   cat >/usr/local/etc/xray/config.json <<EOF
@@ -697,6 +698,22 @@ show_v2ray_details() {
     echo "  V2Ray Target Port: 443 (Usually Ignored via DNSTT)"
     echo "  Network / Transport: TCP"
     echo "  Security: None (Plain)"
+    echo "==============================================="
+    echo "       HOW TO CONNECT in Npv Tunnel (Android)   "
+    echo "==============================================="
+    echo "1. Connection Method: Set to 'DNSTT + V2Ray'"
+    echo "2. DNSTT Settings:"
+    echo "   - DNS Nameserver: ${NS_DOMAIN}"
+    echo "   - Public Key: ${PUBKEY}"
+    echo "   - DNS Resolver: 1.1.1.1 (or 8.8.8.8)"
+    echo "3. V2Ray Configuration:"
+    echo "   - V2Ray Server Host: 127.0.0.1"
+    echo "   - V2Ray Server Port: 1080 (or your app's local DNSTT proxy port)"
+    echo "   - UUID: ${XRAY_UUID}"
+    echo "   - Protocol: vless"
+    echo "   - Network: tcp"
+    echo "   - Security: none"
+    echo "   Then press Start!"
     echo "==============================================="
     echo "       VLESS & VMESS JSON CONFIGURATIONS       "
     echo "   Copy and paste these JSON blocks directly!  "
