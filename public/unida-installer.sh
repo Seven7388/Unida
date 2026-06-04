@@ -291,7 +291,9 @@ if [ -f /usr/local/bin/xray ]; then
   "outbounds": [
     {
       "protocol": "freedom",
-      "settings": {}
+      "settings": {
+        "domainStrategy": "UseIP"
+      }
     }
   ]
 }
