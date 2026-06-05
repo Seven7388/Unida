@@ -132,19 +132,17 @@ done
 echo "==> Clearing required ports (Killing any blocking processes)..."
 if command -v fuser >/dev/null 2>&1; then
 
-# Force IPv4 preference for stable connection on VPS
-echo "==> Forcing VPS to prioritize IPv4 (fixing IPv6 stalling for apps like Instagram)..."
+# Set IPv4 precedence for stable connection on VPS
+echo "==> Configuring VPS to prefer IPv4 over IPv6..."
 cat >> /etc/gai.conf << 'EOF'
 precedence ::ffff:0:0/96  100
 EOF
 
-# Disable IPv6 via sysctl to avoid routing blackholes
-cat >> /etc/sysctl.conf << 'EOF'
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
-EOF
+# Ensure IPv6 is enabled for apps that require it
+echo "==> Re-enabling IPv6..."
+sed -i '/disable_ipv6/d' /etc/sysctl.conf
 sysctl -p >/dev/null 2>&1
+
 
   fuser -k 53/udp >/dev/null 2>&1 || true
   fuser -k 53/tcp >/dev/null 2>&1 || true
@@ -227,7 +225,7 @@ After=network.target
 Type=simple
 LimitNOFILE=1048576
 LimitNPROC=1048576
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 10000 --max-connections-for-client 30
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 1000 --max-connections-for-client 10
 Restart=always
 
 [Install]
