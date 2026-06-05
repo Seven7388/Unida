@@ -131,6 +131,21 @@ done
 
 echo "==> Clearing required ports (Killing any blocking processes)..."
 if command -v fuser >/dev/null 2>&1; then
+
+# Force IPv4 preference for stable connection on VPS
+echo "==> Forcing VPS to prioritize IPv4 (fixing IPv6 stalling for apps like Instagram)..."
+cat >> /etc/gai.conf << 'EOF'
+precedence ::ffff:0:0/96  100
+EOF
+
+# Disable IPv6 via sysctl to avoid routing blackholes
+cat >> /etc/sysctl.conf << 'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+sysctl -p >/dev/null 2>&1
+
   fuser -k 53/udp >/dev/null 2>&1 || true
   fuser -k 53/tcp >/dev/null 2>&1 || true
   fuser -k 5300/udp >/dev/null 2>&1 || true
@@ -195,21 +210,10 @@ EOF
 systemctl restart danted >/dev/null 2>&1 || true
 systemctl enable danted >/dev/null 2>&1 || true
 
-echo "==> Kupakua and Compiling BadVPN UDPGW (UDP via TCP)..."
-echo "    (Please wait 1-3 minutes while BadVPN compiles from source...)"
+echo "==> Kupakua BadVPN UDPGW (UDP via TCP)..."
 if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
-  cd /tmp
-  git clone https://github.com/ambrop72/badvpn.git >/dev/null 2>&1 || true
-  if [ -d /tmp/badvpn ]; then
-    cd badvpn
-    cmake -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null 2>&1
-    make >/dev/null 2>&1
-    cp udpgw/badvpn-udpgw /usr/local/bin/
-    cd /tmp
-    rm -rf badvpn
-  else
-    echo "[-] BadVPN download failed, continuing without it..."
-  fi
+  wget -q -O /usr/local/bin/badvpn-udpgw https://raw.githubusercontent.com/daybreakersx/premscript/master/badvpn-udpgw64
+  chmod +x /usr/local/bin/badvpn-udpgw
 fi
 
 if [ -f /usr/local/bin/badvpn-udpgw ]; then
