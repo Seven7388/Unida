@@ -208,22 +208,11 @@ EOF
 systemctl restart danted >/dev/null 2>&1 || true
 systemctl enable danted >/dev/null 2>&1 || true
 
-echo "==> Kupakua and Compiling BadVPN UDPGW (UDP via TCP)..."
-echo "    (Please wait 1-3 minutes while BadVPN compiles from source...)"
+echo "==> Kupakua and Installing High-Performance BadVPN UDPGW..."
 rm -f /usr/local/bin/badvpn-udpgw
 if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
-  cd /tmp
-  git clone https://github.com/ambrop72/badvpn.git >/dev/null 2>&1 || true
-  if [ -d /tmp/badvpn ]; then
-    cd badvpn
-    cmake -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null 2>&1
-    make >/dev/null 2>&1
-    cp udpgw/badvpn-udpgw /usr/local/bin/
-    cd /tmp
-    rm -rf badvpn
-  else
-    echo "[-] BadVPN download failed, continuing without it..."
-  fi
+  wget -q -O /usr/local/bin/badvpn-udpgw https://raw.githubusercontent.com/daybreakersx/premscript/master/badvpn-udpgw64
+  chmod +x /usr/local/bin/badvpn-udpgw
 fi
 
 if [ -f /usr/local/bin/badvpn-udpgw ]; then
@@ -237,7 +226,7 @@ After=network.target
 Type=simple
 LimitNOFILE=1048576
 LimitNPROC=1048576
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 500 --max-connections-for-client 10 --client-socket-sndbuf 100000
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 10000 --max-connections-for-client 30
 Restart=always
 
 [Install]
@@ -254,7 +243,7 @@ After=network.target
 Type=simple
 LimitNOFILE=1048576
 LimitNPROC=1048576
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr [::1]:7300 --max-clients 500 --max-connections-for-client 10 --client-socket-sndbuf 100000
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr [::1]:7300 --max-clients 10000 --max-connections-for-client 30
 Restart=always
 
 [Install]
@@ -1605,6 +1594,7 @@ if [ -n "$ETH" ]; then
   # Block outgoing QUIC (UDP 443) to force Instagram/YouTube to use TCP
   # This makes DNSTT much faster by avoiding UDP fragmentation.
   iptables -A OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
+  iptables -I FORWARD -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
 
   iptables-save > /etc/iptables.up.rules
 
