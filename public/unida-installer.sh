@@ -208,10 +208,22 @@ EOF
 systemctl restart danted >/dev/null 2>&1 || true
 systemctl enable danted >/dev/null 2>&1 || true
 
-echo "==> Kupakua BadVPN UDPGW (UDP via TCP)..."
+echo "==> Kupakua and Compiling BadVPN UDPGW (UDP via TCP)..."
+echo "    (Please wait 1-3 minutes while BadVPN compiles from source...)"
+rm -f /usr/local/bin/badvpn-udpgw
 if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
-  wget -q -O /usr/local/bin/badvpn-udpgw https://raw.githubusercontent.com/daybreakersx/premscript/master/badvpn-udpgw64
-  chmod +x /usr/local/bin/badvpn-udpgw
+  cd /tmp
+  git clone https://github.com/ambrop72/badvpn.git >/dev/null 2>&1 || true
+  if [ -d /tmp/badvpn ]; then
+    cd badvpn
+    cmake -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null 2>&1
+    make >/dev/null 2>&1
+    cp udpgw/badvpn-udpgw /usr/local/bin/
+    cd /tmp
+    rm -rf badvpn
+  else
+    echo "[-] BadVPN download failed, continuing without it..."
+  fi
 fi
 
 if [ -f /usr/local/bin/badvpn-udpgw ]; then
