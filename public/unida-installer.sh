@@ -208,10 +208,23 @@ EOF
 systemctl restart danted >/dev/null 2>&1 || true
 systemctl enable danted >/dev/null 2>&1 || true
 
-echo "==> Kupakua and Installing High-Performance BadVPN UDPGW..."
+echo "==> Compiling High-Performance BadVPN UDPGW from source..."
 rm -f /usr/local/bin/badvpn-udpgw
 if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
-  wget -q -O /usr/local/bin/badvpn-udpgw https://raw.githubusercontent.com/daybreakersx/premscript/master/badvpn-udpgw64
+  cd /tmp
+  rm -rf badvpn
+  git clone https://github.com/ambrop72/badvpn.git >/dev/null 2>&1 || true
+  if [ -d /tmp/badvpn ]; then
+    cd badvpn
+    cmake -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1
+    make >/dev/null 2>&1
+    cp udpgw/badvpn-udpgw /usr/local/bin/
+    cd /tmp
+    rm -rf badvpn
+  else
+    echo "[-] BadVPN download failed, falling back to precompiled..."
+    wget -q -O /usr/local/bin/badvpn-udpgw https://raw.githubusercontent.com/daybreakersx/premscript/master/badvpn-udpgw64
+  fi
   chmod +x /usr/local/bin/badvpn-udpgw
 fi
 
@@ -1563,8 +1576,8 @@ sed -i 's/16777216/67108864/g' /etc/sysctl.conf
 sysctl -p >/dev/null 2>&1
 
 cat > /etc/cron.d/unida-autoclean << 'EOF_CRON'
-# UNIDA Auto Cleaner - Clears RAM and drops stalled connections every 4 hours
-0 */4 * * * root /bin/sync && /usr/bin/echo 3 > /proc/sys/vm/drop_caches && /bin/systemctl restart badvpn-udpgw badvpn-udpgw-ipv6 2>/dev/null && /bin/systemctl restart dnstt-unida 2>/dev/null
+# UNIDA Auto Cleaner & Speed Optimizer - Runs Option 16 automatically every 2 hours
+0 */2 * * * root /usr/local/bin/speed-optimizer >/dev/null 2>&1
 EOF_CRON
 chmod 644 /etc/cron.d/unida-autoclean
 systemctl restart cron 2>/dev/null || systemctl restart crond 2>/dev/null || true
@@ -1768,14 +1781,14 @@ fi
 CRON_FILE="/etc/cron.d/unida-autoclean"
 
 cat > "$CRON_FILE" << 'EOF'
-# UNIDA Auto Cleaner - Clears RAM and restarts stalled services every 4 hours
-0 */4 * * * root /bin/sync && /usr/bin/echo 3 > /proc/sys/vm/drop_caches && /bin/systemctl restart badvpn-udpgw badvpn-udpgw-ipv6 sshd stunnel4 xray dnstt-unida 2>/dev/null
+# UNIDA Auto Cleaner & Speed Optimizer - Runs Option 16 automatically every 2 hours
+0 */2 * * * root /usr/local/bin/speed-optimizer >/dev/null 2>&1
 EOF
 
 chmod 644 "$CRON_FILE"
 systemctl restart cron 2>/dev/null || systemctl restart crond 2>/dev/null || true
 
-echo "✅ Auto-Clean Cronjob Installed (Runs every 4 hours)!"
+echo "✅ Auto-Clean Cronjob Installed (Runs every 2 hours)!"
 echo "This will help prevent speed degradation over time by refreshing the cache and stalled VPN services."
 EOF_AUTOCLEAN
 chmod +x /usr/local/bin/auto-clean
