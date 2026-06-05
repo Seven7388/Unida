@@ -839,8 +839,8 @@ EOF_PROXY
 update_unida() {
     header
     echo "--- Update Unida System ---"
-    echo "This will download the latest script from GitHub and check for differences."
-    INSTALL_URL="https://raw.githubusercontent.com/Seven7388/Unida/main/public/unida-installer.sh"
+    echo "This will download the latest script."
+    INSTALL_URL="https://ais-pre-pbhaoyo2fd662viiufzhin-596623029126.europe-west2.run.app/unida-installer.sh"
     
     # Extract current parameters
     NS_DOMAIN=$(grep "ExecStart=" /etc/systemd/system/dnstt-unida.service | sed -n 's/.*server\.key \([^ ]*\) .*/\1/p' || echo "")
@@ -1601,6 +1601,10 @@ if [ -n "$ETH" ]; then
   iptables -I INPUT -p tcp --dport 443 -j ACCEPT
   iptables -I INPUT -p tcp --dport 1080 -j ACCEPT
   iptables -I INPUT -p tcp --dport 7300 -j ACCEPT
+  
+  # Block outgoing QUIC (UDP 443) to force Instagram/YouTube to use TCP
+  # This makes DNSTT much faster by avoiding UDP fragmentation.
+  iptables -A OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
 
   iptables-save > /etc/iptables.up.rules
 
@@ -1860,4 +1864,4 @@ echo "    See all commands: unida help"
 echo "==============================================="
 
 # Cache installer for future update checks
-curl -sL "https://raw.githubusercontent.com/Seven7388/Unida/main/public/unida-installer.sh" -o /etc/dnstt/unida-installer.sh 2>/dev/null || true
+curl -sL "https://ais-pre-pbhaoyo2fd662viiufzhin-596623029126.europe-west2.run.app/unida-installer.sh" -o /etc/dnstt/unida-installer.sh 2>/dev/null || true
