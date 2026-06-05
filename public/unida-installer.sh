@@ -840,7 +840,7 @@ update_unida() {
     header
     echo "--- Update Unida System ---"
     echo "This will download the latest script."
-    INSTALL_URL="https://ais-pre-pbhaoyo2fd662viiufzhin-596623029126.europe-west2.run.app/unida-installer.sh"
+    INSTALL_URL="https://raw.githubusercontent.com/Seven7388/Unida/main/public/unida-installer.sh"
     
     # Extract current parameters
     NS_DOMAIN=$(grep "ExecStart=" /etc/systemd/system/dnstt-unida.service | sed -n 's/.*server\.key \([^ ]*\) .*/\1/p' || echo "")
@@ -1864,4 +1864,4 @@ echo "    See all commands: unida help"
 echo "==============================================="
 
 # Cache installer for future update checks
-curl -sL "https://ais-pre-pbhaoyo2fd662viiufzhin-596623029126.europe-west2.run.app/unida-installer.sh" -o /etc/dnstt/unida-installer.sh 2>/dev/null || true
+curl -sL "https://raw.githubusercontent.com/Seven7388/Unida/main/public/unida-installer.sh" -o /etc/dnstt/unida-installer.sh 2>/dev/null || true
