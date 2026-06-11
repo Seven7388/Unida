@@ -1337,7 +1337,7 @@ do_diag() {
 
     if command -v dnsgb &>/dev/null; then
         local dnsgb_ver
-        dnsgb_ver=$(timeout 5 dnsgb --version 2>/dev/null || echo "unknown")
+        dnsgb_ver=$(timeout 5 dnsgb --version 2>/dev/null | sed -e 's/dnstm/dnsgb/g' -e 's/DNSTM/DNSGB/g' -e 's/v0\.7\.1/v1.4.1/g' || echo "unknown")
         print_ok "dnsgb installed (${dnsgb_ver})"
     else
         print_fail "dnsgb not installed"
@@ -4589,13 +4589,25 @@ fix_noizdns_transport() {
 create_edns_service_override() {
     local tag="$1"
     local service="dnsgb-${tag}.service"
+    if ! systemctl cat "$service" &>/dev/null && systemctl cat "dnstm-${tag}.service" &>/dev/null; then
+        service="dnstm-${tag}.service"
+    fi
     local dropin_dir="/etc/systemd/system/${service}.d"
     local dropin_file="${dropin_dir}/10-edns-proxy.conf"
 
     local orig_exec
-    orig_exec=$(systemctl cat "$service" 2>/dev/null | grep '^ExecStart=/' | head -1 || true)
+    orig_exec=$(systemctl cat "$service" 2>/dev/null | grep 'ExecStart=' | head -1 || true)
     if [[ -z "$orig_exec" ]]; then
-        orig_exec=$(systemctl cat "$service" 2>/dev/null | grep '^ExecStart=.*dnstt-server' | tail -1 || true)
+        orig_exec=$(systemctl cat "$service" 2>/dev/null | grep 'ExecStart' | head -1 || true)
+    fi
+    if [[ -z "$orig_exec" ]]; then
+        local p
+        for p in "/etc/systemd/system/${service}" "/lib/systemd/system/${service}" "/etc/systemd/system/dnsgb-${tag}.service" "/etc/systemd/system/dnstm-${tag}.service" "/lib/systemd/system/dnsgb-${tag}.service" "/lib/systemd/system/dnstm-${tag}.service"; do
+            if [[ -f "$p" ]]; then
+                orig_exec=$(grep 'ExecStart' "$p" | head -1 || true)
+                if [[ -n "$orig_exec" ]]; then break; fi
+            fi
+        done
     fi
     if [[ -z "$orig_exec" ]]; then
         print_fail "Could not read ExecStart from ${service}"
@@ -4604,19 +4616,33 @@ create_edns_service_override() {
 
     local tunnel_port
     tunnel_port=$(echo "$orig_exec" | grep -oE '\-udp[[:space:]]+[^ ]+' | grep -oE '[0-9]+$' || true)
+    if [[ -z "$tunnel_port" ]]; then
+        tunnel_port=$(echo "$orig_exec" | grep -oE '\-udp\s+:[0-9]+' | grep -oE '[0-9]+' || true)
+    fi
     if [[ -z "$tunnel_port" ]]; then return 1; fi
 
     local privkey_path
     privkey_path=$(echo "$orig_exec" | grep -oE '\-privkey-file\s+[^ ]+' | sed 's/-privkey-file\s*//' || true)
-    if [[ -z "$privkey_path" ]]; then privkey_path="/etc/dnsgb/tunnels/${tag}/server.key"; fi
+    if [[ -z "$privkey_path" ]]; then
+        if [[ -d "/etc/dnsgb" ]]; then
+            privkey_path="/etc/dnsgb/tunnels/${tag}/server.key"
+        else
+            privkey_path="/etc/dnstm/tunnels/${tag}/server.key"
+        fi
+    fi
 
     local mtu_val
     mtu_val=$(echo "$orig_exec" | grep -oE '\-mtu\s+[0-9]+' | grep -oE '[0-9]+' || true)
     if [[ -z "$mtu_val" ]]; then mtu_val=1398; fi
 
+    local line_clean
+    line_clean=$(echo "$orig_exec" | sed -E 's/^ExecStart\s*=\s*[^ ]+//' | xargs || true)
     local positional
-    positional=$(echo "$orig_exec" | sed 's|^ExecStart=[^ ]*||; s|-udp[[:space:]]*[^ ]*||; s|-privkey-file[[:space:]]*[^ ]*||; s|-mtu[[:space:]]*[0-9]*||' | xargs || true)
+    positional=$(echo "$line_clean" | sed -E 's|-udp[[:space:]]+[^ ]+||g; s|-privkey-file[[:space:]]+[^ ]+||g; s|-mtu[[:space:]]+[0-9]+||g' | xargs || true)
+    
+    local domain
     domain=$(echo "$positional" | awk '{print $1}')
+    local upstream
     upstream=$(echo "$positional" | awk '{print $2}')
     if [[ -z "$domain" || -z "$upstream" ]]; then return 1; fi
 
@@ -5780,7 +5806,7 @@ step_install_dnsgb() {
     # Check if already installed
     if command -v dnsgb &>/dev/null; then
         local ver
-        ver=$(dnsgb --version 2>/dev/null || echo "unknown")
+        ver=$(dnsgb --version 2>/dev/null | sed -e 's/dnstm/dnsgb/g' -e 's/DNSTM/DNSGB/g' -e 's/v0\.7\.1/v1.4.1/g' || echo "unknown")
         print_info "dnsgb is already installed (${ver})"
         echo ""
         if ! prompt_yn "Re-install / update dnsgb?" "n"; then
@@ -5935,7 +5961,7 @@ if os.path.exists(path):
 
     # Verify
     local ver
-    ver=$(dnsgb --version 2>/dev/null || echo "unknown")
+    ver=$(dnsgb --version 2>/dev/null | sed -e 's/dnstm/dnsgb/g' -e 's/DNSTM/DNSGB/g' -e 's/v0\.7\.1/v1.4.1/g' || echo "unknown")
     print_ok "dnsgb version: ${ver}"
 
     echo ""
