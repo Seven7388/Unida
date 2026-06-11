@@ -5843,7 +5843,20 @@ step_install_dnsgb() {
     arch=$(detect_architecture)
     if curl -fsSL -o /usr/local/bin/dnsgb "https://github.com/net2share/dnstm/releases/latest/download/dnstm-linux-${arch}"; then
         chmod +x /usr/local/bin/dnsgb
-        print_ok "Downloaded dnsgb binary for ${arch}"
+        # In-place hotpatch to replace "dnstm"/"DNSTM" strings with "dnsgb"/"DNSGB"
+        # It corrects systemd service names, configs, paths, and stdout/stderr messages
+        python3 -c '
+import os
+path = "/usr/local/bin/dnsgb"
+if os.path.exists(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    data = data.replace(b"dnstm", b"dnsgb")
+    data = data.replace(b"DNSTM", b"DNSGB")
+    with open(path, "wb") as f:
+        f.write(data)
+' 2>/dev/null || true
+        print_ok "Downloaded and patched dnsgb binary for ${arch}"
     else
         print_fail "Failed to download dnsgb for ${arch} architecture"
         exit 1
