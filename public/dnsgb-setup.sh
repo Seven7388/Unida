@@ -7272,7 +7272,7 @@ step_tests() {
 
     # Test 3: Router status
     echo -e "  ${BOLD}Test 3: DNS Router${NC}"
-    if dnsgb router status 2>/dev/null | grep -qi "running"; then
+    if dnsgb router status 2>/dev/null | grep -qi "running" || systemctl is-active --quiet dnsgb-dnsrouter 2>/dev/null || systemctl is-active --quiet dnsgb-dnsrouter.service 2>/dev/null; then
         print_ok "DNS Router: PASS (running)"
         pass=$((pass + 1))
     else
@@ -7648,7 +7648,7 @@ do_add_domain() {
     fi
 
     # Check router is running
-    if ! dnsgb router status 2>/dev/null | grep -qi "running"; then
+    if ! systemctl is-active --quiet dnsgb-dnsrouter 2>/dev/null && ! systemctl is-active --quiet dnsgb-dnsrouter.service 2>/dev/null && ! dnsgb router status 2>/dev/null | grep -qi "running"; then
         print_warn "DNS Router is not running. Starting it..."
         dnsgb router start 2>/dev/null || true
     fi
