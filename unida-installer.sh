@@ -563,6 +563,12 @@ show_status() {
     echo ""
     echo "--- Xray Core Status ---"
     systemctl status xray.service --no-pager 2>/dev/null || true
+    echo ""
+    echo "--- SSH Daemon Status ---"
+    systemctl status sshd.service --no-pager 2>/dev/null || systemctl status ssh.service --no-pager 2>/dev/null || true
+    echo ""
+    echo "--- System Resolver Status ---"
+    systemctl status systemd-resolved.service --no-pager 2>/dev/null || true
     pause
 }
 

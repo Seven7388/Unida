@@ -583,7 +583,7 @@ show_help() {
     echo "  --remove-tunnel [tag]  Remove a specific tunnel (interactive if no tag given)"
     echo "  --add-domain   Add another domain to an existing server (backup/fallback)"
     echo "  --users        Manage SSH tunnel users (add, list, update, delete)"
-    echo "  --mtu <value>  Set DNSTT MTU size (512-1400, default: 1232)"
+    echo "  --mtu <value>  Set DNSTT MTU size (512-2000, default: 1232)"
     echo "  --harden       Apply service and resolver hardening to an existing setup"
     echo "  --cleanup      Emergency disk cleanup (truncate logs, vacuum journal, apply fixes)"
     echo "  --update       Check for updates and install latest version"
@@ -847,6 +847,64 @@ do_status() {
     else
         print_warn "Could not get tunnel list"
     fi
+    echo ""
+
+    echo -e "  ${BOLD}System Services Status${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    local svcs=(
+        "microsocks.service" "SOCKS5 Proxy (microsocks)"
+        "dnsgb-dnsrouter.service" "DNS Router/Forwarder"
+        "badvpn-udpgw.service" "badvpn UDP Gateway (IPv4)"
+        "badvpn-udpgw-ipv6.service" "badvpn UDP Gateway (IPv6)"
+        "systemd-resolved.service" "Local System DNS Resolver"
+    )
+
+    # Detect proper SSH daemon service name
+    if systemctl list-unit-files sshd.service &>/dev/null; then
+        svcs+=("sshd.service" "SSH Daemon (sshd)")
+    elif systemctl list-unit-files ssh.service &>/dev/null; then
+        svcs+=("ssh.service" "SSH Daemon (ssh)")
+    else
+        svcs+=("sshd.service" "SSH Daemon (sshd)")
+    fi
+
+    # Detect Xray/3x-ui panel if installed
+    if systemctl list-unit-files x-ui.service &>/dev/null; then
+        svcs+=("x-ui.service" "3x-ui / Xray Management Panel")
+    fi
+    if systemctl list-unit-files xray.service &>/dev/null; then
+        svcs+=("xray.service" "Xray CORE Service")
+    fi
+
+    local i
+    for ((i=0; i<${#svcs[@]}; i+=2)); do
+        local svc="${svcs[i]}"
+        local desc="${svcs[i+1]}"
+        
+        local status_str
+        if ! systemctl list-unit-files "$svc" &>/dev/null; then
+            status_str="${DIM}Not Configured${NC}"
+        elif systemctl is-active --quiet "$svc" 2>/dev/null; then
+            status_str="${GREEN}● Active (running)${NC}"
+        else
+            status_str="${YELLOW}○ Inactive (stopped)${NC}"
+        fi
+        
+        printf "  %-35s %b\n" "$desc" "$status_str"
+    done
+
+    # Audit check for EDNS Client-Subnet Proxy (runs within DNSTT service/process space)
+    local edns_desc="EDNS Client-Subnet Proxy"
+    local edns_status
+    if [[ ! -f /usr/local/bin/dnsgb-edns-proxy.py ]]; then
+        edns_status="${DIM}Not Configured${NC}"
+    elif pgrep -f dnsgb-edns-proxy.py &>/dev/null; then
+        edns_status="${GREEN}● Active (running)${NC}"
+    else
+        edns_status="${YELLOW}○ Inactive (stopped)${NC}"
+    fi
+    printf "  %-35s %b\n" "$edns_desc" "$edns_status"
+
     echo ""
 
     # ─── Detect SOCKS auth via dnsgb ───
@@ -2291,11 +2349,11 @@ do_change_mtu() {
 
     echo ""
     local new_mtu
-    new_mtu=$(prompt_input "Enter new MTU value for ALL DNSTT tunnels (512-1400)" "1100")
+    new_mtu=$(prompt_input "Enter new MTU value for ALL DNSTT tunnels (512-2000)" "1100")
     new_mtu=$(echo "$new_mtu" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
-    if ! [[ "$new_mtu" =~ ^[0-9]+$ ]] || [[ "$new_mtu" -lt 512 ]] || [[ "$new_mtu" -gt 1400 ]]; then
-        print_fail "Invalid MTU value. Must be 512-1400."
+    if ! [[ "$new_mtu" =~ ^[0-9]+$ ]] || [[ "$new_mtu" -lt 512 ]] || [[ "$new_mtu" -gt 2000 ]]; then
+        print_fail "Invalid MTU value. Must be 512-2000."
         return 1
     fi
 
@@ -2674,8 +2732,8 @@ do_add_tunnel() {
     local mtu_flag=""
     if [[ "$transport" == "dnstt" ]]; then
         local mtu_input
-        mtu_input=$(prompt_input "DNSTT MTU size (512-1400)" "$DNSTT_MTU")
-        if [[ "$mtu_input" =~ ^[0-9]+$ ]] && [[ "$mtu_input" -ge 512 ]] && [[ "$mtu_input" -le 1400 ]]; then
+        mtu_input=$(prompt_input "DNSTT MTU size (512-2000)" "$DNSTT_MTU")
+        if [[ "$mtu_input" =~ ^[0-9]+$ ]] && [[ "$mtu_input" -ge 512 ]] && [[ "$mtu_input" -le 2000 ]]; then
             mtu_flag="--mtu $mtu_input"
             print_ok "MTU: ${mtu_input}"
         else
@@ -6230,14 +6288,48 @@ step_verify_port53() {
     fi
 
     if command -v iptables &>/dev/null; then
-        # Check if rules already exist before adding
-        if ! iptables -C INPUT -p tcp --dport 53 -j ACCEPT &>/dev/null; then
-            iptables -A INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+        # On Oracle Cloud, default rules have a REJECT rule at the end. 
+        # Using -A (append) puts the ACCEPT rule after REJECT, which blocks traffic.
+        # We delete existing rules and insert (-I INPUT 1) at the very top of the chain.
+        iptables -D INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+        iptables -I INPUT 1 -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+        iptables -I INPUT 1 -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+        
+        # Also ensure loopback is allowed (essential for proxy and dnstt backends)
+        iptables -D INPUT -i lo -j ACCEPT 2>/dev/null || true
+        iptables -I INPUT 1 -i lo -j ACCEPT 2>/dev/null || true
+
+        # For game traffic / BadVPN UDPGW
+        iptables -D INPUT -p tcp --dport 7300 -j ACCEPT 2>/dev/null || true
+        iptables -I INPUT 1 -p tcp --dport 7300 -j ACCEPT 2>/dev/null || true
+        
+        # Enable kernel-level NAT masquerading, forwarding, and block outgoing QUIC to force TCP fallback (improves speed & reliability)
+        local eth_if
+        eth_if=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' || ip route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' || true)
+        if [[ -n "$eth_if" ]]; then
+            iptables -t nat -D POSTROUTING -o "$eth_if" -j MASQUERADE 2>/dev/null || true
+            iptables -D FORWARD -o "$eth_if" -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -i "$eth_if" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+            iptables -D OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+            iptables -D FORWARD -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+
+            iptables -t nat -A POSTROUTING -o "$eth_if" -j MASQUERADE 2>/dev/null || true
+            iptables -P FORWARD ACCEPT 2>/dev/null || true
+            iptables -I FORWARD 1 -o "$eth_if" -j ACCEPT 2>/dev/null || true
+            iptables -I FORWARD 1 -i "$eth_if" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+            
+            iptables -A OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+            iptables -I FORWARD 1 -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
         fi
-        if ! iptables -C INPUT -p udp --dport 53 -j ACCEPT &>/dev/null; then
-            iptables -A INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+
+        # Save the rules to be persistent across restarts on Debian/Ubuntu
+        if command -v iptables-save &>/dev/null; then
+            mkdir -p /etc/iptables 2>/dev/null || true
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            iptables-save > /etc/iptables.up.rules 2>/dev/null || true
         fi
-        print_ok "iptables: port 53 TCP/UDP allowed"
+        print_ok "iptables: port 53 (TCP/UDP), loopback, badvpn (7300), and NAT masquerade forwarding enabled"
     fi
 
     echo ""
@@ -6261,8 +6353,8 @@ step_create_tunnels() {
 
     # Ask for DNSTT MTU (use CLI value as default if provided via --mtu)
     local mtu_input
-    mtu_input=$(prompt_input "DNSTT MTU size (512-1400, affects packet size)" "$DNSTT_MTU")
-    if [[ "$mtu_input" =~ ^[0-9]+$ ]] && [[ "$mtu_input" -ge 512 ]] && [[ "$mtu_input" -le 1400 ]]; then
+    mtu_input=$(prompt_input "DNSTT MTU size (512-2000, affects packet size)" "$DNSTT_MTU")
+    if [[ "$mtu_input" =~ ^[0-9]+$ ]] && [[ "$mtu_input" -ge 512 ]] && [[ "$mtu_input" -le 2000 ]]; then
         DNSTT_MTU="$mtu_input"
     else
         print_warn "Invalid MTU value; using default ${DNSTT_MTU}"
@@ -7577,8 +7669,8 @@ do_add_domain() {
 
     # Ask for DNSTT MTU (use CLI value as default if provided via --mtu)
     local mtu_input
-    mtu_input=$(prompt_input "DNSTT MTU size (512-1400, affects packet size)" "$DNSTT_MTU")
-    if [[ "$mtu_input" =~ ^[0-9]+$ ]] && [[ "$mtu_input" -ge 512 ]] && [[ "$mtu_input" -le 1400 ]]; then
+    mtu_input=$(prompt_input "DNSTT MTU size (512-2000, affects packet size)" "$DNSTT_MTU")
+    if [[ "$mtu_input" =~ ^[0-9]+$ ]] && [[ "$mtu_input" -ge 512 ]] && [[ "$mtu_input" -le 2000 ]]; then
         DNSTT_MTU="$mtu_input"
     else
         print_warn "Invalid MTU value; using default ${DNSTT_MTU}"
@@ -8184,11 +8276,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --mtu)
-            if [[ -n "${2:-}" ]] && [[ "$2" =~ ^[0-9]+$ ]] && [[ "$2" -ge 512 ]] && [[ "$2" -le 1400 ]]; then
+            if [[ -n "${2:-}" ]] && [[ "$2" =~ ^[0-9]+$ ]] && [[ "$2" -ge 512 ]] && [[ "$2" -le 2000 ]]; then
                 DNSTT_MTU="$2"
                 shift 2
             else
-                echo "Error: --mtu requires a value between 512 and 1400"
+                echo "Error: --mtu requires a value between 512 and 2000"
                 exit 1
             fi
             ;;
