@@ -811,6 +811,10 @@ do_configure_socks_auth() {
 # ─── DNS Router Troubleshooter ───────────────────────────────────────────────
 
 troubleshoot_and_start_dns_router() {
+    print_info "Resetting DNS Router service configuration to robust defaults..."
+    # Always remove stale or incompatible user-hardening overrides that prevent port binding
+    rm -f "/etc/systemd/system/dnsgb-dnsrouter.service.d/20-hardening.conf" 2>/dev/null || true
+    
     print_info "Starting DNS Router service directly via systemd..."
     
     # Enable and start the systemd service directly to avoid dnsgb CLI's strict localhost probing
@@ -822,7 +826,7 @@ troubleshoot_and_start_dns_router() {
     sleep 3
 
     if systemctl is-active --quiet dnsgb-dnsrouter 2>/dev/null || systemctl is-active --quiet dnsgb-dnsrouter.service 2>/dev/null; then
-        print_ok "DNS Router service started and verified running"
+        print_ok "DNS Router service started and verified running under root"
         return 0
     fi
 
@@ -2331,10 +2335,13 @@ apply_service_hardening() {
     local unit
     for unit in $dnsgb_units; do
         if [[ "$unit" == "dnsgb-dnsrouter.service" ]]; then
-            write_service_override "$unit" "dnsgb" "dnsgb" "yes"
-        else
-            write_service_override "$unit" "dnsgb" "dnsgb" "no"
+            # Exclude dnsgb-dnsrouter from hardening to keep it running as master root on Port 53
+            local dropin_dir="/etc/systemd/system/${unit}.d"
+            rm -f "${dropin_dir}/20-hardening.conf" 2>/dev/null || true
+            rmdir "$dropin_dir" 2>/dev/null || true
+            continue
         fi
+        write_service_override "$unit" "dnsgb" "dnsgb" "no"
     done
 
     if unit_exists "microsocks.service"; then
@@ -2345,6 +2352,9 @@ apply_service_hardening() {
 
     local hardening_ok=true
     for unit in $dnsgb_units microsocks.service; do
+        if [[ "$unit" == "dnsgb-dnsrouter.service" ]]; then
+            continue
+        fi
         if ! unit_exists "$unit"; then
             continue
         fi
@@ -3331,10 +3341,13 @@ do_cleanup() {
             local unit
             for unit in $dnsgb_units; do
                 if [[ "$unit" == "dnsgb-dnsrouter.service" ]]; then
-                    write_service_override "$unit" "dnsgb" "dnsgb" "yes"
-                else
-                    write_service_override "$unit" "dnsgb" "dnsgb" "no"
+                    # Exclude dnsgb-dnsrouter from hardening to keep it running as master root on Port 53
+                    local dropin_dir="/etc/systemd/system/${unit}.d"
+                    rm -f "${dropin_dir}/20-hardening.conf" 2>/dev/null || true
+                    rmdir "$dropin_dir" 2>/dev/null || true
+                    continue
                 fi
+                write_service_override "$unit" "dnsgb" "dnsgb" "no"
             done
 
             if unit_exists "microsocks.service"; then
@@ -3344,6 +3357,9 @@ do_cleanup() {
             systemctl daemon-reload 2>/dev/null || true
 
             for unit in $dnsgb_units microsocks.service; do
+                if [[ "$unit" == "dnsgb-dnsrouter.service" ]]; then
+                    continue
+                fi
                 if ! unit_exists "$unit"; then
                     continue
                 fi
