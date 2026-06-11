@@ -1,0 +1,11497 @@
+#!/usr/bin/env bash
+#
+# dnsgb-setup v1.4.1
+# Interactive DNS Tunnel Setup
+# Sets up Slipstream + DNSTT + NoizDNS + VayDNS tunnels for censorship-resistant internet access
+#
+# Made By SamNet Technologies - Saman
+# GitHub: github.com/SamNet-dev/dnsgb-setup
+# License: MIT
+
+set -euo pipefail
+
+VERSION="1.4.1"
+TOTAL_STEPS=12
+
+# ─── Safety: ensure DNS is never left broken on exit ──────────────────────────
+
+_dnsgb_cleanup_dns() {
+    # If resolv.conf is empty, missing, points at a dead stub, or has no nameservers, fix it.
+    local _needs_dns_fix=false
+    if [[ ! -s /etc/resolv.conf ]]; then
+        _needs_dns_fix=true
+    elif grep -q '127\.0\.0\.53' /etc/resolv.conf 2>/dev/null && \
+         ! ss -ulnp 2>/dev/null | grep -q '127\.0\.0\.53.*systemd-resolve'; then
+        _needs_dns_fix=true
+    elif ! grep -q '^nameserver' /etc/resolv.conf 2>/dev/null; then
+        _needs_dns_fix=true
+    fi
+    if [[ "$_needs_dns_fix" == true ]]; then
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        rm -f /etc/resolv.conf 2>/dev/null || true
+        cat > /etc/resolv.conf 2>/dev/null <<'DNSEOF' || true
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+DNSEOF
+    fi
+}
+trap '_dnsgb_cleanup_dns' EXIT
+
+# ─── Colors & Formatting ───────────────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m' # No Color
+
+CHECK="${GREEN}[✓]${NC}"
+CROSS="${RED}[✗]${NC}"
+WARN="${YELLOW}[!]${NC}"
+INFO="${CYAN}[i]${NC}"
+
+# ─── TUI Helper Functions ──────────────────────────────────────────────────────
+
+print_header() {
+    local title="$1"
+    local width=60
+    local line
+    line=$(printf '─%.0s' $(seq 1 $width))
+    echo ""
+    echo -e "${BOLD}${CYAN}┌${line}┐${NC}"
+    printf "${BOLD}${CYAN}│${NC} %-$((width - 1))s${BOLD}${CYAN}│${NC}\n" "$title"
+    echo -e "${BOLD}${CYAN}└${line}┘${NC}"
+    echo ""
+}
+
+print_step() {
+    local step=$1
+    local title="$2"
+    echo ""
+    echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${BOLD}[${step}/${TOTAL_STEPS}]${NC}  ${BOLD}${title}${NC}"
+    echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+}
+
+print_ok() {
+    echo -e "  ${CHECK} $1"
+}
+
+print_fail() {
+    echo -e "  ${CROSS} $1"
+}
+
+print_warn() {
+    echo -e "  ${WARN} $1"
+}
+
+print_info() {
+    echo -e "  ${INFO} $1"
+}
+
+print_box() {
+    local lines=("$@")
+    # Calculate width from longest line
+    local width=58
+    for l in "${lines[@]}"; do
+        local len=${#l}
+        if (( len + 2 > width )); then
+            width=$((len + 2))
+        fi
+    done
+    local line
+    line=$(printf '─%.0s' $(seq 1 $width))
+    echo -e "  ${DIM}┌${line}┐${NC}"
+    for l in "${lines[@]}"; do
+        printf "  ${DIM}│${NC} %-$((width - 1))s${DIM}│${NC}\n" "$l"
+    done
+    echo -e "  ${DIM}└${line}┘${NC}"
+}
+
+# Check if a tunnel tag exists in dnsgb tunnel list output.
+# Handles both `tag=name` and bare `name` formats in the output.
+# Usage: dnsgb_tag_exists <tag>
+dnsgb_tag_exists() {
+    local t="$1"
+    local output
+    output=$(dnsgb tunnel list 2>/dev/null || true)
+    [[ -z "$output" ]] && return 1
+    # Try tag=name format first
+    if echo "$output" | grep -qwF "tag=${t}"; then
+        return 0
+    fi
+    # Fallback: check if the tag appears as a standalone word anywhere
+    if echo "$output" | grep -qwF "$t"; then
+        return 0
+    fi
+    return 1
+}
+
+# Extract all tunnel tags from dnsgb tunnel list output.
+# Handles both `tag=name` and other formats.
+# Usage: tags=$(dnsgb_get_tags)
+dnsgb_get_tags() {
+    local output
+    output=$(dnsgb tunnel list 2>/dev/null || true)
+    [[ -z "$output" ]] && return
+    # Try tag=name format first
+    local tags
+    tags=$(echo "$output" | grep -oE 'tag=[^ ]+' | sed 's/tag=//' || true)
+    if [[ -n "$tags" ]]; then
+        echo "$tags"
+        return
+    fi
+    # Fallback: extract known tag patterns (slip*, dnstt*, noiz*, xray*)
+    echo "$output" | grep -oE '\b(slip|dnstt|noiz|vay|xray)[a-z0-9_-]*' | sort -u || true
+}
+
+# Check if any tunnels exist
+dnsgb_has_tunnels() {
+    local output
+    output=$(dnsgb tunnel list 2>/dev/null || true)
+    [[ -n "$output" ]] && echo "$output" | grep -qiE 'tag=|slip|dnstt|noiz|vay|xray'
+}
+
+# Check if installed dnsgb has native VayDNS transport support (v0.7.0+).
+# Returns 0 (true) if native vaydns is supported, 1 (false) if we need the
+# legacy DNSTT-with-binary-swap approach.
+# Result is cached in _DNSGB_VAYDNS_NATIVE for the duration of the script run.
+_DNSGB_VAYDNS_NATIVE=""
+dnsgb_supports_vaydns() {
+    if [[ "$_DNSGB_VAYDNS_NATIVE" == "yes" ]]; then
+        return 0
+    fi
+    if [[ "$_DNSGB_VAYDNS_NATIVE" == "no" ]]; then
+        return 1
+    fi
+    if ! command -v dnsgb &>/dev/null; then
+        _DNSGB_VAYDNS_NATIVE="no"
+        return 1
+    fi
+    if timeout 5 dnsgb tunnel add --help 2>&1 | grep -qE -- '--transport.*vaydns|VayDNS'; then
+        _DNSGB_VAYDNS_NATIVE="yes"
+        return 0
+    else
+        _DNSGB_VAYDNS_NATIVE="no"
+        return 1
+    fi
+}
+
+prompt_yn() {
+    local question="$1"
+    local default="${2:-n}"
+    local yn_hint
+    if [[ "$default" == "y" ]]; then
+        yn_hint="[Y/n]"
+    else
+        yn_hint="[y/N]"
+    fi
+    while true; do
+        echo ""
+        echo -ne "  ${BOLD}${question}${NC} ${yn_hint} ${DIM}[h=help]${NC} "
+        read -r answer </dev/tty 2>/dev/null || read -r answer
+        answer=${answer:-$default}
+        if [[ "$answer" =~ ^[Hh]$ ]]; then
+            show_help_menu
+            continue
+        fi
+        if [[ "$answer" =~ ^[Yy] ]]; then
+            return 0
+        else
+            return 1
+        fi
+    done
+}
+
+prompt_input() {
+    local question="$1"
+    local default="${2:-}"
+    local result
+    while true; do
+        if [[ -n "$default" ]]; then
+            echo -ne "  ${BOLD}${question}${NC} [${default}] ${DIM}(h=help)${NC}: " >&2
+        else
+            echo -ne "  ${BOLD}${question}${NC} ${DIM}(h=help)${NC}: " >&2
+        fi
+        read -r result </dev/tty 2>/dev/null || read -r result
+        result=${result:-$default}
+        if [[ "$result" =~ ^[Hh]$ ]]; then
+            show_help_menu >&2
+            continue
+        fi
+        echo "$result"
+        return
+    done
+}
+
+banner() {
+    local w=54
+    local border empty
+    border=$(printf '═%.0s' $(seq 1 $w))
+    empty=$(printf ' %.0s' $(seq 1 $w))
+    local ver_text="dnsgb-setup v${VERSION}"
+    local sub_text="Interactive DNS Tunnel Setup"
+    local vl=$(( (w - ${#ver_text}) / 2 ))
+    local vr=$(( w - ${#ver_text} - vl ))
+    local sl=$(( (w - ${#sub_text}) / 2 ))
+    local sr=$(( w - ${#sub_text} - sl ))
+    echo ""
+    echo -e "${BOLD}${CYAN}"
+    printf "  ╔%s╗\n" "$border"
+    printf "  ║%s║\n" "$empty"
+    printf "  ║%${vl}s%s%${vr}s║\n" "" "$ver_text" ""
+    printf "  ║%${sl}s%s%${sr}s║\n" "" "$sub_text" ""
+    printf "  ║%s║\n" "$empty"
+    printf "  ╚%s╝\n" "$border"
+    echo -e "${NC}"
+}
+
+# ─── Help System ──────────────────────────────────────────────────────────────
+
+help_topic_header() {
+    local title="$1"
+    local width=58
+    local line
+    line=$(printf '─%.0s' $(seq 1 $width))
+    # Compensate for multi-byte chars: pad width = visual width + (bytes - chars)
+    local byte_len=${#title}
+    local byte_count
+    byte_count=$(printf '%s' "$title" | wc -c)
+    local pad_width=$(( width - 1 + byte_count - byte_len ))
+    echo ""
+    echo -e "  ${BOLD}${CYAN}┌${line}┐${NC}"
+    printf "  ${BOLD}${CYAN}│${NC} ${BOLD}%-${pad_width}s${BOLD}${CYAN}│${NC}\n" "$title"
+    echo -e "  ${BOLD}${CYAN}└${line}┘${NC}"
+    echo ""
+}
+
+help_press_enter() {
+    echo ""
+    echo -ne "  ${DIM}Press Enter to go back...${NC}"
+    read -r </dev/tty 2>/dev/null || read -r || true
+}
+
+help_topic_domain() {
+    help_topic_header "1. Domains & DNS Basics"
+    echo -e "  ${BOLD}What is a domain?${NC}"
+    echo "  A domain (e.g. example.com) is a human-readable address"
+    echo "  on the internet. DNS tunneling uses domains to encode"
+    echo "  data inside DNS queries, making your traffic look like"
+    echo "  normal DNS resolution."
+    echo ""
+    echo -e "  ${BOLD}Why do you need one?${NC}"
+    echo "  DNS tunnels work by making DNS queries for subdomains"
+    echo "  of YOUR domain. The DNS system routes these queries to"
+    echo "  your server, which decodes the hidden data. Without a"
+    echo "  domain you own, you can't receive these queries."
+    echo ""
+    echo -e "  ${BOLD}How DNS delegation works${NC}"
+    echo "  When you create NS records pointing t.example.com to"
+    echo "  ns.example.com (your server), you tell the global DNS"
+    echo "  system: 'For any query about t.example.com, ask my"
+    echo "  server directly.' This is how tunnel traffic finds you."
+    echo ""
+    echo -e "  ${BOLD}Where to buy a domain${NC}"
+    echo "  - Namecheap (namecheap.com) — cheap, privacy included"
+    echo "  - Cloudflare Registrar — at-cost pricing"
+    echo "  - Any registrar works, but you MUST use Cloudflare DNS"
+    echo "    (free plan) to manage your records"
+    echo ""
+    echo -e "  ${BOLD}Subdomains used by this script${NC}"
+    echo "  If your domain is example.com:"
+    echo "    t.example.com   ->  Slipstream + SOCKS tunnel"
+    echo "    d.example.com   ->  DNSTT + SOCKS tunnel"
+    echo "    s.example.com   ->  Slipstream + SSH tunnel"
+    echo "    ds.example.com  ->  DNSTT + SSH tunnel"
+    help_press_enter
+}
+
+help_topic_dns_records() {
+    help_topic_header "2. DNS Records (Cloudflare Setup)"
+    echo -e "  ${BOLD}What are DNS records?${NC}"
+    echo "  DNS records are entries that tell the internet how to"
+    echo "  find services for your domain."
+    echo ""
+    echo -e "  ${BOLD}A Record (Address Record)${NC}"
+    echo "  Maps a name to an IP address."
+    echo "  We create:  ns.yourdomain.com -> your server IP"
+    echo "  This tells the internet where your DNS server lives."
+    echo ""
+    echo -e "  ${BOLD}NS Record (Name Server Record)${NC}"
+    echo "  Delegates a subdomain to another DNS server."
+    echo "  We create:  t.yourdomain.com NS -> ns.yourdomain.com"
+    echo "  This tells the internet: 'For queries about t, ask"
+    echo "  the server at ns.yourdomain.com (your VPS).'"
+    echo ""
+    echo -e "  ${BOLD}Why 'DNS Only' (grey cloud)?${NC}"
+    echo "  Cloudflare's proxy (orange cloud) intercepts traffic."
+    echo "  DNS tunneling requires queries to reach YOUR server"
+    echo "  directly. If the proxy is ON, queries go to Cloudflare"
+    echo "  instead and tunneling breaks completely."
+    echo ""
+    echo -e "  ${BOLD}Why 4 subdomains?${NC}"
+    echo "  Each tunnel type needs its own subdomain so the DNS"
+    echo "  Router can route them to the right tunnel:"
+    echo "    t   -> Slipstream + SOCKS  (fastest, QUIC-based)"
+    echo "    d   -> DNSTT + SOCKS       (classic, Noise protocol)"
+    echo "    s   -> Slipstream + SSH    (SSH over DNS)"
+    echo "    ds  -> DNSTT + SSH         (SSH over DNSTT)"
+    echo ""
+    echo -e "  ${BOLD}Common mistakes${NC}"
+    echo "  - Using 'tns' instead of 'ns' for the A record name"
+    echo "  - Leaving Cloudflare proxy ON (must be grey cloud)"
+    echo "  - Setting NS values to the IP instead of ns.domain"
+    echo "  - Forgetting to click Save after adding records"
+    help_press_enter
+}
+
+help_topic_port53() {
+    help_topic_header "3. Port 53 & systemd-resolved"
+    echo -e "  ${BOLD}What is port 53?${NC}"
+    echo "  Port 53 is the standard port for all DNS traffic."
+    echo "  Every DNS query in the world is sent to port 53."
+    echo "  Censors almost never block it because it would break"
+    echo "  DNS for everyone."
+    echo ""
+    echo -e "  ${BOLD}Why do DNS tunnels need port 53?${NC}"
+    echo "  When a DNS resolver (like 8.8.8.8) forwards a query"
+    echo "  to your server, it always sends it to port 53. Your"
+    echo "  tunnel server must listen on port 53 to receive these"
+    echo "  queries. There is no way to use a different port."
+    echo ""
+    echo -e "  ${BOLD}What is systemd-resolved?${NC}"
+    echo "  systemd-resolved is Ubuntu's built-in DNS cache. It"
+    echo "  listens on 127.0.0.53:53 to handle local DNS lookups."
+    echo "  Since it occupies port 53, it must be stopped before"
+    echo "  the DNS tunnel server can bind to that port."
+    echo ""
+    echo -e "  ${BOLD}Is it safe to disable?${NC}"
+    echo "  Yes! We replace it with 8.8.8.8 (Google DNS) in"
+    echo "  /etc/resolv.conf. Your server still resolves domain"
+    echo "  names normally — it just queries Google DNS directly"
+    echo "  instead of using the local cache."
+    help_press_enter
+}
+
+help_topic_dnsgb() {
+    help_topic_header "4. dnsgb — DNS Tunnel Manager"
+    echo -e "  ${BOLD}What is dnsgb?${NC}"
+    echo "  A command-line tool that installs, configures, and"
+    echo "  manages DNS tunnel servers. Handles all the complex"
+    echo "  setup automatically."
+    echo ""
+    echo -e "  ${BOLD}What is 'multi mode'?${NC}"
+    echo "  Multi mode lets multiple tunnels share port 53 through"
+    echo "  a DNS Router. The router reads incoming DNS queries and"
+    echo "  routes them to the correct tunnel based on subdomain."
+    echo ""
+    echo -e "  ${BOLD}What gets installed${NC}"
+    echo "  - slipstream-server   QUIC-based tunnel binary"
+    echo "  - dnstt-server        Classic DNS tunnel binary"
+    echo "  - microsocks          SOCKS5 proxy (auto-assigned port)"
+    echo "  - systemd services    Auto-start tunnels on boot"
+    echo "  - DNS Router          Multiplexes port 53"
+    echo ""
+    echo -e "  ${BOLD}How the DNS Router works${NC}"
+    echo "  All DNS queries arrive at port 53. The router inspects"
+    echo "  the domain name: if it's for t.example.com, it sends"
+    echo "  the query to Slipstream. If it's for d.example.com,"
+    echo "  it routes to DNSTT. Each tunnel decodes the data and"
+    echo "  forwards it through microsocks to the internet."
+    help_press_enter
+}
+
+help_topic_ssh() {
+    help_topic_header "5. SSH Tunnel Users"
+    echo -e "  ${BOLD}What is an SSH tunnel user?${NC}"
+    echo "  A restricted account that can ONLY create SSH port-"
+    echo "  forwarding tunnels. Cannot run commands, access a"
+    echo "  shell, or browse the filesystem."
+    echo ""
+    echo -e "  ${BOLD}How is it different from a regular user?${NC}"
+    echo "  A regular user (like root) has full server access."
+    echo "  An SSH tunnel user can ONLY forward ports. Even if"
+    echo "  the password is leaked, no one can access your server."
+    echo ""
+    echo -e "  ${BOLD}How Slipstream + SSH works${NC}"
+    echo "  Client -> DNS query -> DNS resolver -> Your server"
+    echo "   -> Slipstream (decodes DNS) -> SSH connection"
+    echo "   -> SSH port forwarding (-D) -> Internet"
+    echo ""
+    echo -e "  ${BOLD}SSH vs SOCKS backend${NC}"
+    echo "  SOCKS (t/d tunnels):"
+    echo "    - Faster, no authentication needed"
+    echo "    - Anyone who knows the domain can connect"
+    echo "  SSH (s/ds tunnels):"
+    echo "    - Requires username + password to connect"
+    echo "    - Only authorized users can use it"
+    echo "    - Slightly slower (SSH encryption overhead)"
+    echo ""
+    echo -e "  ${BOLD}Username & password${NC}"
+    echo "  - The username/password are shared with ALL your users"
+    echo "  - Keep the username simple (e.g. 'tunnel', 'vpn')"
+    echo "  - Use a memorable password, NOT your root password"
+    echo "  - Even if leaked, the account is port-forwarding only"
+    help_press_enter
+}
+
+help_topic_architecture() {
+    help_topic_header "6. Architecture & How It Works"
+    echo -e "  ${BOLD}The Big Picture${NC}"
+    echo "  DNS tunneling encodes your internet traffic inside DNS"
+    echo "  queries. Since DNS is almost never blocked, it provides"
+    echo "  a reliable channel even during internet shutdowns."
+    echo ""
+    echo -e "  ${BOLD}Data Flow${NC}"
+    echo ""
+    echo "    Phone (SlipNet app)"
+    echo "      |"
+    echo "      v"
+    echo "    DNS Query (looks like normal DNS traffic)"
+    echo "      |"
+    echo "      v"
+    echo "    Public DNS Resolver (8.8.8.8, 1.1.1.1, etc.)"
+    echo "      |"
+    echo "      v"
+    echo "    Your Server, Port 53"
+    echo "      |"
+    echo "      v"
+    echo "    DNS Router --+--> t   --> Slipstream --+--> microsocks"
+    echo "                 +--> d   --> DNSTT -------+    (SOCKS5)"
+    echo "                 +--> s   --> Slip+SSH ----+       |"
+    echo "                 +--> ds  --> DNSTT+SSH ---+       v"
+    echo "                                              Internet"
+    echo ""
+    echo -e "  ${BOLD}Protocols${NC}"
+    echo "  Slipstream: QUIC-based, TLS encryption, ~63 KB/s"
+    echo "  DNSTT:      Noise protocol, Curve25519 keys, ~42 KB/s"
+    echo ""
+    echo -e "  ${BOLD}Why DNS?${NC}"
+    echo "  DNS is the internet's phone book. EVERY device needs"
+    echo "  it to work, so censors almost never block it. By hiding"
+    echo "  traffic inside DNS queries, you can bypass blocks that"
+    echo "  shut down VPNs, Tor, and other tools."
+    help_press_enter
+}
+
+help_topic_about() {
+    help_topic_header "About dnsgb-setup"
+    echo -e "  ${BOLD}Made By SamNet Technologies - Saman${NC}"
+    echo ""
+    echo -e "  ${BOLD}dnsgb-setup${NC} v${VERSION}"
+    echo "  Interactive DNS Tunnel Setup Wizard"
+    echo ""
+    echo "  Automates the complete setup of DNS tunnel servers"
+    echo "  for censorship-resistant internet access. Designed"
+    echo "  to help people in restricted regions stay connected."
+    echo ""
+    echo -e "  ${BOLD}Links${NC}"
+    echo "  dnsgb-setup   github.com/SamNet-dev/dnsgb-setup"
+    echo "  dnsgb          github.com/net2share/dnsgb"
+    echo "  sshtun-user    github.com/net2share/sshtun-user"
+    echo "  SlipNet        github.com/anonvector/SlipNet"
+    echo ""
+    echo -e "  ${BOLD}Manual Guide (Farsi)${NC}"
+    echo "  telegra.ph/Complete-Guide-to-Setting-Up-a-DNS-Tunnel-03-04"
+    echo ""
+    echo -e "  ${BOLD}Donate${NC}"
+    echo "  www.samnet.dev/donate"
+    echo ""
+    echo -e "  ${BOLD}License${NC}"
+    echo "  MIT License"
+    help_press_enter
+}
+
+show_help_menu() {
+    while true; do
+        help_topic_header "Help — Pick a Topic"
+        echo -e "  ${BOLD}1${NC}  Domains & DNS Basics"
+        echo -e "  ${BOLD}2${NC}  DNS Records (Cloudflare Setup)"
+        echo -e "  ${BOLD}3${NC}  Port 53 & systemd-resolved"
+        echo -e "  ${BOLD}4${NC}  dnsgb — DNS Tunnel Manager"
+        echo -e "  ${BOLD}5${NC}  SSH Tunnel Users"
+        echo -e "  ${BOLD}6${NC}  Architecture & How It Works"
+        echo ""
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}7${NC}  About"
+        echo ""
+        echo -ne "  ${DIM}Pick a topic (1-7) or Enter to go back: ${NC}"
+        read -r choice
+        case "${choice:-}" in
+            1) help_topic_domain ;;
+            2) help_topic_dns_records ;;
+            3) help_topic_port53 ;;
+            4) help_topic_dnsgb ;;
+            5) help_topic_ssh ;;
+            6) help_topic_architecture ;;
+            7) help_topic_about ;;
+            *)
+                if [[ -n "${choice:-}" ]]; then
+                    echo -e "  ${WARN} Invalid choice. Please pick 1–7 or Enter to go back."
+                fi
+                echo ""
+                return
+                ;;
+        esac
+    done
+}
+
+# ─── --help ─────────────────────────────────────────────────────────────────────
+
+show_help() {
+    banner
+    echo -e "${BOLD}DESCRIPTION${NC}"
+    echo "  dnsgb-setup automates the complete setup of DNS tunnel servers for"
+    echo "  censorship-resistant internet access. It installs and configures dnsgb"
+    echo "  (DNS Tunnel Manager) with Slipstream and DNSTT protocols, sets up SOCKS"
+    echo "  and SSH tunnels, and verifies everything works end-to-end."
+    echo ""
+    echo -e "${BOLD}PREREQUISITES${NC}"
+    echo "  - A VPS running Ubuntu/Debian with root access"
+    echo "  - A domain managed on Cloudflare"
+    echo "  - curl installed on the server"
+    echo ""
+    echo -e "${BOLD}USAGE${NC}"
+    echo "  sudo bash dnsgb-setup.sh              Run interactive setup"
+    echo "  sudo bash dnsgb-setup.sh --manage      Post-setup management menu"
+    echo "  sudo bash dnsgb-setup.sh --add-domain  Add a backup domain to existing setup"
+    echo "  sudo bash dnsgb-setup.sh --mtu 1200    Set DNSTT MTU (default: 1232)"
+    echo "  sudo bash dnsgb-setup.sh --add-tunnel   Add a single tunnel interactively"
+    echo "  sudo bash dnsgb-setup.sh --add-xray    Connect existing Xray panel via DNS tunnel"
+    echo "  sudo bash dnsgb-setup.sh --remove-tunnel [tag]  Remove a specific tunnel"
+    echo "  sudo bash dnsgb-setup.sh --harden      Apply security hardening only"
+    echo "  sudo bash dnsgb-setup.sh --cleanup     Emergency disk cleanup (truncate logs, vacuum journal)"
+    echo "  sudo bash dnsgb-setup.sh --uninstall   Remove everything"
+    echo "  sudo bash dnsgb-setup.sh --status      Show all tunnels & share URLs"
+    echo "  sudo bash dnsgb-setup.sh --monitor     Monitor tunnel usage & connections"
+    echo "  sudo bash dnsgb-setup.sh --diag        Diagnose tunnel issues"
+    echo "  bash dnsgb-setup.sh --help             Show this help"
+    echo "  bash dnsgb-setup.sh --about            Show project info"
+    echo ""
+    echo -e "${BOLD}FLAGS${NC}"
+    echo "  --help         Show this help message"
+    echo "  --about        Show project information and credits"
+    echo "  --manage       Interactive management menu (all post-setup actions)"
+    echo "  --status       Show all tunnels, credentials, and share URLs"
+    echo "  --monitor      Show tunnel process stats, connections, and recent logs"
+    echo "  --diag         Run diagnostics: binaries, services, ports, DNS, config"
+    echo "  --add-tunnel   Add a single tunnel (interactive: choose transport, backend, domain)"
+    echo "  --add-xray     Connect existing 3x-ui panel to DNS tunnel (auto-detect + create inbound)"
+    echo "  --remove-tunnel [tag]  Remove a specific tunnel (interactive if no tag given)"
+    echo "  --add-domain   Add another domain to an existing server (backup/fallback)"
+    echo "  --users        Manage SSH tunnel users (add, list, update, delete)"
+    echo "  --mtu <value>  Set DNSTT MTU size (512-1400, default: 1232)"
+    echo "  --harden       Apply service and resolver hardening to an existing setup"
+    echo "  --cleanup      Emergency disk cleanup (truncate logs, vacuum journal, apply fixes)"
+    echo "  --update       Check for updates and install latest version"
+    echo "  --uninstall    Remove all installed components"
+    echo ""
+    echo -e "${BOLD}WHAT THIS SCRIPT SETS UP${NC}"
+    echo "  1. Slipstream + SOCKS tunnel  (fastest, ~63 KB/s)"
+    echo "  2. DNSTT + SOCKS tunnel       (classic, ~42 KB/s)"
+    echo "  3. Slipstream + SSH tunnel    (SSH over DNS)"
+    echo "  4. DNSTT + SSH tunnel         (SSH over DNSTT)"
+    echo "  5. NoizDNS + SOCKS tunnel    (DPI-resistant)"
+    echo "  6. NoizDNS + SSH tunnel      (DPI-resistant SSH)"
+    echo "  7. VayDNS + SOCKS tunnel     (optimized)"
+    echo "  8. VayDNS + SSH tunnel       (optimized SSH)"
+    echo "  9. microsocks SOCKS5 proxy   (auto-installed by dnsgb)"
+    echo "  10. SSH tunnel user (optional)"
+    echo ""
+    echo -e "${BOLD}CLIENT APP${NC}"
+    echo "  SlipNet (Android): https://github.com/anonvector/SlipNet/releases"
+    echo ""
+}
+
+# ─── --about ────────────────────────────────────────────────────────────────────
+
+show_about() {
+    banner
+    echo -e "${BOLD}ABOUT${NC}"
+    echo ""
+    echo "  dnsgb-setup is an interactive installer for DNS tunnel servers."
+    echo "  It provides a guided, step-by-step setup process with colored"
+    echo "  output, progress tracking, and automated verification."
+    echo ""
+    echo -e "${BOLD}HOW DNS TUNNELING WORKS${NC}"
+    echo ""
+    echo "  DNS tunneling encodes data inside DNS queries and responses."
+    echo "  Since DNS is almost never blocked (even during internet shutdowns),"
+    echo "  it provides a reliable channel for internet access. Your traffic"
+    echo "  flows through public DNS resolvers to your tunnel server, which"
+    echo "  decodes it and forwards it to the internet."
+    echo ""
+    echo "  Architecture:"
+    echo ""
+    echo "    Client (SlipNet)"
+    echo "      --> DNS Query"
+    echo "        --> Public Resolver (8.8.8.8)"
+    echo "          --> Your Server (Port 53)"
+    echo "            --> DNS Router"
+    echo "              --> Tunnel --> Internet"
+    echo ""
+    echo -e "${BOLD}SUPPORTED PROTOCOLS${NC}"
+    echo ""
+    echo "  Slipstream  QUIC-based DNS tunnel with TLS encryption"
+    echo "              Uses self-signed certificates (cert.pem/key.pem)"
+    echo "              Speed: ~63 KB/s"
+    echo ""
+    echo "  DNSTT       Classic DNS tunnel using Noise protocol"
+    echo "              Uses Curve25519 key pairs (server.key/server.pub)"
+    echo "              Speed: ~42 KB/s"
+    echo ""
+    echo -e "${BOLD}RELATED PROJECTS${NC}"
+    echo ""
+    echo "  dnsgb          https://github.com/net2share/dnstm"
+    echo "  sshtun-user    https://github.com/net2share/sshtun-user"
+    echo "  SlipNet        https://github.com/anonvector/SlipNet/releases"
+    echo ""
+    echo -e "${BOLD}LICENSE${NC}"
+    echo ""
+    echo "  MIT License"
+    echo ""
+    echo -e "${BOLD}AUTHOR${NC}"
+    echo ""
+    echo "  Made By SamNet Technologies - Saman"
+    echo "  https://github.com/SamNet-dev"
+    echo ""
+}
+
+# ─── SOCKS Auth Detection Helper ──────────────────────────────────────────────
+
+# Detect SOCKS5 auth state from dnsgb backend status.
+# Sets globals: SOCKS_AUTH (true/false), SOCKS_USER, SOCKS_PASS
+# Returns 0 if auth is enabled, 1 otherwise.
+detect_socks_auth() {
+    local status_output
+    status_output=$(timeout --kill-after=3 10 dnsgb backend status -t socks 2>/dev/null || true)
+    local detected_user detected_pass
+    detected_user=$(echo "$status_output" | sed -n 's/^[[:space:]]*User:[[:space:]]*//p' | sed 's/[[:space:]]*$//' || true)
+    detected_pass=$(echo "$status_output" | sed -n 's/^[[:space:]]*Password:[[:space:]]*//p' | sed 's/[[:space:]]*$//' || true)
+    if [[ -n "$detected_user" && -n "$detected_pass" ]]; then
+        # Reject credentials with pipe chars (would corrupt slipnet URL format)
+        if [[ "$detected_user" == *"|"* || "$detected_pass" == *"|"* ]]; then
+            SOCKS_AUTH=false
+            SOCKS_USER=""
+            SOCKS_PASS=""
+            return 1
+        fi
+        SOCKS_AUTH=true
+        SOCKS_USER="$detected_user"
+        SOCKS_PASS="$detected_pass"
+        return 0
+    fi
+    SOCKS_AUTH=false
+    SOCKS_USER=""
+    SOCKS_PASS=""
+    return 1
+}
+
+# ─── Configure SOCKS Auth (manage menu) ──────────────────────────────────────
+
+do_configure_socks_auth() {
+    banner
+    print_header "Configure SOCKS5 Authentication"
+
+    if [[ $EUID -ne 0 ]]; then
+        print_fail "Not running as root."
+        exit 1
+    fi
+
+    if ! command -v dnsgb &>/dev/null; then
+        print_fail "dnsgb is not installed."
+        exit 1
+    fi
+
+    # Show current state
+    echo ""
+    detect_socks_auth || true
+    if [[ "$SOCKS_AUTH" == true ]]; then
+        echo -e "  ${BOLD}Current status:${NC} ${GREEN}Enabled${NC}"
+        echo -e "  ${DIM}Username: ${SOCKS_USER}${NC}"
+        echo ""
+        echo -e "  ${BOLD}1)${NC}  Change credentials"
+        echo -e "  ${BOLD}2)${NC}  Disable authentication"
+        echo -e "  ${BOLD}0)${NC}  Cancel"
+        echo ""
+        local choice=""
+        read -rp "  Select [0-2]: " choice || exit 0
+        case "$choice" in
+            1)
+                echo ""
+                ;;
+            2)
+                echo ""
+                print_info "Disabling SOCKS5 authentication..."
+                if dnsgb backend auth -t socks --disable; then
+                    print_ok "SOCKS5 authentication disabled"
+                    sleep 2
+                    if pgrep -x microsocks &>/dev/null || systemctl is-active --quiet microsocks 2>/dev/null; then
+                        print_ok "microsocks restarted without authentication"
+                    else
+                        print_warn "microsocks may not have restarted — check: systemctl status microsocks"
+                    fi
+                else
+                    print_fail "Failed to disable authentication"
+                fi
+                exit 0
+                ;;
+            *)
+                exit 0
+                ;;
+        esac
+    else
+        echo -e "  ${BOLD}Current status:${NC} ${RED}Disabled (open proxy)${NC}"
+        echo ""
+        if ! prompt_yn "Enable SOCKS5 authentication?" "y"; then
+            print_info "Cancelled."
+            exit 0
+        fi
+        echo ""
+    fi
+
+    # Collect credentials
+    local new_user new_pass
+    new_user=$(prompt_input "Enter SOCKS proxy username" "proxy")
+    new_user=$(echo "$new_user" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [[ -z "$new_user" ]]; then
+        print_fail "Username cannot be empty"
+        exit 1
+    fi
+    if [[ "$new_user" == *"|"* || "$new_user" == *":"* ]]; then
+        print_fail "Username cannot contain | or : characters"
+        exit 1
+    fi
+
+    new_pass=$(prompt_input "Enter SOCKS proxy password")
+    new_pass=$(echo "$new_pass" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [[ -z "$new_pass" ]]; then
+        print_fail "Password cannot be empty"
+        exit 1
+    fi
+    if [[ "$new_pass" == *"|"* ]]; then
+        print_fail "Password cannot contain the | character"
+        exit 1
+    fi
+
+    echo ""
+    print_info "Applying SOCKS5 authentication..."
+    if dnsgb backend auth -t socks -u "$new_user" -p "$new_pass"; then
+        print_ok "SOCKS5 authentication enabled (user: ${new_user})"
+        sleep 2
+        if pgrep -x microsocks &>/dev/null || systemctl is-active --quiet microsocks 2>/dev/null; then
+            print_ok "microsocks restarted with authentication"
+        else
+            print_warn "microsocks may not have restarted — check: systemctl status microsocks"
+        fi
+
+        # Verify auth enforcement
+        local socks_port=""
+        socks_port=$(ss -tlnp 2>/dev/null | grep microsocks | awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/) {split($i,a,":"); print a[length(a)]; exit}}' || true)
+        if [[ -z "$socks_port" ]]; then
+            socks_port="19801"
+        fi
+        local noauth_test
+        noauth_test=$(curl -s --max-time 5 --socks5 "127.0.0.1:${socks_port}" https://api.ipify.org 2>/dev/null || true)
+        if [[ -z "$noauth_test" ]]; then
+            print_ok "Auth enforced: unauthenticated connections are rejected"
+        else
+            print_warn "Auth NOT enforced: proxy still works without credentials!"
+            print_info "Try restarting: systemctl restart microsocks"
+        fi
+    else
+        print_fail "Failed to configure SOCKS5 authentication"
+        print_info "Try manually: dnsgb backend auth -t socks -u ${new_user} -p <password>"
+    fi
+}
+
+# ─── --status ───────────────────────────────────────────────────────────────────
+
+do_status() {
+    banner
+
+    # Warn if not root (ss -p and file reads may not work)
+    if [[ $EUID -ne 0 ]]; then
+        print_warn "Running without root — some info may be unavailable"
+        echo ""
+    fi
+
+    # Check dnsgb is installed
+    if ! command -v dnsgb &>/dev/null; then
+        print_fail "dnsgb is not installed. Run the full setup first: sudo bash $0"
+        exit 1
+    fi
+
+    # Save/restore global DOMAIN so generate_slipnet_url() can read it
+    local _saved_domain="$DOMAIN"
+
+    # Detect server IP
+    local server_ip
+    server_ip=$(curl -4 -s --max-time 10 https://api.ipify.org 2>/dev/null || true)
+    if [[ -n "$server_ip" ]]; then
+        echo -e "  ${BOLD}Server IP:${NC} ${GREEN}${server_ip}${NC}"
+    fi
+    echo ""
+
+    # ─── Cache tunnel list output (reused throughout) ───
+    local tunnel_list_output
+    tunnel_list_output=$(timeout --kill-after=3 10 dnsgb tunnel list 2>/dev/null || true)
+
+    echo -e "  ${BOLD}Tunnel Status${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    if [[ -n "$tunnel_list_output" ]]; then
+        echo "$tunnel_list_output"
+    else
+        print_warn "Could not get tunnel list"
+    fi
+    echo ""
+
+    # ─── Detect SOCKS auth via dnsgb ───
+    detect_socks_auth || true
+    local socks_user="$SOCKS_USER" socks_pass="$SOCKS_PASS" socks_auth="$SOCKS_AUTH"
+
+    echo -e "  ${BOLD}SOCKS Proxy Authentication${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    if [[ "$socks_auth" == true ]]; then
+        echo -e "  Username:  ${GREEN}${socks_user}${NC}"
+        echo -e "  Password:  ${GREEN}${socks_pass}${NC}"
+    else
+        echo -e "  ${YELLOW}No authentication (open proxy)${NC}"
+    fi
+    echo ""
+
+    # ─── Detect microsocks port ───
+    local socks_port=""
+    socks_port=$(ss -tlnp 2>/dev/null | grep microsocks | awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/) {split($i,a,":"); print a[length(a)]; exit}}' || true)
+    if [[ -z "$socks_port" ]]; then
+        socks_port=$(sed -n 's/.*-p[[:space:]]*\([0-9]*\).*/\1/p' /etc/systemd/system/microsocks.service 2>/dev/null | head -1 || true)
+    fi
+    if [[ -n "$socks_port" ]]; then
+        echo -e "  ${BOLD}microsocks Port:${NC} ${GREEN}${socks_port}${NC}"
+        echo ""
+    fi
+
+    # ─── Collect all tunnel tags and their domains ───
+    local tags
+    tags=$(echo "$tunnel_list_output" | grep -oE 'tag=[^ ]+' | sed 's/tag=//' || true)
+    # Fallback: extract known tag patterns if tag= format not found
+    if [[ -z "$tags" ]] && [[ -n "$tunnel_list_output" ]]; then
+        tags=$(echo "$tunnel_list_output" | grep -oE '\b(slip|dnstt|noiz|vay|xray)[a-z0-9_-]*' | sort -u || true)
+    fi
+    if [[ -z "$tags" ]]; then
+        print_warn "No tunnels found"
+        return
+    fi
+
+    # ─── Detect SSH users (check if sshtun-user is available) ───
+    local ssh_user="" ssh_pass=""
+    local has_ssh_users=false
+    if command -v sshtun-user &>/dev/null; then
+        local user_list
+        user_list=$(timeout --kill-after=3 10 sshtun-user list </dev/null 2>/dev/null || true)
+        # Fallback: sshtun-user list may require TTY
+        if [[ -z "$user_list" ]]; then
+            user_list=$(awk -F: '/SSH tunnel only/{print $1}' /etc/passwd 2>/dev/null || true)
+        fi
+        if [[ -n "$user_list" ]]; then
+            has_ssh_users=true
+            echo -e "  ${BOLD}SSH Tunnel Users${NC}"
+            echo -e "  ${DIM}────────────────────────────────────────${NC}"
+            echo "$user_list" | while IFS= read -r line; do
+                echo -e "  ${GREEN}${line}${NC}"
+            done
+            echo ""
+        fi
+    fi
+    # Check and auto-fix sshd reachability (needed for SSH tunnels)
+    if [[ "$has_ssh_users" == true ]]; then
+        if ! timeout 3 bash -c 'echo | nc -w2 127.0.0.1 22' &>/dev/null; then
+            echo -e "  ${YELLOW}[!] sshd not reachable on 127.0.0.1:22 — fixing...${NC}"
+            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+            if command -v iptables &>/dev/null; then
+                iptables -I INPUT -i lo -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+            fi
+            if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+                ufw allow from 127.0.0.1 to any port 22 2>/dev/null || true
+            fi
+            sleep 1
+            if timeout 3 bash -c 'echo | nc -w2 127.0.0.1 22' &>/dev/null; then
+                echo -e "  ${GREEN}[+] sshd fixed — now reachable on 127.0.0.1:22${NC}"
+            else
+                echo -e "  ${RED}[x] sshd still not reachable — SSH tunnels will NOT work${NC}"
+                echo -e "  ${DIM}Check: sudo iptables -L -n | grep 22${NC}"
+            fi
+            echo ""
+        fi
+    fi
+    # Read stored SSH credentials for URL generation
+    if [[ -f /etc/dnsgb/ssh-credentials ]]; then
+        ssh_user=$(cut -d: -f1 /etc/dnsgb/ssh-credentials 2>/dev/null || true)
+        ssh_pass=$(cut -d: -f2- /etc/dnsgb/ssh-credentials 2>/dev/null || true)
+    fi
+
+    # ─── Share URLs — dnst:// ───
+    echo -e "  ${BOLD}Share URLs — dnst:// (for dnstc CLI)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    local share_url
+    for tag in $tags; do
+        # SOCKS tunnels — no SSH credentials needed
+        if echo "$tag" | grep -qE '^(slip[0-9]+|dnstt[0-9]+|noiz[0-9]+|vay[0-9]+)$'; then
+            share_url=$(timeout --kill-after=3 10 dnsgb tunnel share -t "$tag" 2>/dev/null || true)
+            if [[ -n "$share_url" ]]; then
+                echo -e "  ${GREEN}${tag}:${NC}"
+                echo "  ${share_url}"
+                echo ""
+            fi
+        fi
+    done
+    # SSH tunnels — need credentials
+    local ssh_tags
+    ssh_tags=$(echo "$tags" | grep -E 'ssh' || true)
+    if [[ -n "$ssh_tags" ]]; then
+        if [[ "$has_ssh_users" == true ]]; then
+            echo -e "  ${DIM}SSH tunnel share URLs require credentials:${NC}"
+            for tag in $ssh_tags; do
+                echo -e "  ${DIM}  dnsgb tunnel share -t ${tag} --user <username> --password <pass>${NC}"
+            done
+        else
+            echo -e "  ${YELLOW}SSH tunnels: no users configured — create one with: sshtun-user create <user> --insecure-password <pass>${NC}"
+        fi
+        echo ""
+    fi
+
+    # ─── Share URLs — slipnet:// ───
+    # We need the domain for each tunnel to generate slipnet:// URLs
+    echo -e "  ${BOLD}Share URLs — slipnet:// (for SlipNet app)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+
+    local s_user="" s_pass=""
+    if [[ "$socks_auth" == true ]]; then
+        s_user="$socks_user"
+        s_pass="$socks_pass"
+    fi
+
+    # Pre-load domain map from dnsgb config.json (most reliable source)
+    local _dnsgb_config="/etc/dnsgb/config.json"
+    local _domain_map=""
+    if [[ -f "$_dnsgb_config" ]]; then
+        if command -v jq &>/dev/null; then
+            _domain_map=$(jq -r '.tunnels[]? | "\(.tag)=\(.domain)"' "$_dnsgb_config" 2>/dev/null || true)
+        elif command -v python3 &>/dev/null; then
+            _domain_map=$(python3 -c '
+import sys, json
+try:
+    cfg = json.load(sys.stdin)
+    for t in cfg.get("tunnels", []):
+        tag, domain = t.get("tag",""), t.get("domain","")
+        if tag and domain: print(f"{tag}={domain}")
+except: pass
+' < "$_dnsgb_config" 2>/dev/null || true)
+        fi
+    fi
+
+    for tag in $tags; do
+        # Extract domain for this tunnel from dnsgb
+        local tag_domain
+        tag_domain=$(echo "$tunnel_list_output" | grep -wF "$tag" | grep -oE 'domain=[^ ]+' | head -1 | sed 's/domain=//' || true)
+        # Fallback: parse table format (TAG TRANSPORT BACKEND PORT DOMAIN STATUS)
+        if [[ -z "$tag_domain" ]]; then
+            tag_domain=$(echo "$tunnel_list_output" | awk -v t="$tag" '$1 == t {for(i=2;i<=NF;i++) if($i ~ /\./) {print $i; exit}}' || true)
+        fi
+        # Fallback: read domain from dnsgb config.json
+        if [[ -z "$tag_domain" && -n "$_domain_map" ]]; then
+            tag_domain=$(echo "$_domain_map" | grep "^${tag}=" | head -1 | sed 's/^[^=]*=//' || true)
+        fi
+        if [[ -z "$tag_domain" ]]; then
+            continue
+        fi
+
+        # Extract base domain (strip subdomain prefix)
+        DOMAIN=$(echo "$tag_domain" | sed 's/^[^.]*\.//')
+        local subdomain
+        subdomain=$(echo "$tag_domain" | sed 's/\..*//')
+
+        # Get DNSTT pubkey — required by SlipNet for ALL tunnel types
+        local pubkey=""
+        if [[ -f "/etc/dnsgb/tunnels/${tag}/server.pub" ]]; then
+            pubkey=$(cat "/etc/dnsgb/tunnels/${tag}/server.pub" 2>/dev/null || true)
+        fi
+        # Slipstream tunnels don't have server.pub — grab any available dnstt pubkey
+        if [[ -z "$pubkey" ]]; then
+            pubkey=$(cat /etc/dnsgb/tunnels/*/server.pub 2>/dev/null | head -1 || true)
+        fi
+
+        local url=""
+        case "$tag" in
+            slip[0-9]*)
+                url=$(generate_slipnet_url "ss" "$subdomain" "$pubkey" "" "" "$s_user" "$s_pass")
+                ;;
+            dnstt[0-9]*)
+                if [[ -n "$pubkey" ]]; then
+                    url=$(generate_slipnet_url "dnstt" "$subdomain" "$pubkey" "" "" "$s_user" "$s_pass")
+                fi
+                ;;
+            slip-ssh*)
+                if [[ -n "$ssh_user" && -n "$ssh_pass" ]]; then
+                    url=$(generate_slipnet_url "slipstream_ssh" "$subdomain" "$pubkey" "$ssh_user" "$ssh_pass" "$s_user" "$s_pass")
+                elif [[ "$has_ssh_users" == true ]]; then
+                    echo -e "  ${DIM}${tag}: regenerate with — sudo bash $0 --users (option 5)${NC}"
+                    continue
+                else
+                    echo -e "  ${DIM}${tag}: create SSH user first — sudo bash $0 --users${NC}"
+                    continue
+                fi
+                ;;
+            dnstt-ssh*)
+                if [[ -n "$ssh_user" && -n "$ssh_pass" ]]; then
+                    url=$(generate_slipnet_url "dnstt_ssh" "$subdomain" "$pubkey" "$ssh_user" "$ssh_pass" "$s_user" "$s_pass")
+                elif [[ "$has_ssh_users" == true ]]; then
+                    echo -e "  ${DIM}${tag}: regenerate with — sudo bash $0 --users (option 5)${NC}"
+                    continue
+                else
+                    echo -e "  ${DIM}${tag}: create SSH user first — sudo bash $0 --users${NC}"
+                    continue
+                fi
+                ;;
+            xray*)
+                if [[ -n "$pubkey" ]]; then
+                    url=$(generate_slipnet_url "dnstt" "$subdomain" "$pubkey" "" "" "$s_user" "$s_pass")
+                fi
+                ;;
+            noiz[0-9]*)
+                if [[ -n "$pubkey" ]]; then
+                    url=$(generate_slipnet_url "sayedns" "$subdomain" "$pubkey" "" "" "$s_user" "$s_pass")
+                fi
+                ;;
+            noiz-ssh*)
+                if [[ -n "$ssh_user" && -n "$ssh_pass" ]]; then
+                    url=$(generate_slipnet_url "sayedns_ssh" "$subdomain" "$pubkey" "$ssh_user" "$ssh_pass" "$s_user" "$s_pass")
+                elif [[ "$has_ssh_users" == true ]]; then
+                    echo -e "  ${DIM}${tag}: regenerate with — sudo bash $0 --users (option 5)${NC}"
+                    continue
+                else
+                    echo -e "  ${DIM}${tag}: create SSH user first — sudo bash $0 --users${NC}"
+                    continue
+                fi
+                ;;
+            vay[0-9]*)
+                if [[ -n "$pubkey" ]]; then
+                    url=$(generate_slipnet_url "dnstt" "$subdomain" "$pubkey" "" "" "$s_user" "$s_pass")
+                fi
+                ;;
+            vay-ssh*)
+                if [[ -n "$ssh_user" && -n "$ssh_pass" ]]; then
+                    url=$(generate_slipnet_url "dnstt_ssh" "$subdomain" "$pubkey" "$ssh_user" "$ssh_pass" "$s_user" "$s_pass")
+                elif [[ "$has_ssh_users" == true ]]; then
+                    echo -e "  ${DIM}${tag}: regenerate with — sudo bash $0 --users (option 5)${NC}"
+                    continue
+                else
+                    echo -e "  ${DIM}${tag}: create SSH user first — sudo bash $0 --users${NC}"
+                    continue
+                fi
+                ;;
+        esac
+
+        if [[ -n "$url" ]]; then
+            echo -e "  ${GREEN}${tag}:${NC}"
+            echo "  ${url}"
+            echo ""
+        fi
+    done
+
+    # ─── Xray Tunnel Info (if configured) ───
+    if [[ -d /etc/dnsgb/xray ]] && ls /etc/dnsgb/xray/*.conf >/dev/null 2>&1; then
+        echo -e "  ${BOLD}Xray Backend Tunnels${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        local xconf
+        for xconf in /etc/dnsgb/xray/*.conf; do
+            local XRAY_TAG="" XRAY_PORT="" XRAY_PROTOCOL="" XRAY_UUID="" XRAY_PASSWORD="" XRAY_PANEL="" XRAY_DOMAIN=""
+            # shellcheck disable=SC1090
+            source "$xconf"
+            echo -e "  Tag:       ${GREEN}${XRAY_TAG}${NC}"
+            echo -e "  Protocol:  ${GREEN}${XRAY_PROTOCOL}${NC}"
+            echo -e "  Domain:    ${GREEN}${XRAY_DOMAIN}${NC}"
+            echo -e "  Port:      ${GREEN}${XRAY_PORT}${NC} ${DIM}(127.0.0.1)${NC}"
+            echo -e "  Panel:     ${GREEN}${XRAY_PANEL}${NC}"
+
+            # Generate client URI
+            local xcred=""
+            if [[ -n "$XRAY_UUID" ]]; then
+                xcred="$XRAY_UUID"
+            else
+                xcred="$XRAY_PASSWORD"
+            fi
+            if [[ -n "$xcred" ]]; then
+                # Use 127.0.0.1 — client connects through DNSTT tunnel, traffic exits on server localhost
+                local xuri
+                xuri=$(generate_xray_client_uri "$XRAY_PROTOCOL" "127.0.0.1" "$XRAY_PORT" "$xcred" "DNSTT-${XRAY_PROTOCOL}")
+                echo -e "  URI:       ${GREEN}${xuri}${NC}"
+            fi
+            echo ""
+        done
+    fi
+
+    echo -e "  ${BOLD}DNS Resolvers (use in SlipNet)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo "  8.8.8.8:53        (Google)"
+    echo "  1.1.1.1:53        (Cloudflare)"
+    echo "  9.9.9.9:53        (Quad9)"
+    echo "  208.67.222.222:53 (OpenDNS)"
+    echo ""
+
+    # Restore global DOMAIN
+    DOMAIN="$_saved_domain"
+}
+
+# ─── --monitor ─────────────────────────────────────────────────────────────────
+
+do_monitor() {
+    banner
+
+    if [[ $EUID -ne 0 ]]; then
+        print_warn "Running without root — some info may be unavailable"
+        echo ""
+    fi
+
+    if ! command -v dnsgb &>/dev/null; then
+        print_fail "dnsgb is not installed. Run the full setup first: sudo bash $0"
+        exit 1
+    fi
+
+    local tunnel_list_output
+    tunnel_list_output=$(timeout --kill-after=3 10 dnsgb tunnel list 2>/dev/null || true)
+
+    if [[ -z "$tunnel_list_output" ]]; then
+        print_warn "No tunnels found"
+        return
+    fi
+
+    # ─── Tunnel process stats ───
+    echo -e "  ${BOLD}Tunnel Process Stats${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    printf "  ${BOLD}%-16s %-10s %-8s %-10s %-10s %-s${NC}\n" "TAG" "PID" "CPU%" "MEM(MB)" "UPTIME" "STATUS"
+    echo -e "  ${DIM}$(printf '%.0s─' {1..76})${NC}"
+
+    # Extract tags from tunnel list
+    local tags
+    tags=$(echo "$tunnel_list_output" | grep -oE 'tag=[^ ]+' | sed 's/tag=//' || true)
+    if [[ -z "$tags" ]]; then
+        tags=$(echo "$tunnel_list_output" | grep -oE '\b(slip|dnstt|noiz|vay|xray)[a-z0-9_-]*' | sort -u || true)
+    fi
+
+    # Pre-fetch constants used in the loop (avoid forking per tunnel)
+    local _clk_tck _boot_time_s _now_s
+    _clk_tck=$(getconf CLK_TCK 2>/dev/null || echo 100)
+    _boot_time_s=$(awk '/^btime/{print $2}' /proc/stat 2>/dev/null || true)
+    _now_s=$(date +%s)
+
+    local total_conns=0 total_mem=0
+    for tag in $tags; do
+        local pid="" cpu="" mem_kb="" mem_mb="" uptime="" status=""
+
+        # Check if tunnel is running from the list output
+        local tag_line
+        tag_line=$(echo "$tunnel_list_output" | grep -wF "$tag" | head -1)
+        if echo "$tag_line" | grep -qi "stopped\|inactive"; then
+            printf "  %-16s %-10s %-8s %-10s %-10s ${RED}%s${NC}\n" "$tag" "-" "-" "-" "-" "Stopped"
+            continue
+        fi
+
+        # Find PID: look for process with this tag in its command line
+        pid=$(pgrep -f "tag[= ]${tag}" 2>/dev/null | head -1 || true)
+        if [[ -z "$pid" ]]; then
+            pid=$(systemctl show "dnsgb-tunnel-${tag}" --property=MainPID 2>/dev/null | sed 's/MainPID=//' || true)
+            [[ "$pid" == "0" ]] && pid=""
+        fi
+
+        if [[ -n "$pid" ]]; then
+            # Single ps call for both CPU and memory
+            read -r cpu mem_kb <<< "$(ps -p "$pid" -o %cpu=,rss= 2>/dev/null || true)"
+            if [[ -n "$mem_kb" && "$mem_kb" -gt 0 ]] 2>/dev/null; then
+                local _m=$((mem_kb * 10 / 1024)); mem_mb="$((_m / 10)).$((_m % 10))"
+                total_mem=$((total_mem + mem_kb))
+            else
+                mem_mb="-"
+            fi
+
+            # Get uptime from /proc (uses pre-fetched constants)
+            if [[ -f "/proc/${pid}/stat" && -n "$_boot_time_s" ]]; then
+                local start_time elapsed_s
+                start_time=$(awk '{print $22}' "/proc/${pid}/stat" 2>/dev/null || true)
+                if [[ -n "$start_time" ]]; then
+                    elapsed_s=$(( _now_s - (_boot_time_s + start_time / _clk_tck) ))
+                    [[ $elapsed_s -lt 0 ]] && elapsed_s=0
+                    if [[ $elapsed_s -ge 86400 ]]; then
+                        uptime="$((elapsed_s / 86400))d $((elapsed_s % 86400 / 3600))h"
+                    elif [[ $elapsed_s -ge 3600 ]]; then
+                        uptime="$((elapsed_s / 3600))h $((elapsed_s % 3600 / 60))m"
+                    else
+                        uptime="$((elapsed_s / 60))m $((elapsed_s % 60))s"
+                    fi
+                fi
+            fi
+            [[ -z "$uptime" ]] && uptime="-"
+            [[ -z "$cpu" ]] && cpu="-"
+            printf "  %-16s %-10s %-8s %-10s %-10s ${GREEN}%s${NC}\n" "$tag" "$pid" "$cpu" "$mem_mb" "$uptime" "Running"
+        else
+            if echo "$tag_line" | grep -qi "running"; then
+                printf "  %-16s %-10s %-8s %-10s %-10s ${YELLOW}%s${NC}\n" "$tag" "?" "-" "-" "-" "Running (no PID)"
+            else
+                printf "  %-16s %-10s %-8s %-10s %-10s ${RED}%s${NC}\n" "$tag" "-" "-" "-" "-" "Unknown"
+            fi
+        fi
+    done
+    echo ""
+
+    # ─── Active connections (single ss calls, cached) ───
+    echo -e "  ${BOLD}Active Connections${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+
+    local ss_tcp_output ss_listen_output ss_udp_output
+    ss_listen_output=$(ss -tlnp 2>/dev/null || true)
+    ss_tcp_output=$(ss -tnp 2>/dev/null || true)
+    ss_udp_output=$(ss -unp 2>/dev/null || true)
+
+    # Count SOCKS proxy connections (microsocks)
+    local socks_port=""
+    socks_port=$(echo "$ss_listen_output" | grep microsocks | awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/) {split($i,a,":"); print a[length(a)]; exit}}' || true)
+    if [[ -n "$socks_port" ]]; then
+        local socks_conns
+        socks_conns=$(echo "$ss_tcp_output" | grep ":${socks_port}\b" | grep -c "ESTAB" || true)
+        echo -e "  SOCKS proxy (port ${socks_port}):  ${GREEN}${socks_conns:-0}${NC} active connections"
+        total_conns=$((total_conns + ${socks_conns:-0}))
+    fi
+
+    # Count SSH tunnel connections
+    local ssh_conns
+    ssh_conns=$(echo "$ss_tcp_output" | grep ":22\b" | grep -c "ESTAB" || true)
+    if [[ "${ssh_conns:-0}" -gt 0 ]]; then
+        echo -e "  SSH tunnels (port 22):     ${GREEN}${ssh_conns}${NC} active connections"
+        total_conns=$((total_conns + ssh_conns))
+    fi
+
+    # DNS listener (port 53)
+    local dns_conns
+    dns_conns=$(echo "$ss_udp_output" | grep -c ":53\b" || true)
+    if [[ "${dns_conns:-0}" -gt 0 ]]; then
+        echo -e "  DNS listener (port 53):    ${GREEN}${dns_conns}${NC} UDP sessions"
+    fi
+
+    echo -e "  ${DIM}──────────────────────────${NC}"
+    echo -e "  Total:                     ${BOLD}${total_conns}${NC} TCP connections"
+    echo ""
+
+    # ─── Memory summary ───
+    if [[ $total_mem -gt 0 ]]; then
+        local _tm=$((total_mem * 10 / 1024)); local total_mem_mb="$((_tm / 10)).$((_tm % 10))"
+        echo -e "  ${BOLD}Total tunnel memory:${NC} ${GREEN}${total_mem_mb} MB${NC}"
+        echo ""
+    fi
+
+    # ─── Recent tunnel logs ───
+    echo -e "  ${BOLD}Recent Tunnel Activity (last 20 lines)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    local has_logs=false
+    if command -v journalctl &>/dev/null; then
+        local log_output
+        log_output=$(journalctl -u 'dnsgb*' --no-pager -n 20 --no-hostname 2>/dev/null || true)
+        if [[ -n "$log_output" && "$log_output" != *"No entries"* && "$log_output" != *"-- No entries --"* ]]; then
+            echo "$log_output" | while IFS= read -r line; do
+                echo -e "  ${DIM}${line}${NC}"
+            done
+            has_logs=true
+        fi
+    fi
+    if [[ "$has_logs" == false ]]; then
+        echo -e "  ${DIM}No recent logs available${NC}"
+        echo -e "  ${DIM}Try: dnsgb tunnel logs --tag <tag>${NC}"
+    fi
+    echo ""
+
+    echo -e "  ${DIM}Tip: Run with watch for live monitoring:${NC}"
+    echo -e "  ${DIM}  watch -n 5 sudo bash $0 --monitor${NC}"
+    echo ""
+}
+
+# ─── --diag ────────────────────────────────────────────────────────────────────
+
+do_diag() {
+    banner
+    echo -e "  ${BOLD}Tunnel Diagnostics${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo ""
+
+    if [[ $EUID -ne 0 ]]; then
+        print_fail "Diagnostics require root. Run: sudo bash $0 --diag"
+        exit 1
+    fi
+
+    local issues=0
+
+    # ─── 1. Core binaries ───
+    echo -e "  ${BOLD}1. Binary Checks${NC}"
+    echo -e "  ${DIM}──────────────────────────${NC}"
+
+    if command -v dnsgb &>/dev/null; then
+        local dnsgb_ver
+        dnsgb_ver=$(timeout 5 dnsgb --version 2>/dev/null || echo "unknown")
+        print_ok "dnsgb installed (${dnsgb_ver})"
+    else
+        print_fail "dnsgb not installed"
+        issues=$((issues + 1))
+    fi
+
+    if [[ -x /usr/local/bin/dnstt-server ]]; then
+        if timeout 5 /usr/local/bin/dnstt-server -help 2>&1 | grep -q '\-udp'; then
+            print_ok "dnstt-server binary valid (supports -udp)"
+        else
+            print_fail "dnstt-server binary is wrong (missing -udp flag) — may be NoizDNS fork"
+            echo -e "    ${DIM}Fix: re-run setup or manually download correct dnstt-server${NC}"
+            issues=$((issues + 1))
+        fi
+    else
+        print_warn "dnstt-server not found (DNSTT tunnels won't work)"
+    fi
+
+    if [[ -x /usr/local/bin/noizdns-server ]]; then
+        local magic
+        magic=$(xxd -l4 -p /usr/local/bin/noizdns-server 2>/dev/null || od -A n -t x1 -N4 /usr/local/bin/noizdns-server 2>/dev/null | tr -d ' ' || true)
+        if [[ "$magic" == "7f454c46" ]]; then
+            print_ok "noizdns-server binary valid (ELF)"
+        else
+            print_fail "noizdns-server binary is corrupt (not a valid ELF)"
+            issues=$((issues + 1))
+        fi
+    else
+        print_info "noizdns-server not installed (NoizDNS tunnels skipped)"
+    fi
+
+    if [[ -x /usr/local/bin/vaydns-server ]]; then
+        local magic
+        magic=$(xxd -l4 -p /usr/local/bin/vaydns-server 2>/dev/null || od -A n -t x1 -N4 /usr/local/bin/vaydns-server 2>/dev/null | tr -d ' ' || true)
+        if [[ "$magic" == "7f454c46" ]]; then
+            print_ok "vaydns-server binary valid (ELF)"
+        else
+            print_fail "vaydns-server binary is corrupt (not a valid ELF)"
+            issues=$((issues + 1))
+        fi
+    else
+        print_info "vaydns-server not installed (VayDNS tunnels skipped)"
+    fi
+
+    if [[ -x /usr/local/bin/microsocks ]] || command -v microsocks &>/dev/null; then
+        print_ok "microsocks installed"
+    else
+        print_warn "microsocks not found"
+    fi
+    echo ""
+
+    # ─── 2. Service status ───
+    echo -e "  ${BOLD}2. Service Status${NC}"
+    echo -e "  ${DIM}──────────────────────────${NC}"
+
+    local tunnel_list_output
+    tunnel_list_output=$(timeout --kill-after=3 10 dnsgb tunnel list 2>/dev/null || true)
+
+    # Router
+    if systemctl is-active --quiet dnsgb-dnsrouter.service 2>/dev/null; then
+        print_ok "DNS Router: running"
+    else
+        print_fail "DNS Router: not running"
+        local router_log
+        router_log=$(journalctl -u dnsgb-dnsrouter.service -n 3 --no-pager --no-hostname --output=short-precise 2>/dev/null | tail -3 || true)
+        [[ -n "$router_log" ]] && echo -e "    ${DIM}${router_log}${NC}"
+        issues=$((issues + 1))
+    fi
+
+    # microsocks
+    if systemctl is-active --quiet microsocks.service 2>/dev/null; then
+        print_ok "microsocks: running"
+    else
+        print_warn "microsocks: not running"
+    fi
+
+    # Per-tunnel services
+    local tags
+    tags=$(echo "$tunnel_list_output" | grep -oE 'tag=[^ ]+' | sed 's/tag=//' || true)
+    if [[ -z "$tags" ]]; then
+        tags=$(echo "$tunnel_list_output" | grep -oE '\b(slip|dnstt|noiz|vay|xray)[a-z0-9_-]*' | sort -u || true)
+    fi
+
+    for tag in $tags; do
+        local svc="dnsgb-${tag}.service"
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            print_ok "${tag}: running"
+        else
+            local tag_line
+            tag_line=$(echo "$tunnel_list_output" | grep -wF "$tag" | head -1)
+            if echo "$tag_line" | grep -qi "stopped"; then
+                print_info "${tag}: stopped (configured but not running)"
+            else
+                print_fail "${tag}: not running"
+                local svc_log
+                svc_log=$(journalctl -u "$svc" -n 2 --no-pager --no-hostname --output=short-precise 2>/dev/null | tail -2 || true)
+                [[ -n "$svc_log" ]] && echo -e "    ${DIM}${svc_log}${NC}"
+                issues=$((issues + 1))
+            fi
+        fi
+    done
+    echo ""
+
+    # ─── 3. NoizDNS service overrides ───
+    local has_noiz=false
+    for tag in $tags; do
+        [[ "$tag" == noiz* ]] && has_noiz=true && break
+    done
+    if [[ "$has_noiz" == true ]]; then
+        echo -e "  ${BOLD}3. NoizDNS Configuration${NC}"
+        echo -e "  ${DIM}──────────────────────────${NC}"
+        for tag in $tags; do
+            [[ "$tag" != noiz* ]] && continue
+            local dropin="/etc/systemd/system/dnsgb-${tag}.service.d/10-noizdns-binary.conf"
+            if [[ -f "$dropin" ]]; then
+                if grep -q "noizdns-server" "$dropin" 2>/dev/null; then
+                    print_ok "${tag}: binary override present (noizdns-server)"
+                else
+                    print_fail "${tag}: override exists but doesn't reference noizdns-server"
+                    issues=$((issues + 1))
+                fi
+                if grep -q "TOR_PT_SERVER_BINDADDR" "$dropin" 2>/dev/null; then
+                    print_ok "${tag}: PT mode environment variables set"
+                else
+                    print_fail "${tag}: missing TOR_PT_* environment variables"
+                    issues=$((issues + 1))
+                fi
+            else
+                print_fail "${tag}: no binary override — running dnstt-server instead of noizdns-server"
+                echo -e "    ${DIM}Fix: re-run setup or: create_noizdns_service_override ${tag}${NC}"
+                issues=$((issues + 1))
+            fi
+        done
+        echo ""
+    fi
+
+    local has_vay=false
+    for tag in $tags; do
+        [[ "$tag" == vay* ]] && has_vay=true && break
+    done
+    if [[ "$has_vay" == true ]]; then
+        echo -e "  ${BOLD}VayDNS Configuration${NC}"
+        echo -e "  ${DIM}──────────────────────────${NC}"
+        for tag in $tags; do
+            [[ "$tag" != vay* ]] && continue
+            local dropin="/etc/systemd/system/dnsgb-${tag}.service.d/10-vaydns-binary.conf"
+            local svc_unit_exec
+            svc_unit_exec=$(timeout 5 systemctl cat "dnsgb-${tag}.service" 2>/dev/null | grep -E '^ExecStart=' | head -1 || true)
+            if [[ -f "$dropin" ]]; then
+                # Legacy: binary swap drop-in
+                if grep -q "vaydns-server" "$dropin" 2>/dev/null; then
+                    print_ok "${tag}: legacy binary override present (vaydns-server)"
+                else
+                    print_fail "${tag}: override exists but doesn't reference vaydns-server"
+                    issues=$((issues + 1))
+                fi
+            elif echo "$svc_unit_exec" | grep -q "vaydns-server"; then
+                # Native: dnsgb v0.7.0+ uses vaydns-server directly
+                print_ok "${tag}: native VayDNS service (dnsgb-managed)"
+            else
+                print_fail "${tag}: not running vaydns-server"
+                echo -e "    ${DIM}Fix: upgrade dnsgb or run: sudo bash $0 --add-tunnel${NC}"
+                issues=$((issues + 1))
+            fi
+        done
+        echo ""
+    fi
+
+    # ─── Config.json transport check ───
+    local section_num=3
+    [[ "$has_noiz" == true ]] && section_num=$((section_num + 1))
+    [[ "$has_vay" == true ]] && section_num=$((section_num + 1))
+    echo -e "  ${BOLD}${section_num}. Tunnel Configuration${NC}"
+    echo -e "  ${DIM}──────────────────────────${NC}"
+
+    local config="/etc/dnsgb/config.json"
+    if [[ -f "$config" ]]; then
+        if command -v jq &>/dev/null; then
+            local tunnel_info
+            tunnel_info=$(jq -r '.tunnels[]? | "\(.tag)|\(.transport)|\(.domain)|\(.mtu // "n/a")"' "$config" 2>/dev/null || true)
+            if [[ -n "$tunnel_info" ]]; then
+                printf "  ${BOLD}%-16s %-14s %-24s %-s${NC}\n" "TAG" "TRANSPORT" "DOMAIN" "MTU"
+                echo "$tunnel_info" | while IFS='|' read -r t_tag t_transport t_domain t_mtu; do
+                    local col="$GREEN"
+                    # Flag potential issues
+                    if [[ ( "$t_tag" == noiz* || "$t_tag" == vay* ) && "$t_transport" == "dnstt" ]]; then
+                        # Could be fine (older dnsgb) or wrong (newer dnsgb)
+                        col="$YELLOW"
+                    fi
+                    printf "  %-16s ${col}%-14s${NC} %-24s %-s\n" "$t_tag" "$t_transport" "$t_domain" "$t_mtu"
+                done
+            fi
+        elif command -v python3 &>/dev/null; then
+            python3 -c '
+import sys, json
+try:
+    cfg = json.load(sys.stdin)
+    for t in cfg.get("tunnels", []):
+        print(f"  {t.get(\"tag\",\"?\"):16s} {t.get(\"transport\",\"?\"):14s} {t.get(\"domain\",\"?\"):24s} {t.get(\"mtu\",\"n/a\")}")
+except: pass
+' < "$config" 2>/dev/null || true
+        else
+            print_warn "Neither jq nor python3 available — cannot parse config.json"
+        fi
+
+        # Check for MTU issues (DNSTT/NoizDNS tunnels)
+        local high_mtu_tags=""
+        if command -v jq &>/dev/null; then
+            high_mtu_tags=$(jq -r '.tunnels[]? | select(.transport == "dnstt" or .transport == "noizdns" or .transport == "vaydns") | select(.mtu > 1000) | .tag' "$config" 2>/dev/null || true)
+        elif command -v python3 &>/dev/null; then
+            high_mtu_tags=$(python3 -c '
+import sys, json
+try:
+    for t in json.load(sys.stdin).get("tunnels", []):
+        if t.get("transport","") in ("dnstt","noizdns","vaydns") and t.get("mtu",0) > 1000:
+            print(t["tag"])
+except: pass
+' < "$config" 2>/dev/null || true)
+        fi
+        if [[ -n "$high_mtu_tags" ]]; then
+            echo ""
+            print_warn "High MTU detected on DNSTT/NoizDNS/VayDNS tunnels (may cause data issues):"
+            for t in $high_mtu_tags; do
+                echo -e "    ${YELLOW}${t}${NC} — try reducing MTU to 800-1000 if data doesn't flow"
+            done
+        fi
+    else
+        print_fail "Config file not found: ${config}"
+        issues=$((issues + 1))
+    fi
+    echo ""
+
+    # ─── 5. Port 53 binding ───
+    section_num=$((section_num + 1))
+    echo -e "  ${BOLD}${section_num}. Network & Ports${NC}"
+    echo -e "  ${DIM}──────────────────────────${NC}"
+
+    local port53_owner
+    port53_owner=$(ss -ulnp 2>/dev/null | grep ":53\b" | head -1 || true)
+    if [[ -n "$port53_owner" ]]; then
+        if echo "$port53_owner" | grep -q "dnsgb"; then
+            print_ok "Port 53 UDP: bound by dnsgb"
+        elif echo "$port53_owner" | grep -q "systemd-resolve"; then
+            print_fail "Port 53 UDP: bound by systemd-resolved (conflicts with dnsgb)"
+            echo -e "    ${DIM}Fix: sudo systemctl disable --now systemd-resolved${NC}"
+            issues=$((issues + 1))
+        else
+            print_warn "Port 53 UDP: bound by unknown process"
+            echo -e "    ${DIM}${port53_owner}${NC}"
+        fi
+    else
+        print_fail "Port 53 UDP: nothing listening"
+        issues=$((issues + 1))
+    fi
+
+    # Port 53 TCP
+    local port53_tcp
+    port53_tcp=$(ss -tlnp 2>/dev/null | grep ":53\b" | head -1 || true)
+    if [[ -n "$port53_tcp" ]]; then
+        print_ok "Port 53 TCP: listening"
+    else
+        print_warn "Port 53 TCP: not listening (some clients need this)"
+    fi
+
+    # SSH reachability (for SSH tunnels)
+    local has_ssh_tunnels=false
+    for tag in $tags; do
+        [[ "$tag" == *ssh* ]] && has_ssh_tunnels=true && break
+    done
+    if [[ "$has_ssh_tunnels" == true ]]; then
+        if timeout 3 bash -c 'echo > /dev/tcp/127.0.0.1/22' &>/dev/null 2>&1 || timeout 3 bash -c 'echo | nc -w2 127.0.0.1 22' &>/dev/null; then
+            print_ok "SSH (127.0.0.1:22): reachable"
+        else
+            print_fail "SSH (127.0.0.1:22): not reachable — SSH tunnels will fail"
+            echo -e "    ${DIM}Fix: sudo systemctl restart sshd${NC}"
+            issues=$((issues + 1))
+        fi
+    fi
+
+    # Firewall
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+        if ufw status 2>/dev/null | grep -qE "53.*(ALLOW|allow)"; then
+            print_ok "UFW: port 53 allowed"
+        else
+            print_warn "UFW is active but port 53 may not be allowed"
+            echo -e "    ${DIM}Fix: sudo ufw allow 53${NC}"
+        fi
+    fi
+    if command -v iptables &>/dev/null; then
+        local ipt_drop
+        ipt_drop=$(timeout 5 iptables -L INPUT -n 2>/dev/null | grep -i "drop.*dpt:53\|reject.*dpt:53" || true)
+        if [[ -n "$ipt_drop" ]]; then
+            print_fail "iptables: port 53 is being dropped/rejected"
+            echo -e "    ${DIM}${ipt_drop}${NC}"
+            issues=$((issues + 1))
+        fi
+    fi
+    echo ""
+
+    # ─── 6. DNS resolution test ───
+    section_num=$(( ${section_num} + 1 ))
+    echo -e "  ${BOLD}${section_num}. DNS Key & Resolution${NC}"
+    echo -e "  ${DIM}──────────────────────────${NC}"
+
+    # Check public keys exist
+    for tag in $tags; do
+        [[ "$tag" == slip* ]] && continue  # Slipstream doesn't use pubkeys
+        local pubkey_file="/etc/dnsgb/tunnels/${tag}/server.pub"
+        if [[ -f "$pubkey_file" ]]; then
+            local pk
+            pk=$(cat "$pubkey_file" 2>/dev/null || true)
+            if [[ -n "$pk" ]]; then
+                print_ok "${tag}: public key present (${pk:0:16}...)"
+            else
+                print_fail "${tag}: public key file is empty"
+                issues=$((issues + 1))
+            fi
+        else
+            print_warn "${tag}: no public key file"
+        fi
+    done
+
+    # Check private keys exist
+    for tag in $tags; do
+        [[ "$tag" == slip* ]] && continue
+        local privkey_file="/etc/dnsgb/tunnels/${tag}/server.key"
+        if [[ -f "$privkey_file" ]]; then
+            print_ok "${tag}: private key present"
+        else
+            print_fail "${tag}: private key missing — tunnel cannot decrypt"
+            issues=$((issues + 1))
+        fi
+    done
+
+    # External DNS test
+    local test_domain=""
+    if [[ -f "$config" ]]; then
+        if command -v jq &>/dev/null; then
+            test_domain=$(jq -r '.tunnels[0]?.domain // empty' "$config" 2>/dev/null || true)
+        elif command -v python3 &>/dev/null; then
+            test_domain=$(python3 -c '
+import sys, json
+try:
+    t = json.load(sys.stdin).get("tunnels",[])
+    if t: print(t[0].get("domain",""))
+except: pass
+' < "$config" 2>/dev/null || true)
+        fi
+    fi
+    if [[ -n "$test_domain" ]]; then
+        echo ""
+        print_info "Testing DNS resolution for ${test_domain}..."
+        local dig_result
+        if command -v dig &>/dev/null; then
+            dig_result=$(timeout 10 dig @8.8.8.8 "$test_domain" NS +short +time=5 +tries=1 2>/dev/null || true)
+        elif command -v nslookup &>/dev/null; then
+            dig_result=$(timeout 5 nslookup -type=NS "$test_domain" 8.8.8.8 2>/dev/null | grep -i "nameserver\|server" || true)
+        fi
+        if [[ -n "$dig_result" ]]; then
+            print_ok "DNS resolves: ${dig_result}"
+        else
+            print_warn "DNS resolution returned empty (may be normal for subdomain)"
+        fi
+    fi
+    echo ""
+
+    # ─── 7. systemd-resolved conflict ───
+    section_num=$(( ${section_num} + 1 ))
+    echo -e "  ${BOLD}${section_num}. System Conflicts${NC}"
+    echo -e "  ${DIM}──────────────────────────${NC}"
+
+    if systemctl is-active --quiet systemd-resolved.service 2>/dev/null; then
+        print_fail "systemd-resolved is running — may conflict with port 53"
+        echo -e "    ${DIM}Fix: sudo systemctl disable --now systemd-resolved${NC}"
+        issues=$((issues + 1))
+    else
+        print_ok "systemd-resolved: disabled/stopped"
+    fi
+
+    # Check /etc/resolv.conf
+    if [[ -L /etc/resolv.conf ]]; then
+        local resolv_target
+        resolv_target=$(readlink -f /etc/resolv.conf 2>/dev/null || true)
+        if [[ "$resolv_target" == *"systemd"* ]]; then
+            print_warn "/etc/resolv.conf points to systemd-resolved stub"
+            echo -e "    ${DIM}May cause DNS issues. Check: cat /etc/resolv.conf${NC}"
+        else
+            print_ok "/etc/resolv.conf: symlink to ${resolv_target}"
+        fi
+    elif [[ -f /etc/resolv.conf ]]; then
+        local nameserver
+        nameserver=$(grep -m1 'nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' || true)
+        if [[ "$nameserver" == "127.0.0.53" ]]; then
+            print_warn "/etc/resolv.conf uses 127.0.0.53 (systemd-resolved stub)"
+        else
+            print_ok "/etc/resolv.conf nameserver: ${nameserver:-unknown}"
+        fi
+    fi
+    echo ""
+
+    # ─── Summary ───
+    echo -e "  ${DIM}════════════════════════════════════════${NC}"
+    if [[ $issues -eq 0 ]]; then
+        echo -e "  ${GREEN}${BOLD}All checks passed — no issues found${NC}"
+        echo ""
+        echo -e "  ${DIM}If DNSTT/NoizDNS/VayDNS tunnels connect but don't transmit data, try lower MTU.${NC}"
+        echo -e "  ${DIM}See: https://github.com/SamNet-dev/dnstm-setup/issues/35${NC}"
+    else
+        echo -e "  ${RED}${BOLD}Found ${issues} issue(s)${NC}"
+        echo ""
+        echo -e "  ${DIM}Fix the issues above, then re-run: sudo bash $0 --diag${NC}"
+    fi
+    echo ""
+}
+
+# ─── SlipNet URL Generator ────────────────────────────────────────────────────
+
+# Generate a slipnet:// deep-link URL for the SlipNet Android app.
+# Usage: generate_slipnet_url <tunnel_type> <subdomain> [pubkey] [ssh_user] [ssh_pass] [socks_user] [socks_pass]
+#   tunnel_type: "ss", "dnstt", "sayedns", "slipstream_ssh", "dnstt_ssh", or "sayedns_ssh" (SlipNet constants)
+#   subdomain:   e.g. "t" or "d"
+#   pubkey:      DNSTT public key (required for dnstt, empty for slipstream)
+#   ssh_user:    SSH tunnel username (optional)
+#   ssh_pass:    SSH tunnel password (optional)
+generate_slipnet_url() {
+    local tunnel_type="$1"
+    local subdomain="$2"
+    local pubkey="${3:-}"
+    local ssh_user="${4:-}"
+    local ssh_pass="${5:-}"
+    local socks_user="${6:-}"
+    local socks_pass="${7:-}"
+    local name="${subdomain}.${DOMAIN}"
+    local ns_domain="${subdomain}.${DOMAIN}"
+    local resolver="8.8.8.8:53:0"
+    local ssh_enabled="0" ssh_port="22" ssh_host="127.0.0.1"
+    local auth_mode="0"
+
+    if [[ -n "$ssh_user" && -n "$ssh_pass" ]]; then
+        ssh_enabled="1"
+    fi
+
+    if [[ -n "$socks_user" && -n "$socks_pass" ]]; then
+        auth_mode="1"
+    fi
+
+    # v16 pipe-delimited format (36 fields):
+    # 1:version 2:tunnelType 3:name 4:domain 5:resolvers 6:authMode 7:keepAlive
+    # 8:cc 9:port 10:host 11:gso 12:dnsttPublicKey 13:socksUser 14:socksPass
+    # 15:sshEnabled 16:sshUser 17:sshPass 18:sshPort 19:fwdDns 20:sshHost
+    # 21:useServerDns 22:dohUrl 23:dnsTransport 24:sshAuthType 25:sshPrivKey
+    # 26:sshKeyPass 27:torBridges 28:dnsttAuthoritative 29:naivePort
+    # 30:naiveUser 31:naivePass 32:isLocked 33:lockHash 34:expiration
+    # 35:allowSharing 36:boundDeviceId
+    local data="16|${tunnel_type}|${name}|${ns_domain}|${resolver}|${auth_mode}|5000|bbr|1080|127.0.0.1|0|${pubkey}|${socks_user}|${socks_pass}|${ssh_enabled}|${ssh_user}|${ssh_pass}|${ssh_port}|0|${ssh_host}|0||udp|password|||0|0|443|||0||0|0|"
+    echo "slipnet://$(echo -n "$data" | base64 -w0)"
+}
+
+# ─── SSH MAC Compatibility Fix ────────────────────────────────────────────────
+
+fix_ssh_macs() {
+    # sshtun-user configure may set MACs to ETM-only, which breaks clients like
+    # Bitvise and older SSH clients that only support non-ETM MACs.
+    # Add SHA2 non-ETM fallbacks while keeping ETM preferred.
+    local sshd_config="/etc/ssh/sshd_config"
+    [[ -f "$sshd_config" ]] || return 0
+
+    # Check if MACs line exists and is ETM-only (no non-ETM fallbacks)
+    if grep -qE '^MACs\s+.*etm@openssh\.com' "$sshd_config" 2>/dev/null && \
+       ! grep -qE '^MACs\s+.*hmac-sha2-256[^-]' "$sshd_config" 2>/dev/null; then
+        # Add non-ETM SHA2 fallbacks
+        sed -i 's/^\(MACs\s\+.*\)$/\1,hmac-sha2-256,hmac-sha2-512/' "$sshd_config"
+        # Validate before reloading
+        if command -v sshd &>/dev/null && sshd -t 2>/dev/null; then
+            systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
+            print_ok "Added SSH MAC compatibility (non-ETM SHA2 fallbacks)"
+        else
+            # Rollback the change
+            sed -i 's/,hmac-sha2-256,hmac-sha2-512$//' "$sshd_config"
+            print_warn "SSH MAC fix failed validation — reverted"
+        fi
+    fi
+}
+
+# ─── microsocks GLIBC Fix ─────────────────────────────────────────────────────
+
+compile_microsocks_from_source() {
+    # The pre-built microsocks binary shipped by dnsgb requires GLIBC ≥ 2.38.
+    # Older distros (Ubuntu 22.04 = GLIBC 2.35, Debian 11 = 2.31) will fail to
+    # run it.  This function compiles microsocks from source as a fallback.
+    print_info "Compiling microsocks from source (GLIBC compatibility fix)..."
+
+    # Ensure build tools are available
+    if ! command -v gcc &>/dev/null || ! command -v make &>/dev/null; then
+        print_info "Installing build tools (gcc, make, git)..."
+
+        # Wait for any running apt/dpkg lock (unattended-upgrades, etc.)
+        local lock_wait=0
+        while fuser /var/lib/dpkg/lock-frontend &>/dev/null 2>&1 || \
+              fuser /var/lib/apt/lists/lock &>/dev/null 2>&1 || \
+              fuser /var/lib/dpkg/lock &>/dev/null 2>&1; do
+            if [[ $lock_wait -eq 0 ]]; then
+                print_info "Waiting for package manager lock (another process is running)..."
+            fi
+            sleep 2
+            lock_wait=$((lock_wait + 2))
+            if [[ $lock_wait -ge 60 ]]; then
+                print_warn "Package manager still locked after 60s — killing blocking process"
+                # Kill unattended-upgrades if it's the blocker
+                pkill -f unattended-upgr 2>/dev/null || true
+                sleep 3
+                dpkg --configure -a 2>/dev/null || true
+                break
+            fi
+        done
+
+        dpkg --configure -a 2>/dev/null || true
+        apt-get update -qq 2>/dev/null || true
+        if ! apt-get install -y -qq build-essential git 2>/dev/null; then
+            # Retry once after clearing locks
+            sleep 2
+            dpkg --configure -a 2>/dev/null || true
+            apt-get install -y -qq build-essential git 2>/dev/null || true
+        fi
+    fi
+
+    if ! command -v gcc &>/dev/null; then
+        print_fail "Cannot install gcc — microsocks will not work"
+        print_info "Try manually: apt install -y build-essential && re-run this script"
+        return 1
+    fi
+
+    local build_dir="/tmp/microsocks-build-$$"
+    rm -rf "$build_dir"
+
+    if ! git clone --depth 1 https://github.com/rofl0r/microsocks.git "$build_dir" 2>/dev/null; then
+        print_fail "Failed to clone microsocks source"
+        rm -rf "$build_dir"
+        return 1
+    fi
+
+    if ! make -C "$build_dir" 2>/dev/null; then
+        print_fail "Failed to compile microsocks"
+        rm -rf "$build_dir"
+        return 1
+    fi
+
+    if [[ ! -f "$build_dir/microsocks" ]]; then
+        print_fail "microsocks binary not produced"
+        rm -rf "$build_dir"
+        return 1
+    fi
+
+    # Replace the broken binary
+    systemctl stop microsocks 2>/dev/null || true
+    cp "$build_dir/microsocks" /usr/local/bin/microsocks
+    chmod +x /usr/local/bin/microsocks
+    rm -rf "$build_dir"
+
+    # Restart service
+    systemctl reset-failed microsocks 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    if systemctl start microsocks 2>/dev/null; then
+        sleep 2
+        if pgrep -x microsocks &>/dev/null; then
+            print_ok "microsocks compiled from source and running"
+            return 0
+        fi
+    fi
+
+    print_fail "microsocks compiled but failed to start"
+    return 1
+}
+
+# Check whether the microsocks binary can actually execute on this system.
+# Returns 0 if it works, 1 if GLIBC or another loader error is detected.
+microsocks_binary_works() {
+    local bin="${1:-/usr/local/bin/microsocks}"
+    [[ -x "$bin" ]] || return 1
+    # Use ldd to check for missing shared library versions.  GLIBC mismatches
+    # show "not found" in ldd output (e.g. "GLIBC_2.38 not found").
+    if ldd "$bin" 2>&1 | grep -qi "not found"; then
+        return 1
+    fi
+    return 0
+}
+
+# ─── Security Hardening Helpers ────────────────────────────────────────────────
+
+ensure_resolv_conf_fallback() {
+    # After stopping systemd-resolved, /etc/resolv.conf may still point to
+    # 127.0.0.53 which is now dead, or be a symlink to resolved's file with
+    # no nameservers.  Write a fallback and lock it so nothing can overwrite it.
+    local needs_fix=false
+    if [[ ! -s /etc/resolv.conf ]]; then
+        needs_fix=true
+    elif grep -q '127\.0\.0\.53' /etc/resolv.conf 2>/dev/null; then
+        needs_fix=true
+    elif ! grep -q '^nameserver' /etc/resolv.conf 2>/dev/null; then
+        # File exists but has no nameserver lines (e.g. resolved uplink mode with no DNS)
+        needs_fix=true
+    fi
+    if [[ "$needs_fix" == true ]]; then
+        print_info "Updating /etc/resolv.conf with public DNS fallback"
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        rm -f /etc/resolv.conf 2>/dev/null || true
+        cat > /etc/resolv.conf <<'RESOLVEOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+RESOLVEOF
+        # Verify the write succeeded
+        if ! grep -q '8\.8\.8\.8' /etc/resolv.conf 2>/dev/null; then
+            echo "nameserver 8.8.8.8" > /etc/resolv.conf 2>/dev/null || true
+        fi
+        # Lock so systemd-resolved or package manager can't overwrite
+        chattr +i /etc/resolv.conf 2>/dev/null || true
+    fi
+}
+
+configure_systemd_resolved_no_stub() {
+    # Keep system DNS working while freeing port 53 from the local stub listener.
+    if ! command -v systemctl &>/dev/null; then
+        print_warn "systemctl not found; skipping resolver hardening"
+        return 0
+    fi
+
+    if ! systemctl cat systemd-resolved.service &>/dev/null; then
+        print_warn "systemd-resolved is not installed; skipping resolver hardening"
+        return 0
+    fi
+
+    mkdir -p /etc/systemd/resolved.conf.d
+    cat > /etc/systemd/resolved.conf.d/10-dnsgb-no-stub.conf <<'EOF'
+[Resolve]
+DNSStubListener=no
+DNS=8.8.8.8 1.1.1.1
+EOF
+
+    # Unlock resolv.conf, write direct nameservers (NOT a symlink to resolved),
+    # then lock it so nothing (package manager, resolved restart) can overwrite it.
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    rm -f /etc/resolv.conf 2>/dev/null || true
+    cat > /etc/resolv.conf <<'DNSEOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+DNSEOF
+    chattr +i /etc/resolv.conf 2>/dev/null || true
+
+    systemctl unmask systemd-resolved.service systemd-resolved.socket 2>/dev/null || true
+    systemctl enable systemd-resolved.service 2>/dev/null || true
+    systemctl restart systemd-resolved.service 2>/dev/null || true
+
+    # Verify DNS actually works
+    sleep 1
+    local dns_ok=false
+    if getent hosts github.com &>/dev/null 2>&1; then
+        dns_ok=true
+    elif curl -sf --max-time 3 https://api.ipify.org &>/dev/null 2>&1; then
+        dns_ok=true
+    fi
+
+    if [[ "$dns_ok" != "true" ]]; then
+        print_warn "DNS not working — check /etc/resolv.conf"
+        return 1
+    fi
+
+    return 0
+}
+
+write_service_override() {
+    local unit="$1"
+    local run_user="$2"
+    local run_group="$3"
+    local needs_bind_cap="${4:-no}"
+    local dropin_dir="/etc/systemd/system/${unit}.d"
+    local dropin_file="${dropin_dir}/20-hardening.conf"
+
+    # DNS router may need more memory on high-traffic servers
+    local mem_limit="512M"
+    [[ "$unit" == "dnsgb-dnsrouter.service" ]] && mem_limit="1G"
+
+    mkdir -p "$dropin_dir"
+
+    cat > "$dropin_file" <<EOF
+[Service]
+User=${run_user}
+Group=${run_group}
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/dnsgb
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+MemoryMax=${mem_limit}
+EOF
+
+    if [[ "$needs_bind_cap" == "yes" ]]; then
+        cat >> "$dropin_file" <<'EOF'
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+EOF
+    else
+        cat >> "$dropin_file" <<'EOF'
+AmbientCapabilities=
+CapabilityBoundingSet=
+EOF
+    fi
+}
+
+unit_exists() {
+    local unit="$1"
+    systemctl cat "$unit" >/dev/null 2>&1
+}
+
+enable_autostart_units() {
+    local dnsgb_units unit
+    dnsgb_units=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '$1 ~ /^dnsgb-.*\.service$/ {print $1}' || true)
+    for unit in $dnsgb_units microsocks.service; do
+        if ! unit_exists "$unit"; then
+            continue
+        fi
+        if ! systemctl enable "$unit" >/dev/null 2>&1; then
+            print_warn "Could not enable ${unit} for boot autostart"
+        fi
+    done
+    print_ok "Boot autostart enabled for dnsgb and microsocks services"
+}
+
+# ─── Rsyslog Filter & Journald Size Limits ────────────────────────────────────
+
+install_rsyslog_filter() {
+    local rsyslog_file="/etc/rsyslog.d/10-dnsgb-suppress.conf"
+    cat > "$rsyslog_file" <<'EOF'
+:programname, isequal, "dnstt-server" stop
+:programname, isequal, "noizdns-server" stop
+:programname, isequal, "vaydns-server" stop
+EOF
+    chmod 644 "$rsyslog_file"
+    systemctl restart rsyslog 2>/dev/null || true
+    print_ok "Installed rsyslog filter: $rsyslog_file (suppresses tunnel log flood to syslog)"
+}
+
+configure_journald_limit() {
+    local journald_dir="/etc/systemd/journald.conf.d"
+    local journald_file="${journald_dir}/10-dnsgb-limit.conf"
+    
+    mkdir -p "$journald_dir"
+    cat > "$journald_file" <<'EOF'
+[Journal]
+SystemMaxUse=200M
+RuntimeMaxUse=100M
+EOF
+    chmod 644 "$journald_file"
+    systemctl restart systemd-journald 2>/dev/null || true
+    print_ok "Configured journald size limits: $journald_file"
+}
+
+apply_service_hardening() {
+    print_info "Applying least-privilege service hardening..."
+
+    if ! id -u dnsgb &>/dev/null; then
+        if useradd --system --home /nonexistent --shell /usr/sbin/nologin dnsgb 2>/dev/null; then
+            print_ok "Created service account: dnsgb"
+        else
+            print_fail "Could not create service account: dnsgb"
+            return 1
+        fi
+    fi
+
+    if [[ -d /etc/dnsgb ]]; then
+        chown -R root:dnsgb /etc/dnsgb 2>/dev/null || true
+        find /etc/dnsgb -type d -exec chmod 750 {} + 2>/dev/null || true
+        find /etc/dnsgb -type f -exec chmod 640 {} + 2>/dev/null || true
+        find /etc/dnsgb -type f \( -name "*.pub" -o -name "cert.pem" \) -exec chmod 644 {} + 2>/dev/null || true
+        find /etc/dnsgb -type f \( -name "*.key" -o -name "server.key" \) -exec chmod 640 {} + 2>/dev/null || true
+        print_ok "Hardened /etc/dnsgb ownership and permissions"
+    else
+        print_warn "/etc/dnsgb not found yet; skipping file permission hardening"
+    fi
+
+    local dnsgb_units
+    dnsgb_units=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '$1 ~ /^dnsgb-.*\.service$/ {print $1}' || true)
+    if [[ -z "$dnsgb_units" ]]; then
+        print_warn "No dnsgb systemd units found to harden"
+        return 0
+    fi
+
+    local unit
+    for unit in $dnsgb_units; do
+        if [[ "$unit" == "dnsgb-dnsrouter.service" ]]; then
+            write_service_override "$unit" "dnsgb" "dnsgb" "yes"
+        else
+            write_service_override "$unit" "dnsgb" "dnsgb" "no"
+        fi
+    done
+
+    if unit_exists "microsocks.service"; then
+        write_service_override "microsocks.service" "nobody" "nogroup" "no"
+    fi
+
+    systemctl daemon-reload 2>/dev/null || true
+
+    local hardening_ok=true
+    for unit in $dnsgb_units microsocks.service; do
+        if ! unit_exists "$unit"; then
+            continue
+        fi
+        if systemctl is-enabled "$unit" &>/dev/null || systemctl is-active --quiet "$unit" 2>/dev/null; then
+            if ! systemctl restart "$unit" 2>/dev/null; then
+                print_warn "Failed to restart hardened unit: $unit — rolling back"
+                local dropin="/etc/systemd/system/${unit}.d/20-hardening.conf"
+                rm -f "$dropin"
+                systemctl daemon-reload 2>/dev/null || true
+                systemctl reset-failed "$unit" 2>/dev/null || true
+                systemctl restart "$unit" 2>/dev/null || true
+                hardening_ok=false
+            fi
+        fi
+    done
+
+    if [[ "$hardening_ok" != "true" ]]; then
+        print_warn "Some units could not be hardened; services restored without hardening"
+        return 1
+    fi
+
+    enable_autostart_units
+    install_rsyslog_filter
+    configure_journald_limit
+    print_ok "Applied systemd hardening overrides"
+    return 0
+}
+
+# ─── Change MTU ──────────────────────────────────────────────────────────────────
+
+do_change_mtu() {
+    banner
+    print_header "Change DNSTT MTU"
+
+    if [[ $EUID -ne 0 ]]; then
+        print_fail "Not running as root."
+        exit 1
+    fi
+
+    if ! command -v dnsgb &>/dev/null; then
+        print_fail "dnsgb is not installed."
+        return 1
+    fi
+
+    # Find DNSTT tunnels from dnsgb
+    local tunnel_output
+    tunnel_output=$(dnsgb tunnel list 2>/dev/null || true)
+    if [[ -z "$tunnel_output" ]]; then
+        print_warn "No tunnels found."
+        return 0
+    fi
+
+    # Find DNSTT service files by looking for dnstt-server in ExecStart
+    local dnstt_svcs=()
+    local dnstt_tags=()
+    local svc_files
+    svc_files=$(find /etc/systemd/system -maxdepth 1 -name 'dnsgb*.service' -o -name 'dnsrouter*.service' 2>/dev/null || true)
+    # Also check for dnsgb tunnel list tag-based discovery
+    local all_tags
+    all_tags=$(echo "$tunnel_output" | grep -oE 'tag=[^ ]+' | sed 's/tag=//' || true)
+    [[ -z "$all_tags" && -n "$tunnel_output" ]] && \
+        all_tags=$(echo "$tunnel_output" | grep -oE '\b(slip|dnstt|noiz|vay|xray)[a-z0-9_-]*' | sort -u || true)
+
+    # Method 1: Find services containing dnstt-server in ExecStart
+    for svc_file in $svc_files; do
+        if grep -q 'dnstt-server\|dnstt' "$svc_file" 2>/dev/null; then
+            local svc_name
+            svc_name=$(basename "$svc_file")
+            local exec_line
+            exec_line=$(grep '^ExecStart=' "$svc_file" 2>/dev/null | tail -1 || true)
+            # Only include if it actually runs dnstt-server (not router)
+            if echo "$exec_line" | grep -q 'dnstt-server'; then
+                dnstt_svcs+=("$svc_name")
+                local tag_name
+                tag_name=$(echo "$svc_name" | sed 's/^dnsgb-tunnel-//;s/^dnsgb-//;s/\.service$//')
+                dnstt_tags+=("$tag_name")
+            fi
+        fi
+    done
+
+    # Method 2: If Method 1 found nothing, try from dnsgb tunnel list
+    if [[ ${#dnstt_svcs[@]} -eq 0 ]]; then
+        for tag in $all_tags; do
+            # Skip noiz tunnels — they don't support MTU
+            if [[ "$tag" == noiz* ]]; then
+                continue
+            fi
+            if echo "$tunnel_output" | grep -wF "$tag" | grep -qi "transport=dnstt\|dnstt"; then
+                # Try common service name patterns
+                local found_svc=""
+                for pattern in "dnsgb-tunnel-${tag}.service" "dnsgb-${tag}.service"; do
+                    if systemctl cat "$pattern" &>/dev/null; then
+                        # Verify it actually runs dnstt-server, not noiz
+                        if systemctl cat "$pattern" 2>/dev/null | grep -q 'dnstt-server'; then
+                            found_svc="$pattern"
+                            break
+                        fi
+                    fi
+                done
+                if [[ -n "$found_svc" ]]; then
+                    dnstt_svcs+=("$found_svc")
+                    dnstt_tags+=("$tag")
+                fi
+            fi
+        done
+    fi
+
+    if [[ ${#dnstt_svcs[@]} -eq 0 ]]; then
+        print_warn "No DNSTT tunnel services found. MTU only applies to DNSTT tunnels."
+        return 0
+    fi
+
+    # Show current MTU for each DNSTT tunnel
+    echo ""
+    print_info "Current DNSTT tunnels and MTU values:"
+    echo ""
+    local i
+    for i in "${!dnstt_svcs[@]}"; do
+        local svc="${dnstt_svcs[$i]}"
+        local tag="${dnstt_tags[$i]}"
+        local exec_line
+        exec_line=$(systemctl cat "$svc" 2>/dev/null | grep '^ExecStart=' | tail -1 || true)
+        local current_mtu
+        current_mtu=$(echo "$exec_line" | grep -oE '\-mtu\s+[0-9]+' | grep -oE '[0-9]+' || true)
+        if [[ -z "$current_mtu" ]]; then
+            current_mtu="default (1232)"
+        fi
+        echo -e "  ${BOLD}${tag}${NC}: MTU = ${GREEN}${current_mtu}${NC}  ${DIM}(${svc})${NC}"
+    done
+
+    echo ""
+    local new_mtu
+    new_mtu=$(prompt_input "Enter new MTU value for ALL DNSTT tunnels (512-1400)" "1100")
+    new_mtu=$(echo "$new_mtu" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    if ! [[ "$new_mtu" =~ ^[0-9]+$ ]] || [[ "$new_mtu" -lt 512 ]] || [[ "$new_mtu" -gt 1400 ]]; then
+        print_fail "Invalid MTU value. Must be 512-1400."
+        return 1
+    fi
+
+    echo ""
+    print_info "Setting MTU to ${new_mtu} on all DNSTT tunnels..."
+
+    local changed=0
+    for i in "${!dnstt_svcs[@]}"; do
+        local svc="${dnstt_svcs[$i]}"
+        local tag="${dnstt_tags[$i]}"
+        local exec_line
+        exec_line=$(systemctl cat "$svc" 2>/dev/null | grep '^ExecStart=' | tail -1 || true)
+        if [[ -z "$exec_line" ]]; then
+            print_warn "Could not read ExecStart for ${tag}, skipping"
+            continue
+        fi
+
+        local new_exec
+        if echo "$exec_line" | grep -qE '\-mtu\s+[0-9]+'; then
+            # Replace existing MTU
+            new_exec=$(echo "$exec_line" | sed -E "s/-mtu\s+[0-9]+/-mtu ${new_mtu}/")
+        else
+            # Add MTU after -udp :PORT
+            new_exec=$(echo "$exec_line" | sed -E "s/(-udp\\s+:[0-9]+)/\\1 -mtu ${new_mtu}/")
+        fi
+        new_exec=$(echo "$new_exec" | sed -E "s/ 1800 [0-9]+/ 1800 ${new_mtu}/")
+
+        # Write override
+        local override_dir="/etc/systemd/system/${svc}.d"
+        mkdir -p "$override_dir"
+        cat > "${override_dir}/mtu-override.conf" <<MTEOF
+[Service]
+ExecStart=
+${new_exec}
+MTEOF
+
+        print_ok "${tag}: MTU → ${new_mtu}"
+        ((changed++)) || true
+    done
+
+    if [[ $changed -gt 0 ]]; then
+        if [ -f /usr/local/bin/dnsgb-edns-proxy.py ]; then
+            print_info "Updating internal EDNS size in proxy..."
+            sed -i "s/INTERNAL_EDNS_SIZE=[0-9]\\+/INTERNAL_EDNS_SIZE=${new_mtu}/g" /usr/local/bin/dnsgb-edns-proxy.py
+        fi
+
+        systemctl daemon-reload
+        echo ""
+        print_info "Restarting DNSTT tunnels..."
+        for svc in "${dnstt_svcs[@]}"; do
+            systemctl restart "$svc" 2>/dev/null || true
+        done
+        sleep 2
+        # Restart router to pick up changes
+        if systemctl is-active dnsgb-router &>/dev/null; then
+            systemctl restart dnsgb-router 2>/dev/null || true
+        fi
+        echo ""
+        print_ok "MTU updated to ${new_mtu} on ${changed} tunnel(s). Keys unchanged."
+    else
+        print_warn "No tunnels were modified."
+    fi
+}
+
+# ─── --harden ────────────────────────────────────────────────────────────────────
+
+do_harden() {
+    banner
+    print_header "Security Hardening Mode"
+
+    if [[ $EUID -ne 0 ]]; then
+        print_fail "Not running as root. Please run with: sudo bash $0 --harden"
+        exit 1
+    fi
+
+    if ! command -v dnsgb &>/dev/null; then
+        print_fail "dnsgb is not installed. Run the setup first before hardening."
+        exit 1
+    fi
+
+    configure_systemd_resolved_no_stub || true
+    if apply_service_hardening; then
+        print_ok "Runtime hardening applied"
+    else
+        print_warn "Runtime hardening reported issues; review systemctl status for dnsgb units"
+    fi
+
+    echo ""
+    print_info "Current unit users:"
+    for unit in dnsgb-dnsrouter.service dnsgb-dnstt1.service dnsgb-slip1.service dnsgb-dnstt-ssh.service dnsgb-slip-ssh.service microsocks.service; do
+        if unit_exists "$unit"; then
+            systemctl show -p User -p Group "$unit" 2>/dev/null || true
+        fi
+    done
+    echo ""
+    print_ok "Hardening complete."
+}
+
+# ─── --remove-tunnel ─────────────────────────────────────────────────────────────
+
+do_remove_tunnel() {
+    local target_tag="$1"
+    banner
+
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "  ${CROSS} Not running as root. Please run with: sudo bash $0 --remove-tunnel <tag>"
+        exit 1
+    fi
+
+    if ! command -v dnsgb &>/dev/null; then
+        print_fail "dnsgb is not installed. Nothing to remove."
+        exit 1
+    fi
+
+    # Cache tunnel list output (reused throughout)
+    local tunnel_output
+    tunnel_output=$(dnsgb tunnel list 2>/dev/null || true)
+
+    # Show current tunnels
+    print_header "Remove Tunnel"
+    echo ""
+    print_info "Current tunnels:"
+    echo ""
+    echo "$tunnel_output"
+    echo ""
+
+    # If no tag given, ask interactively
+    if [[ -z "$target_tag" ]]; then
+        local tags
+        tags=$(echo "$tunnel_output" | grep -oE 'tag=[^ ]+' | sed 's/tag=//' || true)
+        [[ -z "$tags" && -n "$tunnel_output" ]] && \
+            tags=$(echo "$tunnel_output" | grep -oE '\b(slip|dnstt|noiz|vay|xray)[a-z0-9_-]*' | sort -u || true)
+        if [[ -z "$tags" ]]; then
+            print_warn "No tunnels found."
+            exit 0
+        fi
+
+        # Show numbered list
+        local i=1
+        local tag_arr=()
+        for tag in $tags; do
+            local domain_info
+            domain_info=$(echo "$tunnel_output" | grep -wF "$tag" | grep -oE 'domain=[^ ]+' | head -1 | sed 's/domain=//' || true)
+            echo -e "  ${BOLD}${i})${NC}  ${tag}  ${DIM}(${domain_info})${NC}"
+            tag_arr+=("$tag")
+            i=$((i + 1))
+        done
+        echo -e "  ${BOLD}0)${NC}  Cancel"
+        echo ""
+
+        local choice
+        choice=$(prompt_input "Select tunnel to remove (1-${#tag_arr[@]})")
+        if [[ "$choice" == "0" || -z "$choice" ]]; then
+            print_info "Cancelled."
+            exit 0
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#tag_arr[@]} ]]; then
+            target_tag="${tag_arr[$((choice - 1))]}"
+        else
+            print_fail "Invalid selection."
+            exit 1
+        fi
+    fi
+
+    # Verify tunnel exists
+    if ! echo "$tunnel_output" | grep -qwF "${target_tag}"; then
+        print_fail "Tunnel '${target_tag}' not found."
+        echo ""
+        print_info "Available tunnels:"
+        local _avail_tags
+        _avail_tags=$(echo "$tunnel_output" | grep -oE 'tag=[^ ]+' | sed 's/tag=//' || true)
+        [[ -z "$_avail_tags" && -n "$tunnel_output" ]] && \
+            _avail_tags=$(echo "$tunnel_output" | grep -oE '\b(slip|dnstt|noiz|vay|xray)[a-z0-9_-]*' | sort -u || true)
+        echo "$_avail_tags" | sed 's/^/  /' || true
+        exit 1
+    fi
+
+    local domain_info
+    domain_info=$(echo "$tunnel_output" | grep -wF "$target_tag" | grep -oE 'domain=[^ ]+' | head -1 | sed 's/domain=//' || true)
+
+    echo ""
+    if ! prompt_yn "Remove tunnel '${target_tag}' (${domain_info})?" "n"; then
+        print_info "Cancelled."
+        exit 0
+    fi
+
+    echo ""
+
+    # Stop the tunnel
+    print_info "Stopping tunnel: ${target_tag}..."
+    if dnsgb tunnel stop --tag "$target_tag" 2>/dev/null; then
+        print_ok "Stopped: ${target_tag}"
+    else
+        print_warn "Stop command failed (tunnel may already be stopped)"
+    fi
+
+    # Remove the tunnel
+    print_info "Removing tunnel: ${target_tag}..."
+    if dnsgb tunnel remove --tag "$target_tag" 2>/dev/null; then
+        print_ok "Removed: ${target_tag}"
+    else
+        print_warn "Remove command returned an error (tunnel may already be gone)"
+    fi
+
+    # Clean up Xray config and systemd drop-in if this was an xray tunnel
+    if [[ "$target_tag" == xray* ]]; then
+        rm -f "/etc/dnsgb/xray/${target_tag}.conf" 2>/dev/null || true
+        rm -f "/etc/systemd/system/dnsgb-${target_tag}.service.d/10-xray-upstream.conf" 2>/dev/null || true
+        rmdir "/etc/systemd/system/dnsgb-${target_tag}.service.d" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        print_ok "Cleaned up Xray config for ${target_tag}"
+        print_warn "Note: The Xray inbound in your panel was NOT removed. Delete it manually if needed."
+    fi
+
+    # Clean up NoizDNS systemd drop-in if this was a noiz tunnel
+    if [[ "$target_tag" == noiz* ]]; then
+        rm -f "/etc/systemd/system/dnsgb-${target_tag}.service.d/10-noizdns-binary.conf" 2>/dev/null || true
+        rmdir "/etc/systemd/system/dnsgb-${target_tag}.service.d" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        print_ok "Cleaned up NoizDNS override for ${target_tag}"
+    fi
+
+    if [[ "$target_tag" == vay* ]]; then
+        rm -f "/etc/systemd/system/dnsgb-${target_tag}.service.d/10-vaydns-binary.conf" 2>/dev/null || true
+        rmdir "/etc/systemd/system/dnsgb-${target_tag}.service.d" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
+    # Restart router only if tunnels remain
+    local remaining
+    if dnsgb_has_tunnels; then
+        print_info "Restarting DNS Router..."
+        dnsgb router stop 2>/dev/null || true
+        sleep 1
+        if dnsgb router start 2>/dev/null; then
+            print_ok "DNS Router restarted"
+        else
+            print_warn "DNS Router restart may have issues. Check: dnsgb router logs"
+        fi
+        echo ""
+        print_info "Remaining tunnels:"
+        echo ""
+        dnsgb tunnel list 2>/dev/null || true
+    else
+        dnsgb router stop 2>/dev/null || true
+        print_info "No tunnels remaining — DNS Router stopped"
+    fi
+    echo ""
+    print_ok "Tunnel '${target_tag}' removed."
+    echo ""
+}
+
+# ─── --add-tunnel ────────────────────────────────────────────────────────────────
+
+do_add_tunnel() {
+    banner
+
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "  ${CROSS} Not running as root. Please run with: sudo bash $0 --add-tunnel"
+        exit 1
+    fi
+
+    if ! command -v dnsgb &>/dev/null; then
+        print_fail "dnsgb is not installed. Run the full setup first: sudo bash $0"
+        exit 1
+    fi
+
+    print_header "Add Single Tunnel"
+
+    # Show current tunnels
+    echo ""
+    print_info "Current tunnels:"
+    echo ""
+    dnsgb tunnel list 2>/dev/null || print_info "(none)"
+    echo ""
+
+    # Detect server IP
+    SERVER_IP=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || curl -4 -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
+    if [[ -n "$SERVER_IP" ]]; then
+        print_ok "Server IP: ${SERVER_IP}"
+    fi
+    echo ""
+
+    # 1. Choose transport
+    echo -e "  ${BOLD}Transport:${NC}"
+    echo -e "  ${BOLD}1)${NC}  Slipstream  ${DIM}(QUIC + TLS, faster ~63 KB/s)${NC}"
+    echo -e "  ${BOLD}2)${NC}  DNSTT       ${DIM}(Noise + Curve25519, ~42 KB/s)${NC}"
+    echo -e "  ${BOLD}3)${NC}  NoizDNS     ${DIM}(DPI-resistant DNSTT fork)${NC}"
+    echo -e "  ${BOLD}4)${NC}  VayDNS      ${DIM}(optimized DNSTT fork, KCP/smux)${NC}"
+    echo ""
+    local transport_choice
+    transport_choice=$(prompt_input "Select transport (1-4)" "1")
+    local transport
+    local use_noizdns=false
+    local use_vaydns=false
+    case "$transport_choice" in
+        1) transport="slipstream" ;;
+        2) transport="dnstt" ;;
+        3)
+            transport="dnstt"
+            use_noizdns=true
+            if ! ensure_noizdns_binary; then
+                print_fail "NoizDNS binary not available. Cannot create NoizDNS tunnel."
+                exit 1
+            fi
+            ;;
+        4)
+            use_vaydns=true
+            if dnsgb_supports_vaydns; then
+                # Native VayDNS support — dnsgb handles the binary itself
+                transport="vaydns"
+            else
+                # Legacy: create as dnstt and swap binary via systemd drop-in
+                transport="dnstt"
+                if ! ensure_vaydns_binary; then
+                    print_fail "VayDNS binary not available. Cannot create VayDNS tunnel."
+                    exit 1
+                fi
+            fi
+            ;;
+        *)
+            print_fail "Invalid selection. Use 1, 2, 3, or 4."
+            exit 1
+            ;;
+    esac
+    print_ok "Transport: ${transport}$( [[ "$use_noizdns" == true ]] && echo ' (NoizDNS)' )$( [[ "$use_vaydns" == true ]] && echo ' (VayDNS)' )"
+    echo ""
+
+    # 2. Choose backend
+    echo -e "  ${BOLD}Backend:${NC}"
+    echo -e "  ${BOLD}1)${NC}  SOCKS  ${DIM}(connects to microsocks proxy)${NC}"
+    echo -e "  ${BOLD}2)${NC}  SSH    ${DIM}(connects via SSH port forwarding, requires SSH user)${NC}"
+    echo ""
+    local backend_choice
+    backend_choice=$(prompt_input "Select backend (1-2)" "1")
+    local backend
+    case "$backend_choice" in
+        1) backend="socks" ;;
+        2) backend="ssh" ;;
+        *)
+            print_fail "Invalid selection. Use 1 or 2."
+            exit 1
+            ;;
+    esac
+    print_ok "Backend: ${backend}"
+    echo ""
+
+    # 3. Get domain
+    local domain
+    domain=$(prompt_input "Enter the full tunnel domain (e.g. t.example.com)")
+    domain=$(echo "$domain" | sed 's|^[[:space:]]*||;s|[[:space:]]*$||;s|^https\?://||;s|/.*$||')
+    if [[ -z "$domain" || ! "$domain" == *.*.* ]]; then
+        print_fail "Invalid domain. Must be a subdomain (e.g. t.example.com, not example.com)"
+        exit 1
+    fi
+    print_ok "Domain: ${domain}"
+    echo ""
+
+    # 4. Get tag
+    local tag
+    tag=$(prompt_input "Enter a unique tag for this tunnel (e.g. slip1, dnstt2, my-tunnel)")
+    tag=$(echo "$tag" | sed 's|[[:space:]]||g')
+    if [[ -z "$tag" ]]; then
+        print_fail "Tag cannot be empty."
+        exit 1
+    fi
+    # Check if tag already exists
+    if dnsgb_tag_exists "$tag"; then
+        print_fail "Tunnel with tag '${tag}' already exists. Choose a different tag."
+        exit 1
+    fi
+    print_ok "Tag: ${tag}"
+    echo ""
+
+    # 5. MTU for DNSTT
+    local mtu_flag=""
+    if [[ "$transport" == "dnstt" ]]; then
+        local mtu_input
+        mtu_input=$(prompt_input "DNSTT MTU size (512-1400)" "$DNSTT_MTU")
+        if [[ "$mtu_input" =~ ^[0-9]+$ ]] && [[ "$mtu_input" -ge 512 ]] && [[ "$mtu_input" -le 1400 ]]; then
+            mtu_flag="--mtu $mtu_input"
+            print_ok "MTU: ${mtu_input}"
+        else
+            print_warn "Invalid MTU; using default ${DNSTT_MTU}"
+            mtu_flag="--mtu $DNSTT_MTU"
+        fi
+        echo ""
+    fi
+
+    # Confirm
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Creating tunnel:${NC}"
+    echo -e "  Transport: ${GREEN}${transport}${NC}"
+    echo -e "  Backend:   ${GREEN}${backend}${NC}"
+    echo -e "  Domain:    ${GREEN}${domain}${NC}"
+    echo -e "  Tag:       ${GREEN}${tag}${NC}"
+    echo ""
+
+    if ! prompt_yn "Create this tunnel?" "y"; then
+        print_info "Cancelled."
+        exit 0
+    fi
+
+    echo ""
+
+    # Create the tunnel
+    print_info "Creating tunnel: ${tag}..."
+    local create_output
+    local extra_flags=""
+    # Native VayDNS: add --dnstt-compat so SlipNet's built-in DNSTT client works
+    [[ "$transport" == "vaydns" ]] && extra_flags="--dnstt-compat"
+    # shellcheck disable=SC2086
+    create_output=$(dnsgb tunnel add --transport "$transport" --backend "$backend" --domain "$domain" --tag "$tag" $mtu_flag $extra_flags 2>&1) || true
+    echo "$create_output"
+
+    if dnsgb_tag_exists "$tag"; then
+        print_ok "Created: ${tag}"
+    else
+        print_fail "Tunnel creation may have failed. Check output above."
+        exit 1
+    fi
+
+    # Apply NoizDNS override if selected
+    if [[ "$use_noizdns" == true ]]; then
+        create_noizdns_service_override "$tag" || print_warn "Could not set NoizDNS binary for ${tag}"
+        systemctl stop "dnsgb-${tag}.service" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
+    # Legacy VayDNS path: swap binary via systemd drop-in.
+    # Native path (transport=vaydns): dnsgb already configured the service correctly.
+    if [[ "$use_vaydns" == true && "$transport" != "vaydns" ]]; then
+        create_vaydns_service_override "$tag" || print_warn "Could not set VayDNS binary for ${tag}"
+        systemctl stop "dnsgb-${tag}.service" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
+    # Show DNSTT pubkey if applicable
+    if [[ "$transport" == "dnstt" && -f "/etc/dnsgb/tunnels/${tag}/server.pub" ]]; then
+        local pubkey
+        pubkey=$(cat "/etc/dnsgb/tunnels/${tag}/server.pub" 2>/dev/null || true)
+        if [[ -n "$pubkey" ]]; then
+            echo ""
+            echo -e "  ${BOLD}${YELLOW}DNSTT Public Key (save this!):${NC}"
+            echo -e "  ${GREEN}${pubkey}${NC}"
+        fi
+    fi
+
+    echo ""
+
+    # Start the tunnel
+    print_info "Starting tunnel: ${tag}..."
+    if dnsgb tunnel start --tag "$tag" 2>/dev/null; then
+        print_ok "Started: ${tag}"
+    else
+        print_warn "Could not start tunnel. Check: dnsgb tunnel logs --tag ${tag}"
+    fi
+
+    # Restart router to pick up new config
+    print_info "Restarting DNS Router..."
+    dnsgb router stop 2>/dev/null || true
+    sleep 1
+    if dnsgb router start 2>/dev/null; then
+        print_ok "DNS Router restarted"
+    else
+        print_warn "DNS Router restart may have issues. Check: dnsgb router logs"
+    fi
+
+    echo ""
+
+    # Show share URLs
+    local subdomain
+    subdomain=$(echo "$domain" | sed 's/\..*//')
+    local base_domain
+    base_domain=$(echo "$domain" | sed 's/^[^.]*\.//')
+
+    echo -e "  ${BOLD}Share URL — dnst:// (for dnstc CLI)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    local share_url
+    share_url=$(dnsgb tunnel share -t "$tag" 2>/dev/null || true)
+    if [[ -n "$share_url" ]]; then
+        echo -e "  ${share_url}"
+    else
+        print_info "Share URL not available (generate later with: dnsgb tunnel share -t ${tag})"
+    fi
+    echo ""
+
+    # Generate slipnet:// URL for non-SSH tunnels
+    if [[ "$backend" == "socks" ]]; then
+        # Detect existing SOCKS auth via dnsgb
+        detect_socks_auth || true
+        local s_user="$SOCKS_USER" s_pass="$SOCKS_PASS"
+
+        local pubkey_for_url=""
+        if [[ "$transport" != "slipstream" && -f "/etc/dnsgb/tunnels/${tag}/server.pub" ]]; then
+            pubkey_for_url=$(cat "/etc/dnsgb/tunnels/${tag}/server.pub" 2>/dev/null || true)
+        fi
+
+        local slipnet_type
+        case "$transport" in
+            slipstream) slipnet_type="ss" ;;
+            dnstt)      slipnet_type="dnstt" ;;
+            vaydns)     slipnet_type="dnstt" ;;  # VayDNS in dnstt-compat mode
+        esac
+        # NoizDNS tunnels use dnstt transport but need sayedns type for SlipNet
+        [[ "$use_noizdns" == true || "$tag" == noiz* ]] && slipnet_type="sayedns"
+        # VayDNS tunnels use dnstt type (server runs in -dnstt-compat mode)
+        [[ "$use_vaydns" == true || "$tag" == vay* ]] && slipnet_type="dnstt"
+
+        DOMAIN="$base_domain"
+        local slipnet_url
+        slipnet_url=$(generate_slipnet_url "$slipnet_type" "$subdomain" "$pubkey_for_url" "" "" "$s_user" "$s_pass")
+        echo -e "  ${BOLD}Share URL — slipnet:// (for SlipNet app)${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${slipnet_url}"
+        echo ""
+    else
+        echo -e "  ${DIM}slipnet:// URL for SSH tunnels requires credentials.${NC}"
+        echo -e "  ${DIM}Use --status after creating an SSH user to see all share URLs.${NC}"
+        echo ""
+    fi
+    echo -e "  ${BOLD}Required DNS Record${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Make sure this NS record exists in Cloudflare for ${GREEN}${base_domain}${NC}:"
+    echo ""
+    echo -e "  Type: ${GREEN}NS${NC}  |  Name: ${GREEN}${subdomain}${NC}  |  Target: ${GREEN}ns.${base_domain}${NC}"
+    echo ""
+
+    print_info "All tunnels:"
+    echo ""
+    dnsgb tunnel list 2>/dev/null || true
+    echo ""
+    print_ok "Tunnel '${tag}' added."
+    echo ""
+}
+
+# ─── --uninstall ────────────────────────────────────────────────────────────────
+
+do_update() {
+    print_header "Update dnsgb-setup"
+
+    local REPO_URL="https://raw.githubusercontent.com/SamNet-dev/dnstm-setup/master/dnstm-setup.sh"
+    local current_version="$VERSION"
+
+    # Find the script path early so we can bail if it's not writable
+    local script_path
+    script_path=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+    if [[ ! -f "$script_path" ]]; then
+        print_fail "Cannot determine script location. Run update manually:"
+        print_info "curl -sO ${REPO_URL} && chmod +x dnsgb-setup.sh"
+        echo ""
+        read -rp "  Press Enter to return to menu..." _
+        return 1
+    fi
+
+    # Download to temp file
+    print_info "Checking for updates..."
+    local tmp_file="${script_path}.tmp"
+    if ! curl -fsSL --max-time 15 -o "$tmp_file" "$REPO_URL" 2>/dev/null; then
+        print_fail "Could not reach GitHub. Check your internet connection."
+        rm -f "$tmp_file" 2>/dev/null || true
+        echo ""
+        read -rp "  Press Enter to return to menu..." _
+        return 1
+    fi
+
+    # Validate: must be a bash script
+    if ! head -1 "$tmp_file" 2>/dev/null | grep -q "bash"; then
+        print_fail "Downloaded file is not a valid script"
+        rm -f "$tmp_file"
+        echo ""
+        read -rp "  Press Enter to return to menu..." _
+        return 1
+    fi
+
+    # Extract remote version
+    local remote_version
+    remote_version=$(grep -m1 '^VERSION=' "$tmp_file" | sed 's/VERSION="//;s/"//')
+
+    if [[ -z "$remote_version" ]]; then
+        print_warn "Could not detect remote version"
+        rm -f "$tmp_file"
+        echo ""
+        read -rp "  Press Enter to return to menu..." _
+        return 1
+    fi
+
+    echo -e "  Current version:  ${YELLOW}v${current_version}${NC}"
+    echo -e "  Latest version:   ${GREEN}v${remote_version}${NC}"
+    echo ""
+
+    if [[ "$current_version" == "$remote_version" ]]; then
+        print_ok "You are already on the latest version."
+        rm -f "$tmp_file"
+        echo ""
+        read -rp "  Press Enter to return to menu..." _
+        return 0
+    fi
+
+    if ! prompt_yn "Update to v${remote_version}?" "y"; then
+        print_info "Update cancelled."
+        rm -f "$tmp_file"
+        echo ""
+        read -rp "  Press Enter to return to menu..." _
+        return 0
+    fi
+
+    # Fix CRLF line endings if any
+    sed -i 's/\r$//' "$tmp_file" 2>/dev/null || true
+
+    # Replace script
+    chmod +x "$tmp_file"
+    mv -f "$tmp_file" "$script_path"
+
+    # Also update /usr/local/bin if installed there
+    if [[ -f /usr/local/bin/dnsgb-setup ]] && [[ "$script_path" != "/usr/local/bin/dnsgb-setup" ]]; then
+        cp -f "$script_path" /usr/local/bin/dnsgb-setup
+        chmod +x /usr/local/bin/dnsgb-setup
+    fi
+
+    echo ""
+    print_ok "Updated to v${remote_version}!"
+    print_info "Restarting with new version..."
+    echo ""
+    sleep 1
+
+    # Signal the parent menu loop to re-exec (write a marker file)
+    local update_marker="/tmp/.dnsgb-update-reexec"
+    echo "$script_path" > "$update_marker"
+    exit 0
+}
+
+do_uninstall() {
+    banner
+
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "  ${CROSS} Not running as root. Please run with: sudo bash $0 --uninstall"
+        exit 1
+    fi
+
+    print_header "Uninstall DNS Tunnel Setup"
+
+    echo -e "  ${YELLOW}This will remove all DNS tunnel components from this server.${NC}"
+    echo ""
+    echo "  Components to remove:"
+    echo "    - All dnsgb tunnels and router"
+    echo "    - dnsgb binary and configuration"
+    echo "    - sshtun-user binary (if installed)"
+    echo "    - microsocks service"
+    echo ""
+
+    if ! prompt_yn "Are you sure you want to uninstall everything?" "n"; then
+        echo ""
+        print_info "Uninstall cancelled."
+        exit 0
+    fi
+
+    echo ""
+
+    # Stop and remove tunnels
+    if command -v dnsgb &>/dev/null; then
+        print_info "Stopping tunnels..."
+        local tags
+        tags=$(dnsgb_get_tags)
+        for tag in $tags; do
+            dnsgb tunnel stop --tag "$tag" 2>/dev/null && print_ok "Stopped tunnel: $tag" || true
+        done
+
+        print_info "Stopping router..."
+        dnsgb router stop 2>/dev/null && print_ok "Router stopped" || true
+
+        print_info "Removing tunnels..."
+        for tag in $tags; do
+            dnsgb tunnel remove --tag "$tag" 2>/dev/null && print_ok "Removed tunnel: $tag" || true
+        done
+
+        print_info "Uninstalling dnsgb..."
+        dnsgb uninstall 2>/dev/null && print_ok "dnsgb uninstalled" || print_warn "dnsgb uninstall returned an error (may already be removed)"
+    else
+        print_info "dnsgb not found, skipping tunnel cleanup"
+    fi
+
+    # Remove binaries
+    if [[ -f /usr/local/bin/dnsgb ]]; then
+        rm -f /usr/local/bin/dnsgb
+        print_ok "Removed /usr/local/bin/dnsgb"
+    fi
+
+    if [[ -f /usr/local/bin/sshtun-user ]]; then
+        rm -f /usr/local/bin/sshtun-user
+        print_ok "Removed /usr/local/bin/sshtun-user"
+    fi
+
+    if [[ -f /usr/local/bin/noizdns-server ]]; then
+        rm -f /usr/local/bin/noizdns-server
+        print_ok "Removed /usr/local/bin/noizdns-server"
+    fi
+
+    if [[ -f /usr/local/bin/vaydns-server ]]; then
+        rm -f /usr/local/bin/vaydns-server
+        print_ok "Removed /usr/local/bin/vaydns-server"
+    fi
+
+    if [[ -f /usr/local/bin/dnsgb-setup ]]; then
+        rm -f /usr/local/bin/dnsgb-setup
+        print_ok "Removed /usr/local/bin/dnsgb-setup"
+    fi
+
+    # Stop microsocks
+    if systemctl is-active --quiet microsocks 2>/dev/null; then
+        systemctl stop microsocks 2>/dev/null || true
+        systemctl disable microsocks 2>/dev/null || true
+        print_ok "Stopped and disabled microsocks"
+    fi
+
+    # Remove config directory (includes /etc/dnsgb/xray/)
+    if [[ -d /etc/dnsgb ]]; then
+        rm -rf /etc/dnsgb
+        print_ok "Removed /etc/dnsgb (including Xray tunnel configs)"
+    fi
+
+    # Remove systemd overrides (hardening + xray upstream drop-ins)
+    find /etc/systemd/system -maxdepth 2 -type f -name '20-hardening.conf' -path '*/dnsgb-*.service.d/*' -delete 2>/dev/null || true
+    find /etc/systemd/system -maxdepth 2 -type f -name '10-xray-upstream.conf' -path '*/dnsgb-*.service.d/*' -delete 2>/dev/null || true
+    find /etc/systemd/system -maxdepth 2 -type f -name '10-noizdns-binary.conf' -path '*/dnsgb-*.service.d/*' -delete 2>/dev/null || true
+    find /etc/systemd/system -maxdepth 2 -type f -name '10-vaydns-binary.conf' -path '*/dnsgb-*.service.d/*' -delete 2>/dev/null || true
+    rm -f /etc/systemd/system/microsocks.service.d/20-hardening.conf 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    print_ok "Removed local service hardening drop-ins"
+
+    # Remove resolver override used to free port 53
+    rm -f /etc/systemd/resolved.conf.d/10-dnsgb-no-stub.conf 2>/dev/null || true
+
+    # Remove rsyslog filter and journald limits
+    rm -f /etc/rsyslog.d/10-dnsgb-suppress.conf 2>/dev/null || true
+    systemctl restart rsyslog 2>/dev/null || true
+    rm -f /etc/systemd/journald.conf.d/10-dnsgb-limit.conf 2>/dev/null || true
+    rmdir /etc/systemd/journald.conf.d 2>/dev/null || true
+    print_ok "Removed rsyslog filter and journald limit configs"
+
+    # Unlock resolv.conf so the system can manage DNS again
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    print_ok "Removed immutable flag from /etc/resolv.conf"
+
+    systemctl unmask systemd-resolved.socket systemd-resolved.service 2>/dev/null || true
+    systemctl enable systemd-resolved.service 2>/dev/null || true
+    systemctl restart systemd-resolved.service 2>/dev/null || true
+    sleep 1
+    if [[ -e /run/systemd/resolve/stub-resolv.conf ]]; then
+        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf || true
+    fi
+    # Ensure DNS works after uninstall — if resolv.conf is broken, write fallback
+    if ! getent hosts google.com >/dev/null 2>&1 && \
+       ! curl -sf --max-time 3 https://api.ipify.org >/dev/null 2>&1; then
+        print_warn "DNS not working after restore — writing fallback nameservers"
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        cat > /etc/resolv.conf <<'DNSEOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+DNSEOF
+    fi
+    print_ok "Restored systemd-resolved defaults (best effort)"
+
+    echo ""
+    print_ok "${GREEN}Uninstall complete.${NC}"
+    echo ""
+    print_warn "Note: DNS records in Cloudflare were NOT removed. Remove them manually if needed."
+    print_warn "Note: Xray/3x-ui panel was NOT removed (only DNSTT tunnel configs were cleaned up)."
+    echo ""
+}
+
+# ─── Emergency Disk Cleanup ────────────────────────────────────────────────────
+
+do_cleanup() {
+    banner
+
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "  ${CROSS} Not running as root. Please run with: sudo bash $0 --cleanup"
+        exit 1
+    fi
+
+    print_header "Disk Space Cleanup & Log Management"
+
+    echo ""
+    print_info "This operation will:"
+    echo "  1. Truncate /var/log/syslog and /var/log/syslog.1 (emergency disk recovery)"
+    echo "  2. Vacuum journald to 100M (compact journal)"
+    echo "  3. Install rsyslog filter (suppress tunnel log flood to syslog)"
+    echo "  4. Configure journald size limits (200M system / 100M runtime)"
+    echo "  5. Apply log rate limiting and memory limits to tunnel services"
+    echo ""
+    echo -e "  ${YELLOW}Warning: This will restart all tunnel services. Active connections${NC}"
+    echo -e "  ${YELLOW}will be briefly interrupted (each service restarted one at a time).${NC}"
+    echo ""
+
+    if ! prompt_yn "Continue with cleanup?" "y"; then
+        echo ""
+        print_info "Cleanup cancelled."
+        return 0
+    fi
+
+    echo ""
+
+    local before_df
+    before_df=$(df -h / | tail -1)
+    echo -e "  ${DIM}Disk before cleanup:${NC}"
+    echo "  $before_df"
+    echo ""
+
+    # Step 1: Truncate syslog files
+    if [[ -f /var/log/syslog ]]; then
+        print_info "Truncating /var/log/syslog..."
+        > /var/log/syslog
+        print_ok "Truncated /var/log/syslog"
+    fi
+
+    if [[ -f /var/log/syslog.1 ]]; then
+        print_info "Truncating /var/log/syslog.1..."
+        > /var/log/syslog.1
+        print_ok "Truncated /var/log/syslog.1"
+    fi
+
+    # Step 2: Vacuum journald
+    print_info "Vacuuming journald to 100M..."
+    journalctl --vacuum-size=100M 2>/dev/null || true
+    print_ok "Vacuumed journald"
+
+    # Step 3 & 4: Install rsyslog filter and journald limits
+    echo ""
+    install_rsyslog_filter
+    configure_journald_limit
+
+    # Step 5: Apply rate limiting and memory limits to all dnsgb services
+    if command -v dnsgb &>/dev/null; then
+        echo ""
+        print_info "Applying log rate limiting and memory limits to tunnel services..."
+
+        local dnsgb_units
+        dnsgb_units=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '$1 ~ /^dnsgb-.*\.service$/ {print $1}' || true)
+
+        if [[ -n "$dnsgb_units" ]]; then
+            local unit
+            for unit in $dnsgb_units; do
+                if [[ "$unit" == "dnsgb-dnsrouter.service" ]]; then
+                    write_service_override "$unit" "dnsgb" "dnsgb" "yes"
+                else
+                    write_service_override "$unit" "dnsgb" "dnsgb" "no"
+                fi
+            done
+
+            if unit_exists "microsocks.service"; then
+                write_service_override "microsocks.service" "nobody" "nogroup" "no"
+            fi
+
+            systemctl daemon-reload 2>/dev/null || true
+
+            for unit in $dnsgb_units microsocks.service; do
+                if ! unit_exists "$unit"; then
+                    continue
+                fi
+                if systemctl is-enabled "$unit" &>/dev/null || systemctl is-active --quiet "$unit" 2>/dev/null; then
+                    systemctl restart "$unit" 2>/dev/null && print_ok "Restarted: $unit" || print_warn "Could not restart: $unit"
+                    sleep 1
+                fi
+            done
+
+            print_ok "Applied log rate limiting and memory limits"
+        else
+            print_warn "No dnsgb services found to update"
+        fi
+    fi
+
+    # Report disk space after cleanup
+    echo ""
+    local after_df
+    after_df=$(df -h / | tail -1)
+    echo -e "  ${DIM}Disk after cleanup:${NC}"
+    echo "  $after_df"
+    echo ""
+    print_ok "${GREEN}Cleanup complete.${NC}"
+    echo ""
+}
+
+# ─── Architecture Detection ────────────────────────────────────────────────────
+
+detect_architecture() {
+    # Detect system architecture using uname and map it to binary suffix
+    # Supports: 386, amd64, arm64, armv7
+    local machine_arch
+    machine_arch=$(uname -m)
+
+    case "$machine_arch" in
+        x86_64|amd64)
+            echo "amd64"
+            ;;
+        i386|i686)
+            echo "386"
+            ;;
+        aarch64|arm64)
+            echo "arm64"
+            ;;
+        armv7l|armv7)
+            echo "armv7"
+            ;;
+        *)
+            print_warn "Unsupported architecture: $machine_arch (defaulting to amd64)" >&2
+            echo "amd64"
+            ;;
+    esac
+}
+
+# ─── User Management TUI ──────────────────────────────────────────────────────
+
+do_manage_users() {
+    banner
+    print_header "SSH Tunnel User Management"
+
+    # Check root
+    if [[ $EUID -ne 0 ]]; then
+        print_fail "Not running as root. Please run with: sudo bash $0 --users"
+        exit 1
+    fi
+
+    # Install sshtun-user if not present
+    if ! command -v sshtun-user &>/dev/null; then
+        print_info "sshtun-user not found. Installing..."
+        local arch
+        arch=$(detect_architecture)
+        if curl -fsSL -o /usr/local/bin/sshtun-user "https://github.com/net2share/sshtun-user/releases/latest/download/sshtun-user-linux-${arch}"; then
+            chmod +x /usr/local/bin/sshtun-user
+            print_ok "Downloaded sshtun-user for ${arch}"
+        else
+            print_fail "Failed to download sshtun-user for ${arch} architecture. Check your internet connection."
+            exit 1
+        fi
+
+        # Run initial configure
+        print_info "Applying SSH security configuration..."
+        mkdir -p /run/sshd 2>/dev/null || true
+        # Back up sshd_config before modification
+        if [[ -f /etc/ssh/sshd_config ]]; then
+            cp -f /etc/ssh/sshd_config /etc/ssh/sshd_config.dnsgb-backup 2>/dev/null || true
+        fi
+        if timeout --kill-after=3 30 sshtun-user configure </dev/null 2>&1; then
+            print_ok "SSH configuration applied"
+        else
+            print_warn "SSH configuration may not have applied fully — user management may have issues"
+        fi
+        # Validate sshd_config — rollback if broken
+        if command -v sshd &>/dev/null && ! sshd -t 2>/dev/null; then
+            print_warn "sshd_config validation failed — rolling back"
+            if [[ -f /etc/ssh/sshd_config.dnsgb-backup ]]; then
+                cp -f /etc/ssh/sshd_config.dnsgb-backup /etc/ssh/sshd_config
+                print_ok "Restored sshd_config from backup"
+            fi
+        fi
+        # Fix ETM-only MACs for client compatibility (Bitvise, older clients)
+        fix_ssh_macs
+        echo ""
+    fi
+
+    while true; do
+        echo ""
+        echo -e "  ${BOLD}SSH Tunnel User Management${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo ""
+        echo -e "  ${BOLD}1${NC}  List users"
+        echo -e "  ${BOLD}2${NC}  Add user"
+        echo -e "  ${BOLD}3${NC}  Change password"
+        echo -e "  ${BOLD}4${NC}  Delete user"
+        echo -e "  ${BOLD}5${NC}  Regenerate SSH share URLs"
+        echo -e "  ${BOLD}0${NC}  Exit"
+        echo ""
+
+        local choice=""
+        read -rp "  Select [0-5]: " choice || break
+
+        case "$choice" in
+            1)
+                echo ""
+                print_info "SSH tunnel users:"
+                echo ""
+                if ! timeout --kill-after=3 10 sshtun-user list </dev/null 2>/dev/null; then
+                    # Fallback: sshtun-user list requires TTY on some versions
+                    local tun_users
+                    tun_users=$(awk -F: '/SSH tunnel only/{print $1}' /etc/passwd 2>/dev/null)
+                    if [[ -n "$tun_users" ]]; then
+                        echo "$tun_users" | while IFS= read -r u; do
+                            echo -e "  ${GREEN}${u}${NC}"
+                        done
+                    else
+                        print_warn "No tunnel users found"
+                    fi
+                fi
+                ;;
+            2)
+                echo ""
+                local new_user new_pass
+                new_user=$(prompt_input "Enter username for new tunnel user")
+                new_user=$(echo "$new_user" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [[ -z "$new_user" ]]; then
+                    print_fail "Username cannot be empty"
+                    continue
+                fi
+                if [[ "$new_user" == *"|"* ]]; then
+                    print_fail "Username cannot contain the | character"
+                    continue
+                fi
+                new_pass=$(prompt_input "Enter password (leave blank to auto-generate)")
+                new_pass=$(echo "$new_pass" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [[ "$new_pass" == *"|"* ]]; then
+                    print_fail "Password cannot contain the | character"
+                    continue
+                fi
+                echo ""
+                local user_created=false
+                if [[ -n "$new_pass" ]]; then
+                    if timeout --kill-after=3 30 sshtun-user create "$new_user" --insecure-password "$new_pass" </dev/null 2>&1; then
+                        print_ok "User '${new_user}' created"
+                        user_created=true
+                    else
+                        print_fail "Failed to create user '${new_user}' (command timed out or failed)"
+                    fi
+                else
+                    if timeout --kill-after=3 30 sshtun-user create "$new_user" </dev/null 2>&1; then
+                        print_ok "User '${new_user}' created (random password assigned)"
+                        user_created=true
+                    else
+                        print_fail "Failed to create user '${new_user}' (command timed out or failed)"
+                    fi
+                fi
+
+                # Save credentials for status page URL generation
+                if [[ "$user_created" == true ]]; then
+                    local final_pass="$new_pass"
+                    if [[ -z "$final_pass" ]]; then
+                        final_pass=$(timeout --kill-after=3 10 sshtun-user show "$new_user" </dev/null 2>/dev/null | grep -i pass | awk '{print $NF}' || true)
+                    fi
+                    if [[ -n "$final_pass" ]]; then
+                        # Store credentials (root-only) for status page
+                        mkdir -p /etc/dnsgb 2>/dev/null || true
+                        echo "${new_user}:${final_pass}" > /etc/dnsgb/ssh-credentials
+                        chmod 600 /etc/dnsgb/ssh-credentials
+                        echo ""
+                        print_info "SlipNet SSH config URLs for user '${new_user}':"
+                        echo ""
+                        # Find all SSH tunnels and generate URLs
+                        local s_user="" s_pass=""
+                        if detect_socks_auth; then
+                            s_user="$SOCKS_USER"
+                            s_pass="$SOCKS_PASS"
+                        fi
+                        local tunnel_domains
+                        tunnel_domains=$(dnsgb tunnel list 2>/dev/null || true)
+                        # Get all unique base domains from tunnels
+                        local domains
+                        domains=$(echo "$tunnel_domains" | grep -o 'domain=[^ ]*' | sed 's/domain=//;s/^[a-z]*\.//' | sort -u || true)
+                        for dom in $domains; do
+                            DOMAIN="$dom"
+                            local pubkey=""
+                            # Find DNSTT pubkey for this domain
+                            local dnstt_tag_name
+                            dnstt_tag_name=$(echo "$tunnel_domains" | grep "domain=d\.${dom}" | grep -oE 'tag=[^ ]+' | head -1 | sed 's/tag=//' || true)
+                            # Fallback: try matching dnstt tag from the domain line
+                            [[ -z "$dnstt_tag_name" ]] && \
+                                dnstt_tag_name=$(echo "$tunnel_domains" | grep "d\.${dom}" | grep -oE '\bdnstt[a-z0-9_-]*' | head -1 || true)
+                            if [[ -n "$dnstt_tag_name" && -f "/etc/dnsgb/tunnels/${dnstt_tag_name}/server.pub" ]]; then
+                                pubkey=$(cat "/etc/dnsgb/tunnels/${dnstt_tag_name}/server.pub" 2>/dev/null || true)
+                            fi
+                            # Slipstream + SSH — SlipNet needs pubkey even for slipstream
+                            local slip_ssh_pk=""
+                            slip_ssh_pk=$(cat /etc/dnsgb/tunnels/*/server.pub 2>/dev/null | head -1 || true)
+                            local url
+                            url=$(generate_slipnet_url "slipstream_ssh" "s" "$slip_ssh_pk" "$new_user" "$final_pass" "$s_user" "$s_pass")
+                            echo -e "  ${GREEN}s.${dom}:${NC}  ${url}"
+                            # DNSTT + SSH
+                            if [[ -n "$pubkey" ]]; then
+                                url=$(generate_slipnet_url "dnstt_ssh" "ds" "$pubkey" "$new_user" "$final_pass" "$s_user" "$s_pass")
+                                echo -e "  ${GREEN}ds.${dom}:${NC} ${url}"
+                            fi
+                            # NoizDNS + SSH
+                            local noiz_ssh_pk=""
+                            local noiz_ssh_tags
+                            noiz_ssh_tags=$(echo "$tunnel_domains" | grep -o 'tag=noiz-ssh[^ ]*' | sed 's/tag=//' || true)
+                            for ntag in $noiz_ssh_tags; do
+                                if [[ -f "/etc/dnsgb/tunnels/${ntag}/server.pub" ]]; then
+                                    noiz_ssh_pk=$(cat "/etc/dnsgb/tunnels/${ntag}/server.pub" 2>/dev/null || true)
+                                    if [[ -n "$noiz_ssh_pk" ]]; then
+                                        url=$(generate_slipnet_url "sayedns_ssh" "z" "$noiz_ssh_pk" "$new_user" "$final_pass" "$s_user" "$s_pass")
+                                        echo -e "  ${GREEN}z.${dom}:${NC}  ${url}"
+                                    fi
+                                    break
+                                fi
+                            done
+                            # VayDNS + SSH
+                            local vay_ssh_pk=""
+                            local vay_ssh_tags
+                            vay_ssh_tags=$(echo "$tunnel_domains" | grep -o 'tag=vay-ssh[^ ]*' | sed 's/tag=//' || true)
+                            for vtag in $vay_ssh_tags; do
+                                if [[ -f "/etc/dnsgb/tunnels/${vtag}/server.pub" ]]; then
+                                    vay_ssh_pk=$(cat "/etc/dnsgb/tunnels/${vtag}/server.pub" 2>/dev/null || true)
+                                    if [[ -n "$vay_ssh_pk" ]]; then
+                                        url=$(generate_slipnet_url "dnstt_ssh" "vz" "$vay_ssh_pk" "$new_user" "$final_pass" "$s_user" "$s_pass")
+                                        echo -e "  ${GREEN}vz.${dom}:${NC} ${url}"
+                                    fi
+                                    break
+                                fi
+                            done
+                        done
+                    fi
+                fi
+                ;;
+            3)
+                echo ""
+                local upd_user upd_pass
+                upd_user=$(prompt_input "Enter username to update")
+                upd_user=$(echo "$upd_user" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [[ -z "$upd_user" ]]; then
+                    print_fail "Username cannot be empty"
+                    continue
+                fi
+                if [[ "$upd_user" == *"|"* ]]; then
+                    print_fail "Username cannot contain the | character"
+                    continue
+                fi
+                upd_pass=$(prompt_input "Enter new password")
+                upd_pass=$(echo "$upd_pass" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [[ -z "$upd_pass" ]]; then
+                    print_fail "Password cannot be empty"
+                    continue
+                fi
+                if [[ "$upd_pass" == *"|"* ]]; then
+                    print_fail "Password cannot contain the | character"
+                    continue
+                fi
+                echo ""
+                if timeout --kill-after=3 30 sshtun-user update "$upd_user" --insecure-password "$upd_pass" </dev/null 2>&1; then
+                    print_ok "Password updated for '${upd_user}'"
+                    # Update stored credentials
+                    mkdir -p /etc/dnsgb 2>/dev/null || true
+                    echo "${upd_user}:${upd_pass}" > /etc/dnsgb/ssh-credentials
+                    chmod 600 /etc/dnsgb/ssh-credentials
+                else
+                    print_fail "Failed to update user '${upd_user}'"
+                fi
+                ;;
+            4)
+                echo ""
+                local del_user
+                del_user=$(prompt_input "Enter username to delete")
+                del_user=$(echo "$del_user" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [[ -z "$del_user" ]]; then
+                    print_fail "Username cannot be empty"
+                    continue
+                fi
+                if [[ "$del_user" == *"|"* ]]; then
+                    print_fail "Username cannot contain the | character"
+                    continue
+                fi
+                if prompt_yn "Are you sure you want to delete '${del_user}'?" "n"; then
+                    if timeout --kill-after=3 30 sshtun-user delete "$del_user" </dev/null 2>&1; then
+                        print_ok "User '${del_user}' deleted"
+                        # Remove stored credentials if they match
+                        if [[ -f /etc/dnsgb/ssh-credentials ]]; then
+                            local stored_user
+                            stored_user=$(cut -d: -f1 /etc/dnsgb/ssh-credentials 2>/dev/null || true)
+                            if [[ "$stored_user" == "$del_user" ]]; then
+                                rm -f /etc/dnsgb/ssh-credentials
+                            fi
+                        fi
+                    else
+                        print_fail "Failed to delete user '${del_user}'"
+                    fi
+                else
+                    print_info "Cancelled"
+                fi
+                ;;
+            5)
+                echo ""
+                local regen_user regen_pass
+                regen_user=$(prompt_input "Enter SSH tunnel username")
+                regen_user=$(echo "$regen_user" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [[ -z "$regen_user" ]]; then
+                    print_fail "Username cannot be empty"
+                    continue
+                fi
+                regen_pass=$(prompt_input "Enter SSH tunnel password")
+                regen_pass=$(echo "$regen_pass" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [[ -z "$regen_pass" ]]; then
+                    print_fail "Password cannot be empty"
+                    continue
+                fi
+                echo ""
+                print_info "SlipNet SSH share URLs for '${regen_user}':"
+                echo ""
+                local s_user="" s_pass=""
+                if detect_socks_auth; then
+                    s_user="$SOCKS_USER"
+                    s_pass="$SOCKS_PASS"
+                fi
+                local tunnel_domains
+                tunnel_domains=$(dnsgb tunnel list 2>/dev/null || true)
+                local domains
+                domains=$(echo "$tunnel_domains" | awk '{for(i=1;i<=NF;i++) if($i ~ /\.[a-z]/) print $i}' | sed 's/^[a-z]*\.//' | sort -u || true)
+                if [[ -z "$domains" ]]; then
+                    domains=$(echo "$tunnel_domains" | grep -o 'domain=[^ ]*' | sed 's/domain=//;s/^[a-z]*\.//' | sort -u || true)
+                fi
+                for dom in $domains; do
+                    DOMAIN="$dom"
+                    local _any_pk=""
+                    _any_pk=$(cat /etc/dnsgb/tunnels/*/server.pub 2>/dev/null | head -1 || true)
+                    # Slipstream + SSH
+                    local url
+                    url=$(generate_slipnet_url "slipstream_ssh" "s" "$_any_pk" "$regen_user" "$regen_pass" "$s_user" "$s_pass")
+                    echo -e "  ${GREEN}slip-ssh (s.${dom}):${NC}"
+                    echo "  ${url}"
+                    echo ""
+                    # DNSTT + SSH
+                    local _dnstt_pk=""
+                    _dnstt_pk=$(cat /etc/dnsgb/tunnels/dnstt-ssh/server.pub 2>/dev/null || true)
+                    [[ -z "$_dnstt_pk" ]] && _dnstt_pk=$(cat /etc/dnsgb/tunnels/dnstt1/server.pub 2>/dev/null || true)
+                    if [[ -n "$_dnstt_pk" ]]; then
+                        url=$(generate_slipnet_url "dnstt_ssh" "ds" "$_dnstt_pk" "$regen_user" "$regen_pass" "$s_user" "$s_pass")
+                        echo -e "  ${GREEN}dnstt-ssh (ds.${dom}):${NC}"
+                        echo "  ${url}"
+                        echo ""
+                    fi
+                    # NoizDNS + SSH
+                    local _noiz_pk=""
+                    _noiz_pk=$(cat /etc/dnsgb/tunnels/noiz-ssh/server.pub 2>/dev/null || true)
+                    if [[ -n "$_noiz_pk" ]]; then
+                        url=$(generate_slipnet_url "sayedns_ssh" "z" "$_noiz_pk" "$regen_user" "$regen_pass" "$s_user" "$s_pass")
+                        echo -e "  ${GREEN}noiz-ssh (z.${dom}):${NC}"
+                        echo "  ${url}"
+                        echo ""
+                    fi
+                    # VayDNS + SSH
+                    local _vay_pk=""
+                    _vay_pk=$(cat /etc/dnsgb/tunnels/vay-ssh/server.pub 2>/dev/null || true)
+                    if [[ -n "$_vay_pk" ]]; then
+                        url=$(generate_slipnet_url "dnstt_ssh" "vz" "$_vay_pk" "$regen_user" "$regen_pass" "$s_user" "$s_pass")
+                        echo -e "  ${GREEN}vay-ssh (vz.${dom}):${NC}"
+                        echo "  ${url}"
+                        echo ""
+                    fi
+                done
+                ;;
+            0)
+                echo ""
+                print_ok "Done"
+                exit 0
+                ;;
+            *)
+                print_warn "Invalid choice"
+                ;;
+        esac
+    done
+}
+
+# ─── Xray Backend Integration ─────────────────────────────────────────────────
+
+# Install 3x-ui panel with custom credentials and port.
+# Usage: install_3xui <username> <password> <panel_port>
+install_3xui() {
+    local admin_user="$1"
+    local admin_pass="$2"
+    local panel_port="$3"
+
+    # Ensure sqlite3 is available (needed to set credentials after install)
+    if ! command -v sqlite3 &>/dev/null; then
+        print_info "Installing sqlite3 (needed for panel credential setup)..."
+        apt-get install -y -qq sqlite3 2>/dev/null || true
+    fi
+
+    print_info "Downloading and installing 3x-ui..."
+    echo ""
+
+    # Download the install script
+    local install_script
+    install_script=$(mktemp)
+    if ! curl -fsSL -o "$install_script" "https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh" 2>/dev/null; then
+        rm -f "$install_script"
+        print_fail "Could not download 3x-ui install script."
+        return 1
+    fi
+
+    # Run non-interactively with 'y' piped for prompts
+    local install_log
+    install_log=$(mktemp)
+    if ! echo "y" | bash "$install_script" > "$install_log" 2>&1; then
+        tail -5 "$install_log"
+        rm -f "$install_log" "$install_script"
+        print_fail "3x-ui installation failed."
+        return 1
+    fi
+    tail -5 "$install_log"
+    rm -f "$install_log" "$install_script"
+
+    # Wait for service to start
+    sleep 3
+
+    if ! systemctl is-active --quiet x-ui 2>/dev/null; then
+        print_fail "3x-ui service did not start."
+        return 1
+    fi
+    print_ok "3x-ui installed and running"
+
+    # Set custom credentials and port
+    # IMPORTANT: if setting fails, we must output the ACTUAL values so the caller
+    # uses correct credentials for the API (avoids mismatch)
+    INSTALL_3XUI_ACTUAL_USER="$admin_user"
+    INSTALL_3XUI_ACTUAL_PASS="$admin_pass"
+    INSTALL_3XUI_ACTUAL_PORT="$panel_port"
+
+    # --- Set credentials ---
+    # Prefer x-ui binary (handles password hashing for v2.0+)
+    local creds_set=false
+    if [[ -x /usr/local/x-ui/x-ui ]]; then
+        if /usr/local/x-ui/x-ui setting -username "$admin_user" -password "$admin_pass" &>/dev/null; then
+            print_ok "Set panel credentials: ${admin_user}"
+            creds_set=true
+        fi
+    fi
+    # Fallback to sqlite3 for older versions without the binary setting command
+    if [[ "$creds_set" != "true" ]] && command -v sqlite3 &>/dev/null && [[ -f /etc/x-ui/x-ui.db ]]; then
+        local sql_user="${admin_user//\'/\'\'}"
+        local sql_pass="${admin_pass//\'/\'\'}"
+        if echo "UPDATE users SET username='${sql_user}', password='${sql_pass}' WHERE id=1;" | sqlite3 /etc/x-ui/x-ui.db 2>/dev/null; then
+            print_ok "Set panel credentials: ${admin_user} (via database)"
+            creds_set=true
+        fi
+    fi
+    if [[ "$creds_set" != "true" ]]; then
+        print_warn "Could not set custom credentials. Using defaults: admin/admin"
+        INSTALL_3XUI_ACTUAL_USER="admin"
+        INSTALL_3XUI_ACTUAL_PASS="admin"
+    fi
+
+    # --- Set panel port ---
+    local port_set=false
+    # Try x-ui binary first
+    if [[ -x /usr/local/x-ui/x-ui ]]; then
+        if /usr/local/x-ui/x-ui setting -port "$panel_port" &>/dev/null; then
+            print_ok "Set panel port: ${panel_port}"
+            port_set=true
+        fi
+    fi
+    # Fallback to sqlite3
+    if [[ "$port_set" != "true" ]] && command -v sqlite3 &>/dev/null && [[ -f /etc/x-ui/x-ui.db ]]; then
+        local existing
+        existing=$(sqlite3 /etc/x-ui/x-ui.db "SELECT COUNT(*) FROM settings WHERE key='webPort'" 2>/dev/null || echo "0")
+        if [[ "$existing" -gt 0 ]]; then
+            sqlite3 /etc/x-ui/x-ui.db "UPDATE settings SET value='${panel_port}' WHERE key='webPort'" 2>/dev/null && port_set=true
+        else
+            sqlite3 /etc/x-ui/x-ui.db "INSERT INTO settings (key, value) VALUES ('webPort', '${panel_port}')" 2>/dev/null && port_set=true
+        fi
+        [[ "$port_set" == "true" ]] && print_ok "Set panel port: ${panel_port}"
+    fi
+    if [[ "$port_set" != "true" ]]; then
+        print_warn "Could not set panel port. Using default: 2053"
+        INSTALL_3XUI_ACTUAL_PORT="2053"
+    fi
+
+    # Restart to apply credential and port changes
+    systemctl restart x-ui 2>/dev/null || true
+    sleep 2
+
+    if systemctl is-active --quiet x-ui 2>/dev/null; then
+        print_ok "3x-ui restarted with new settings"
+    else
+        print_warn "3x-ui may need manual restart: systemctl restart x-ui"
+    fi
+}
+
+# Install raw Xray (headless, no web panel).
+# Creates a minimal Xray setup with just the binary and config.
+# Usage: install_xray_headless
+install_xray_headless() {
+    print_info "Installing Xray (headless mode, no web panel)..."
+
+    # Check if Xray binary already exists
+    if command -v xray &>/dev/null || [[ -f /usr/local/bin/xray ]]; then
+        print_ok "Xray binary already installed"
+    else
+        # Install via official script — capture output to check exit code properly
+        local install_log
+        install_log=$(mktemp)
+        if ! bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" -- install > "$install_log" 2>&1; then
+            tail -5 "$install_log"
+            rm -f "$install_log"
+            print_fail "Xray installation failed."
+            return 1
+        fi
+        tail -3 "$install_log"
+        rm -f "$install_log"
+
+        # Verify the binary was actually installed
+        if ! command -v xray &>/dev/null && [[ ! -f /usr/local/bin/xray ]]; then
+            print_fail "Xray binary not found after installation."
+            return 1
+        fi
+        print_ok "Xray binary installed"
+    fi
+
+    # Ensure the config directory exists
+    mkdir -p /usr/local/etc/xray
+
+    # Create a minimal config with just an empty inbounds array
+    # (the actual inbound will be added by create_headless_xray_inbound)
+    if [[ ! -f /usr/local/etc/xray/config.json ]]; then
+        cat > /usr/local/etc/xray/config.json <<'XRAYEOF'
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [],
+  "outbounds": [
+    {"protocol": "freedom", "tag": "direct"},
+    {"protocol": "blackhole", "tag": "block"}
+  ]
+}
+XRAYEOF
+        chmod 600 /usr/local/etc/xray/config.json
+        print_ok "Created minimal Xray config"
+    fi
+
+    # Enable and start the service
+    systemctl enable xray 2>/dev/null || true
+    systemctl start xray 2>/dev/null || true
+
+    if systemctl is-active --quiet xray 2>/dev/null; then
+        print_ok "Xray service running (headless)"
+    else
+        print_warn "Xray service may need manual start: systemctl start xray"
+    fi
+}
+
+# Create an inbound directly in Xray config.json (headless mode, no panel).
+# Usage: create_headless_xray_inbound
+# Requires: XRAY_PROTOCOL, XRAY_INBOUND_PORT
+# Sets: XRAY_UUID or XRAY_PASSWORD
+create_headless_xray_inbound() {
+    local config_file="/usr/local/etc/xray/config.json"
+
+    if [[ ! -f "$config_file" ]]; then
+        print_fail "Xray config not found at ${config_file}"
+        return 1
+    fi
+
+    # Generate credentials
+    XRAY_UUID=""
+    XRAY_PASSWORD=""
+    if [[ "$XRAY_PROTOCOL" == "vless" || "$XRAY_PROTOCOL" == "vmess" ]]; then
+        XRAY_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || openssl rand -hex 16 | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)/\1-\2-\3-\4-\5/')
+    else
+        XRAY_PASSWORD=$(openssl rand -hex 16)
+    fi
+
+    # Build the new inbound JSON
+    local new_inbound
+    case "$XRAY_PROTOCOL" in
+        vless)
+            new_inbound=$(jq -nc --arg uuid "$XRAY_UUID" --argjson port "$XRAY_INBOUND_PORT" '{
+                "listen": "127.0.0.1", "port": $port, "protocol": "vless",
+                "settings": {"clients": [{"id": $uuid, "flow": ""}], "decryption": "none"},
+                "streamSettings": {"network": "tcp", "security": "none"},
+                "tag": "dnstt-vless"
+            }')
+            ;;
+        shadowsocks)
+            new_inbound=$(jq -nc --arg pass "$XRAY_PASSWORD" --argjson port "$XRAY_INBOUND_PORT" '{
+                "listen": "127.0.0.1", "port": $port, "protocol": "shadowsocks",
+                "settings": {"method": "chacha20-ietf-poly1305", "password": $pass, "network": "tcp,udp"},
+                "tag": "dnstt-shadowsocks"
+            }')
+            ;;
+        vmess)
+            new_inbound=$(jq -nc --arg uuid "$XRAY_UUID" --argjson port "$XRAY_INBOUND_PORT" '{
+                "listen": "127.0.0.1", "port": $port, "protocol": "vmess",
+                "settings": {"clients": [{"id": $uuid, "alterId": 0}]},
+                "streamSettings": {"network": "tcp", "security": "none"},
+                "tag": "dnstt-vmess"
+            }')
+            ;;
+        trojan)
+            new_inbound=$(jq -nc --arg pass "$XRAY_PASSWORD" --argjson port "$XRAY_INBOUND_PORT" '{
+                "listen": "127.0.0.1", "port": $port, "protocol": "trojan",
+                "settings": {"clients": [{"password": $pass}]},
+                "streamSettings": {"network": "tcp", "security": "none"},
+                "tag": "dnstt-trojan"
+            }')
+            ;;
+    esac
+
+    # Backup original config
+    cp "$config_file" "${config_file}.bak.$(date +%s)" 2>/dev/null || true
+
+    # Add inbound to the config using jq
+    local tmp_config
+    tmp_config=$(mktemp)
+    if jq --argjson inbound "$new_inbound" '.inbounds += [$inbound]' "$config_file" > "$tmp_config" 2>/dev/null; then
+        mv "$tmp_config" "$config_file"
+        chmod 600 "$config_file"
+        print_ok "Added inbound: ${XRAY_PROTOCOL} on 127.0.0.1:${XRAY_INBOUND_PORT}"
+    else
+        rm -f "$tmp_config"
+        print_fail "Failed to update Xray config."
+        return 1
+    fi
+
+    # Restart Xray to apply
+    systemctl restart xray 2>/dev/null || true
+    sleep 1
+    if systemctl is-active --quiet xray 2>/dev/null; then
+        print_ok "Xray restarted with new inbound"
+    else
+        print_warn "Xray may need manual restart: systemctl restart xray"
+    fi
+}
+
+# Detect if an Xray panel (3x-ui) is installed on this server.
+# Sets XRAY_PANEL_TYPE to "3xui" or "none"
+# Sets XRAY_PANEL_PORT if detected
+detect_xray_panel() {
+    XRAY_PANEL_TYPE="none"
+    XRAY_PANEL_PORT=""
+    XRAY_PANEL_RUNNING=false
+
+    # Check for 3x-ui (native install)
+    local found_3xui=false
+    if systemctl is-active --quiet x-ui 2>/dev/null; then
+        found_3xui=true
+        XRAY_PANEL_RUNNING=true
+    elif systemctl list-unit-files 2>/dev/null | grep -q 'x-ui'; then
+        found_3xui=true
+    elif [[ -d /usr/local/x-ui ]]; then
+        found_3xui=true
+    elif command -v x-ui &>/dev/null; then
+        found_3xui=true
+    fi
+
+    # Check for Docker-based 3x-ui
+    if [[ "$found_3xui" == false ]] && command -v docker &>/dev/null; then
+        if docker ps 2>/dev/null | grep -qi 'x-ui\|3x-ui'; then
+            found_3xui=true
+            XRAY_PANEL_RUNNING=true
+        fi
+    fi
+
+    if [[ "$found_3xui" == true ]]; then
+        XRAY_PANEL_TYPE="3xui"
+
+        # Warn if service exists but is not running
+        if [[ "$XRAY_PANEL_RUNNING" == false ]]; then
+            print_warn "3x-ui is installed but NOT running."
+            print_info "Start it with: systemctl start x-ui"
+            echo ""
+        fi
+
+        # Try to detect panel port
+        # Method 1: Parse x-ui config.json
+        if [[ -f /usr/local/x-ui/config.json ]]; then
+            XRAY_PANEL_PORT=$(jq -r '.port // .webPort // empty' /usr/local/x-ui/config.json 2>/dev/null || true)
+        fi
+
+        # Method 2: Check x-ui.db for webPort setting
+        if [[ -z "$XRAY_PANEL_PORT" ]] && command -v sqlite3 &>/dev/null; then
+            if [[ -f /etc/x-ui/x-ui.db ]]; then
+                XRAY_PANEL_PORT=$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webPort'" 2>/dev/null || true)
+            fi
+        fi
+        # Method 2b: Query x-ui binary directly
+        if [[ -z "$XRAY_PANEL_PORT" ]]; then
+            XRAY_PANEL_PORT=$(/usr/local/x-ui/x-ui setting -show 2>/dev/null | grep -Ei '^\s*port:' | awk -F': ' '{print $2}' | tr -d '[:space:]' || true)
+            [[ -z "$XRAY_PANEL_PORT" ]] && \
+                XRAY_PANEL_PORT=$(x-ui settings 2>/dev/null | grep -Ei '^\s*port:' | awk -F': ' '{print $2}' | tr -d '[:space:]' || true)
+        fi
+        # Validate port is numeric
+        if [[ -n "$XRAY_PANEL_PORT" && ! "$XRAY_PANEL_PORT" =~ ^[0-9]+$ ]]; then
+            XRAY_PANEL_PORT=""
+        fi
+
+        # Method 3: Try common 3x-ui ports (skip 443 — too likely to be nginx)
+        if [[ -z "$XRAY_PANEL_PORT" ]]; then
+            for port in 2053 54321 2087 2083; do
+                if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+                    XRAY_PANEL_PORT="$port"
+                    break
+                fi
+            done
+        fi
+
+        # Method 4: Fall back to default
+        XRAY_PANEL_PORT="${XRAY_PANEL_PORT:-2053}"
+
+        # Detect web base path (3x-ui v2.0+ sets a random base path by default)
+        XRAY_PANEL_BASEPATH=""
+        # Method 1: Parse config.json
+        if [[ -f /usr/local/x-ui/config.json ]]; then
+            XRAY_PANEL_BASEPATH=$(jq -r '.webBasePath // empty' /usr/local/x-ui/config.json 2>/dev/null || true)
+        fi
+        # Method 2: Query sqlite database
+        if [[ -z "$XRAY_PANEL_BASEPATH" ]] && command -v sqlite3 &>/dev/null && [[ -f /etc/x-ui/x-ui.db ]]; then
+            XRAY_PANEL_BASEPATH=$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webBasePath'" 2>/dev/null || true)
+        fi
+        # Method 3: Try to read from x-ui process environment or binary output
+        if [[ -z "$XRAY_PANEL_BASEPATH" ]]; then
+            # Some 3x-ui versions expose base path in config output
+            local xui_config_output
+            xui_config_output=$(/usr/local/x-ui/x-ui setting -show 2>/dev/null || x-ui setting -show 2>/dev/null || true)
+            if [[ -n "$xui_config_output" ]]; then
+                XRAY_PANEL_BASEPATH=$(echo "$xui_config_output" | grep -i 'webBasePath\|basePath' | sed 's/.*:[[:space:]]*//' | head -1 || true)
+            fi
+        fi
+        # Method 4: Parse from running process cmdline or env
+        if [[ -z "$XRAY_PANEL_BASEPATH" ]]; then
+            local _xui_pid
+            _xui_pid=$(pgrep -x x-ui 2>/dev/null | head -1 || true)
+            if [[ -n "$_xui_pid" && -f "/proc/${_xui_pid}/environ" ]]; then
+                XRAY_PANEL_BASEPATH=$(tr '\0' '\n' < "/proc/${_xui_pid}/environ" 2>/dev/null | grep -i 'basepath\|base_path' | sed 's/.*=//' | head -1 || true)
+            fi
+        fi
+        # Normalize: strip whitespace and leading/trailing slashes
+        XRAY_PANEL_BASEPATH=$(echo "${XRAY_PANEL_BASEPATH:-}" | sed 's|^[[:space:]]*||;s|[[:space:]]*$||;s|^/||;s|/$||')
+    fi
+}
+
+# Get 3x-ui admin credentials. Tries to read from DB first, then asks user.
+# Sets XRAY_ADMIN_USER and XRAY_ADMIN_PASS
+get_3xui_credentials() {
+    XRAY_ADMIN_USER=""
+    XRAY_ADMIN_PASS=""
+
+    # Try to read from database
+    if [[ -z "$XRAY_ADMIN_USER" || -z "$XRAY_ADMIN_PASS" ]]; then
+        if command -v sqlite3 &>/dev/null && [[ -f /etc/x-ui/x-ui.db ]]; then
+            XRAY_ADMIN_USER=$(sqlite3 /etc/x-ui/x-ui.db "SELECT username FROM users LIMIT 1" 2>/dev/null || true)
+            XRAY_ADMIN_PASS=$(sqlite3 /etc/x-ui/x-ui.db "SELECT password FROM users LIMIT 1" 2>/dev/null || true)
+        fi
+    fi
+
+    # Detect bcrypt-hashed passwords (3x-ui v2.0+ hashes by default)
+    # Hashed passwords start with $2a$, $2b$, or $2y$ and cannot be used as plaintext
+    if [[ -n "$XRAY_ADMIN_PASS" && "$XRAY_ADMIN_PASS" == \$2[aby]\$* ]]; then
+        print_warn "Password in database is hashed (3x-ui v2.0+). Manual entry required."
+        XRAY_ADMIN_PASS=""
+    fi
+
+    if [[ -n "$XRAY_ADMIN_USER" && -n "$XRAY_ADMIN_PASS" ]]; then
+        print_ok "Read credentials from 3x-ui database"
+        return 0
+    fi
+
+    # Ask user — keep DB username if we have it, only ask for what's missing
+    echo ""
+    echo -e "  ${BOLD}3x-ui Panel Credentials${NC}"
+    echo -e "  ${DIM}(needed to create the Xray inbound via API)${NC}"
+    echo ""
+    if [[ -z "$XRAY_ADMIN_USER" ]]; then
+        XRAY_ADMIN_USER=$(prompt_input "Panel username" "admin")
+    else
+        echo -e "  ${DIM}Username from database: ${XRAY_ADMIN_USER}${NC}"
+    fi
+    echo ""
+    read -rsp "  Panel password [admin]: " XRAY_ADMIN_PASS
+    XRAY_ADMIN_PASS="${XRAY_ADMIN_PASS:-admin}"
+    echo ""
+
+    if [[ -z "$XRAY_ADMIN_USER" ]]; then
+        print_fail "Username cannot be empty."
+        return 1
+    fi
+}
+
+# Let user choose which Xray protocol to use for the inbound.
+# Sets XRAY_PROTOCOL
+pick_xray_protocol() {
+    echo ""
+    echo -e "  ${BOLD}Xray Protocol:${NC}"
+    echo -e "  ${BOLD}1)${NC}  VLESS        ${DIM}(lightweight, recommended)${NC}"
+    echo -e "  ${BOLD}2)${NC}  Shadowsocks  ${DIM}(widely supported, simple)${NC}"
+    echo -e "  ${BOLD}3)${NC}  VMess        ${DIM}(V2Ray protocol)${NC}"
+    echo -e "  ${BOLD}4)${NC}  Trojan       ${DIM}(HTTPS-like)${NC}"
+    echo ""
+    local choice
+    choice=$(prompt_input "Select protocol (1-4)" "1")
+    case "$choice" in
+        1) XRAY_PROTOCOL="vless" ;;
+        2) XRAY_PROTOCOL="shadowsocks" ;;
+        3) XRAY_PROTOCOL="vmess" ;;
+        4) XRAY_PROTOCOL="trojan" ;;
+        *)
+            print_fail "Invalid selection. Use 1-4."
+            return 1
+            ;;
+    esac
+    print_ok "Protocol: ${XRAY_PROTOCOL}"
+}
+
+# Auto-find a free port for the Xray inbound, let user override.
+# Sets XRAY_INBOUND_PORT
+pick_xray_port() {
+    local port
+    # Find a free port
+    local attempts=0
+    while true; do
+        port=$((RANDOM % 50000 + 10000))
+        if ! ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+            break
+        fi
+        attempts=$((attempts + 1))
+        if [[ $attempts -ge 50 ]]; then
+            port=18443
+            break
+        fi
+    done
+
+    echo ""
+    XRAY_INBOUND_PORT=$(prompt_input "Xray inbound port (internal only, not exposed)" "$port")
+
+    # Validate
+    if ! [[ "$XRAY_INBOUND_PORT" =~ ^[0-9]+$ ]] || [[ "$XRAY_INBOUND_PORT" -lt 1 ]] || [[ "$XRAY_INBOUND_PORT" -gt 65535 ]]; then
+        print_fail "Invalid port number. Must be between 1 and 65535."
+        return 1
+    fi
+
+    if ss -tlnp 2>/dev/null | grep -q ":${XRAY_INBOUND_PORT} "; then
+        print_warn "Port ${XRAY_INBOUND_PORT} is already in use. Continuing anyway (may be intended)."
+    fi
+
+    print_ok "Inbound port: ${XRAY_INBOUND_PORT} (127.0.0.1 only)"
+}
+
+# Create a new inbound on the 3x-ui panel via its API.
+# Requires: XRAY_ADMIN_USER, XRAY_ADMIN_PASS, XRAY_PANEL_PORT, XRAY_PROTOCOL, XRAY_INBOUND_PORT
+# Sets: XRAY_UUID (for vless/vmess) or XRAY_PASSWORD (for ss/trojan)
+create_3xui_inbound() {
+    local base_segment=""
+    [[ -n "${XRAY_PANEL_BASEPATH:-}" ]] && base_segment="/${XRAY_PANEL_BASEPATH}"
+    local cookie_jar
+    cookie_jar=$(mktemp)
+    chmod 600 "$cookie_jar" 2>/dev/null || true
+
+    # Ensure cookie jar is cleaned up on any exit path
+    trap 'rm -f "${cookie_jar:-}"; trap - RETURN' RETURN
+
+    # Generate credentials for the inbound
+    XRAY_UUID=""
+    XRAY_PASSWORD=""
+    if [[ "$XRAY_PROTOCOL" == "vless" || "$XRAY_PROTOCOL" == "vmess" ]]; then
+        XRAY_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || openssl rand -hex 16 | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)/\1-\2-\3-\4-\5/')
+    else
+        XRAY_PASSWORD=$(openssl rand -hex 16)
+    fi
+
+    # Auto-detect panel URL: try http, then https, with and without base path
+    # Also try localhost in case 127.0.0.1 doesn't resolve (IPv6-only systems)
+    print_info "Logging in to 3x-ui panel..."
+    if [[ -n "$base_segment" ]]; then
+        print_info "Detected web base path: ${base_segment}"
+    fi
+    local panel_url=""
+    local login_resp=""
+    local try_urls=()
+
+    # Build list of URLs to try — with base path, without, and also try
+    # /panel prefix (some 3x-ui versions use /{basepath}/panel/... routes)
+    local _addrs=("127.0.0.1" "localhost")
+    for _addr in "${_addrs[@]}"; do
+        if [[ -n "$base_segment" ]]; then
+            try_urls+=("http://${_addr}:${XRAY_PANEL_PORT}${base_segment}")
+            try_urls+=("https://${_addr}:${XRAY_PANEL_PORT}${base_segment}")
+        fi
+        try_urls+=("http://${_addr}:${XRAY_PANEL_PORT}")
+        try_urls+=("https://${_addr}:${XRAY_PANEL_PORT}")
+    done
+
+    # Wait for panel to become ready (it may have just been installed/restarted)
+    local _wait_attempts=0
+    while [[ $_wait_attempts -lt 5 ]]; do
+        if ss -tlnp 2>/dev/null | grep -q ":${XRAY_PANEL_PORT} "; then
+            break
+        fi
+        _wait_attempts=$((_wait_attempts + 1))
+        if [[ $_wait_attempts -eq 1 ]]; then
+            print_info "Waiting for panel to start on port ${XRAY_PANEL_PORT}..."
+        fi
+        [[ $_wait_attempts -lt 5 ]] && sleep 2
+    done
+
+    # Also detect actual listening port from x-ui process if our port doesn't match
+    if ! ss -tlnp 2>/dev/null | grep -q ":${XRAY_PANEL_PORT} "; then
+        local _actual_port
+        _actual_port=$(ss -tlnp 2>/dev/null | grep 'x-ui\|x\.ui' | grep -oE ':[0-9]+' | head -1 | tr -d ':' || true)
+        if [[ -n "$_actual_port" && "$_actual_port" != "$XRAY_PANEL_PORT" ]]; then
+            print_warn "Panel not on port ${XRAY_PANEL_PORT}, found on port ${_actual_port} — trying that"
+            XRAY_PANEL_PORT="$_actual_port"
+            # Rebuild URLs with correct port
+            try_urls=()
+            for _addr in "${_addrs[@]}"; do
+                if [[ -n "$base_segment" ]]; then
+                    try_urls+=("http://${_addr}:${XRAY_PANEL_PORT}${base_segment}")
+                    try_urls+=("https://${_addr}:${XRAY_PANEL_PORT}${base_segment}")
+                fi
+                try_urls+=("http://${_addr}:${XRAY_PANEL_PORT}")
+                try_urls+=("https://${_addr}:${XRAY_PANEL_PORT}")
+            done
+        fi
+    fi
+
+    for try_url in "${try_urls[@]}"; do
+        login_resp=$(curl -s -L -k -c "$cookie_jar" -X POST "${try_url}/login" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "username=${XRAY_ADMIN_USER}" \
+            --data-urlencode "password=${XRAY_ADMIN_PASS}" \
+            --connect-timeout 5 --max-time 10 2>/dev/null || true)
+        # Only accept JSON responses (not HTML error pages or empty)
+        if [[ -n "$login_resp" ]] && echo "$login_resp" | jq . &>/dev/null; then
+            panel_url="$try_url"
+            break
+        fi
+        # Clear cookie jar between attempts
+        : > "$cookie_jar"
+    done
+
+    if [[ -z "$panel_url" ]]; then
+        print_fail "Could not connect to 3x-ui panel on port ${XRAY_PANEL_PORT}"
+        # Show what's actually listening for debugging
+        local _listening
+        _listening=$(ss -tlnp 2>/dev/null | grep -i 'x-ui\|x\.ui' || true)
+        if [[ -n "$_listening" ]]; then
+            print_info "Panel process found but login failed:"
+            print_info "  ${_listening}"
+            # Diagnostic: probe the panel to find what's actually responding
+            local _diag_url _diag_resp _diag_err
+            for _diag_url in "https://127.0.0.1:${XRAY_PANEL_PORT}" "http://127.0.0.1:${XRAY_PANEL_PORT}"; do
+                _diag_err=$(curl -s -k --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" "${_diag_url}/" 2>&1 || true)
+                if [[ "$_diag_err" =~ ^[0-9]+$ && "$_diag_err" != "000" ]]; then
+                    print_info "Panel responds on ${_diag_url} (HTTP ${_diag_err})"
+                    # Try to get the actual login page to see if base path redirect happens
+                    _diag_resp=$(curl -s -k -L --connect-timeout 3 --max-time 5 "${_diag_url}/" 2>/dev/null | head -c 500 || true)
+                    # Check if response contains a redirect to a base path
+                    local _detected_base
+                    _detected_base=$(echo "$_diag_resp" | grep -oE 'href="(/[^"]+)/"' | head -1 | sed 's/href="//;s/\/"$//' || true)
+                    if [[ -n "$_detected_base" && "$_detected_base" != "/" ]]; then
+                        print_info "Detected redirect to base path: ${_detected_base}"
+                        print_info "Retrying login with base path..."
+                        login_resp=$(curl -s -L -k -c "$cookie_jar" -X POST "${_diag_url}${_detected_base}/login" \
+                            -H "Content-Type: application/x-www-form-urlencoded" \
+                            --data-urlencode "username=${XRAY_ADMIN_USER}" \
+                            --data-urlencode "password=${XRAY_ADMIN_PASS}" \
+                            --connect-timeout 5 --max-time 10 2>/dev/null || true)
+                        if [[ -n "$login_resp" ]] && echo "$login_resp" | jq . &>/dev/null; then
+                            panel_url="${_diag_url}${_detected_base}"
+                            print_ok "Found panel at ${panel_url}"
+                            break
+                        fi
+                    fi
+                    break
+                fi
+            done
+        else
+            print_info "No x-ui process found listening on any port"
+            print_info "Try: systemctl restart x-ui && sleep 3 && sudo bash $0 --add-xray"
+        fi
+        # If diagnostic probe found the panel, continue; otherwise fail
+        if [[ -z "$panel_url" ]]; then
+            if [[ -n "$base_segment" ]]; then
+                print_info "Web base path '${base_segment}' was detected — verify it matches your panel"
+            fi
+            print_info "Check: systemctl status x-ui"
+            print_info "Debug: curl -k https://127.0.0.1:${XRAY_PANEL_PORT}/"
+            return 1
+        fi
+    fi
+
+    local login_success
+    login_success=$(echo "$login_resp" | jq -r '.success // false' 2>/dev/null || echo "false")
+    if [[ "$login_success" != "true" ]]; then
+        print_fail "Login failed. Check username/password."
+        print_info "Response: $(echo "$login_resp" | jq -r '.msg // "unknown error"' 2>/dev/null || echo "$login_resp")"
+        return 1
+    fi
+    print_ok "Logged in to 3x-ui"
+
+    # Build inbound settings JSON based on protocol
+    local settings stream_settings sniffing_settings remark
+    remark="DNSTT-${XRAY_PROTOCOL}-${XRAY_INBOUND_PORT}"
+
+    sniffing_settings='{"enabled":true,"destOverride":["http","tls","quic","fakedns"]}'
+    stream_settings='{"network":"tcp","security":"none","tcpSettings":{"header":{"type":"none"}}}'
+
+    local client_email="dnstt-${XRAY_INBOUND_PORT}"
+
+    case "$XRAY_PROTOCOL" in
+        vless)
+            settings=$(jq -nc --arg uuid "$XRAY_UUID" --arg email "$client_email" '{
+                "clients": [{"id": $uuid, "flow": "", "email": $email, "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": true}],
+                "decryption": "none",
+                "fallbacks": []
+            }')
+            ;;
+        shadowsocks)
+            settings=$(jq -nc --arg pass "$XRAY_PASSWORD" '{
+                "method": "chacha20-ietf-poly1305",
+                "password": $pass,
+                "network": "tcp,udp",
+                "clients": []
+            }')
+            ;;
+        vmess)
+            settings=$(jq -nc --arg uuid "$XRAY_UUID" --arg email "$client_email" '{
+                "clients": [{"id": $uuid, "alterId": 0, "email": $email, "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": true}]
+            }')
+            ;;
+        trojan)
+            settings=$(jq -nc --arg pass "$XRAY_PASSWORD" --arg email "$client_email" '{
+                "clients": [{"password": $pass, "email": $email, "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": true}],
+                "fallbacks": []
+            }')
+            ;;
+    esac
+
+    # Create inbound via API
+    print_info "Creating inbound: ${XRAY_PROTOCOL} on 127.0.0.1:${XRAY_INBOUND_PORT}..."
+    local inbound_data
+    inbound_data=$(jq -nc \
+        --arg remark "$remark" \
+        --argjson port "$XRAY_INBOUND_PORT" \
+        --arg protocol "$XRAY_PROTOCOL" \
+        --arg settings "$settings" \
+        --arg stream "$stream_settings" \
+        --arg sniffing "$sniffing_settings" \
+        '{
+            "up": 0, "down": 0,
+            "total": 0,
+            "remark": $remark,
+            "enable": true,
+            "expiryTime": 0,
+            "listen": "127.0.0.1",
+            "port": $port,
+            "protocol": $protocol,
+            "settings": $settings,
+            "streamSettings": $stream,
+            "sniffing": $sniffing
+        }')
+
+    local create_resp
+    create_resp=$(curl -s -L -k -b "$cookie_jar" -X POST "${panel_url}/panel/api/inbounds/add" \
+        -H "Content-Type: application/json" \
+        -d "$inbound_data" \
+        --max-time 10 2>/dev/null || true)
+
+    if [[ -z "$create_resp" ]]; then
+        print_fail "No response from panel when creating inbound."
+        return 1
+    fi
+
+    local create_success
+    create_success=$(echo "$create_resp" | jq -r '.success // false' 2>/dev/null || echo "false")
+    if [[ "$create_success" != "true" ]]; then
+        print_fail "Failed to create inbound."
+        print_info "Response: $(echo "$create_resp" | jq -r '.msg // "unknown error"' 2>/dev/null || echo "$create_resp")"
+        return 1
+    fi
+
+    print_ok "Created inbound: ${remark} (127.0.0.1:${XRAY_INBOUND_PORT})"
+}
+
+# Create a systemd drop-in override to redirect the DNSTT tunnel upstream
+# from microsocks to the Xray inbound port.
+# Usage: create_xray_service_override <tag> <xray_port> <domain>
+create_xray_service_override() {
+    local tag="$1"
+    local xray_port="$2"
+    local domain="$3"
+    local service="dnsgb-${tag}.service"
+    local dropin_dir="/etc/systemd/system/${service}.d"
+    local dropin_file="${dropin_dir}/10-xray-upstream.conf"
+
+    # Parse original ExecStart to get the tunnel's listening port and key path
+    # Use 'systemctl show' for the resolved ExecStart (avoids drop-in merging issues)
+    local orig_exec
+    orig_exec=$(systemctl cat "$service" 2>/dev/null | grep '^ExecStart=/' | head -1 || true)
+    # Fallback: if drop-in already exists, grep for the binary path line
+    if [[ -z "$orig_exec" ]]; then
+        orig_exec=$(systemctl cat "$service" 2>/dev/null | grep '^ExecStart=.*dnstt-server' | tail -1 || true)
+    fi
+
+    if [[ -z "$orig_exec" ]]; then
+        print_fail "Could not read ExecStart from ${service}"
+        return 1
+    fi
+
+    # Extract the listening port (-udp :PORT part) — no Perl regex needed
+    local tunnel_port
+    tunnel_port=$(echo "$orig_exec" | grep -oE '\-udp[[:space:]]+[^ ]+' | grep -oE '[0-9]+$' || true)
+    if [[ -z "$tunnel_port" ]]; then
+        print_fail "Could not detect tunnel listening port from service"
+        return 1
+    fi
+
+    # Extract the privkey path
+    local privkey_path
+    privkey_path=$(echo "$orig_exec" | sed -n 's/.*-privkey-file[[:space:]]\+\([^[:space:]]\+\).*/\1/p' || true)
+    if [[ -z "$privkey_path" ]]; then
+        privkey_path="/etc/dnsgb/tunnels/${tag}/server.key"
+    fi
+
+    # Extract MTU flag if present (e.g., -mtu 1100)
+    local mtu_arg=""
+    local orig_mtu
+    orig_mtu=$(echo "$orig_exec" | grep -oE '\-mtu[[:space:]]+[0-9]+' || true)
+    if [[ -n "$orig_mtu" ]]; then
+        mtu_arg=" ${orig_mtu}"
+    fi
+
+    # Extract the dnstt-server binary path (first token after ExecStart=)
+    local dnstt_bin
+    dnstt_bin=$(echo "$orig_exec" | sed 's/^ExecStart=[-+!@]*//;s/[[:space:]].*//' || true)
+    if [[ -z "$dnstt_bin" || ! -f "$dnstt_bin" ]]; then
+        # Fallback to common locations
+        for bin_path in /usr/local/bin/dnstt-server /usr/bin/dnstt-server; do
+            if [[ -f "$bin_path" ]]; then
+                dnstt_bin="$bin_path"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "$dnstt_bin" ]]; then
+        print_fail "Could not find dnstt-server binary"
+        return 1
+    fi
+
+    if ! mkdir -p "$dropin_dir" 2>/dev/null; then
+        print_fail "Could not create drop-in directory: ${dropin_dir}"
+        return 1
+    fi
+    cat > "$dropin_file" <<EOF || { print_fail "Could not write service override: ${dropin_file}"; return 1; }
+[Service]
+ExecStart=
+ExecStart=${dnstt_bin} -udp :${tunnel_port}${mtu_arg} -privkey-file ${privkey_path} ${domain} 127.0.0.1:${xray_port}
+EOF
+
+    print_ok "Created service override: ${service} → 127.0.0.1:${xray_port}"
+}
+
+# Generate a client share URI for the Xray tunnel.
+# Usage: generate_xray_client_uri <protocol> <server_ip> <port> <uuid_or_pass> [remark]
+# Returns the URI string
+generate_xray_client_uri() {
+    local protocol="$1"
+    local server_ip="$2"
+    local port="$3"
+    local credential="$4"
+    local remark="${5:-DNSTT-Xray}"
+
+    # URL-encode the remark (pure bash, no python dependency)
+    local encoded_remark=""
+    local i c
+    for (( i=0; i<${#remark}; i++ )); do
+        c="${remark:$i:1}"
+        case "$c" in
+            [a-zA-Z0-9._~-]) encoded_remark+="$c" ;;
+            *) encoded_remark+=$(printf '%%%02X' "'$c") ;;
+        esac
+    done
+
+    # Handle IPv6 addresses — wrap in brackets for URIs
+    local host="$server_ip"
+    if [[ "$server_ip" == *:* ]]; then
+        host="[${server_ip}]"
+    fi
+
+    case "$protocol" in
+        vless)
+            echo "vless://${credential}@${host}:${port}?encryption=none&type=tcp&security=none#${encoded_remark}"
+            ;;
+        shadowsocks)
+            local method="chacha20-ietf-poly1305"
+            # SIP002 requires URL-safe base64 (RFC 4648 section 5): +/ → -_, no padding
+            local encoded
+            encoded=$(echo -n "${method}:${credential}" | base64 -w0 | tr '+/' '-_' | tr -d '=')
+            echo "ss://${encoded}@${host}:${port}#${encoded_remark}"
+            ;;
+        vmess)
+            local vmess_json
+            vmess_json=$(jq -nc \
+                --arg ip "$server_ip" \
+                --arg port "$port" \
+                --arg uuid "$credential" \
+                --arg remark "$remark" \
+                '{
+                    "v": "2",
+                    "ps": $remark,
+                    "add": $ip,
+                    "port": $port,
+                    "id": $uuid,
+                    "aid": "0",
+                    "net": "tcp",
+                    "type": "none",
+                    "host": "",
+                    "path": "",
+                    "tls": "",
+                    "scy": "auto"
+                }')
+            echo "vmess://$(echo -n "$vmess_json" | base64 -w0)"
+            ;;
+        trojan)
+            echo "trojan://${credential}@${host}:${port}?type=tcp&security=none#${encoded_remark}"
+            ;;
+    esac
+}
+
+# Save Xray tunnel config to /etc/dnsgb/xray/
+# Usage: save_xray_config <tag>
+save_xray_config() {
+    local tag="$1"
+    local config_dir="/etc/dnsgb/xray"
+    local config_file="${config_dir}/${tag}.conf"
+
+    if ! mkdir -p "$config_dir" 2>/dev/null; then
+        print_warn "Could not create config directory: ${config_dir}"
+        return 1
+    fi
+    chmod 700 "$config_dir" 2>/dev/null || true
+    # Create file with restrictive permissions before writing any secrets
+    # Use subshell umask to ensure touch fallback is also restrictive
+    install -m 600 /dev/null "$config_file" 2>/dev/null || (umask 077; touch "$config_file")
+    chmod 600 "$config_file" 2>/dev/null || true
+    # Use printf %q to safely quote all values (handles special chars)
+    {
+        printf 'XRAY_TAG=%q\n' "$tag"
+        printf 'XRAY_PORT=%q\n' "$XRAY_INBOUND_PORT"
+        printf 'XRAY_PROTOCOL=%q\n' "$XRAY_PROTOCOL"
+        printf 'XRAY_UUID=%q\n' "$XRAY_UUID"
+        printf 'XRAY_PASSWORD=%q\n' "$XRAY_PASSWORD"
+        printf 'XRAY_PANEL=%q\n' "$XRAY_PANEL_TYPE"
+        printf 'XRAY_DOMAIN=%q\n' "x.${DOMAIN}"
+    } > "$config_file" || { print_warn "Could not write config: ${config_file}"; return 1; }
+    print_ok "Saved config: ${config_file}"
+}
+
+# ─── NoizDNS Binary Download ──────────────────────────────────────────────────
+
+# Download and verify the NoizDNS server binary if not already installed.
+# Returns 0 if binary is available (already existed or freshly downloaded), 1 otherwise.
+ensure_noizdns_binary() {
+    # Already installed — validate it's actually an ELF binary (not a corrupted download)
+    if [[ -x /usr/local/bin/noizdns-server ]]; then
+        local _is_elf=false
+        if command -v file &>/dev/null; then
+            file /usr/local/bin/noizdns-server 2>/dev/null | grep -qi "ELF" && _is_elf=true
+        else
+            local _magic
+            _magic=$(xxd -l 4 -p /usr/local/bin/noizdns-server 2>/dev/null || od -A n -t x1 -N 4 /usr/local/bin/noizdns-server 2>/dev/null | tr -d ' ')
+            [[ "$_magic" == "7f454c46" ]] && _is_elf=true
+        fi
+        if [[ "$_is_elf" == true ]]; then
+            return 0
+        fi
+        # Corrupted or invalid binary — remove and re-download
+        print_warn "Existing NoizDNS binary is invalid — re-downloading..."
+        rm -f /usr/local/bin/noizdns-server
+    fi
+
+    print_info "Downloading NoizDNS server (DPI-resistant tunnel)..."
+
+    # Quick DNS check — fail fast if DNS is broken instead of curl hanging
+    if ! curl -s --connect-timeout 5 --max-time 5 -o /dev/null "https://github.com" 2>/dev/null; then
+        print_warn "Cannot reach GitHub — DNS or network may be down"
+        print_info "Check: cat /etc/resolv.conf && curl -s https://github.com"
+        return 1
+    fi
+
+    local arch
+    arch=$(detect_architecture)
+    local noizdns_arch="$arch"
+    [[ "$noizdns_arch" == "armv7" ]] && noizdns_arch="arm"
+
+    local noizdns_downloaded=false
+    local noizdns_own_url="https://github.com/SamNet-dev/dnstm-setup/releases/download/noizdns-v1.0/noizdns-server-linux-${noizdns_arch}"
+    local noizdns_release_url="https://github.com/anonvector/noizdns-deploy/releases/latest/download/dnstt-server-linux-${noizdns_arch}"
+    local noizdns_raw_url="https://raw.githubusercontent.com/anonvector/noizdns-deploy/main/bin/dnstt-server-linux-${noizdns_arch}"
+
+    # Try each URL with progress indicator (--progress-bar so user sees it's not stuck)
+    if curl -fSL --progress-bar --connect-timeout 10 --max-time 60 -o /usr/local/bin/noizdns-server "$noizdns_own_url" 2>/dev/null; then
+        noizdns_downloaded=true
+    elif curl -fSL --progress-bar --connect-timeout 10 --max-time 60 -o /usr/local/bin/noizdns-server "$noizdns_release_url" 2>/dev/null; then
+        noizdns_downloaded=true
+    elif curl -fSL --progress-bar --connect-timeout 10 --max-time 60 -o /usr/local/bin/noizdns-server "$noizdns_raw_url" 2>/dev/null; then
+        noizdns_downloaded=true
+    fi
+
+    if [[ "$noizdns_downloaded" == true ]]; then
+        chmod +x /usr/local/bin/noizdns-server
+        if [[ ! -s /usr/local/bin/noizdns-server ]]; then
+            print_warn "NoizDNS binary is empty (download may have failed)"
+            rm -f /usr/local/bin/noizdns-server
+            return 1
+        fi
+        # Validate: must be an ELF binary for this architecture
+        if command -v file &>/dev/null; then
+            local file_type
+            file_type=$(file /usr/local/bin/noizdns-server 2>/dev/null || true)
+            if echo "$file_type" | grep -qi "ELF"; then
+                print_ok "NoizDNS server installed and verified"
+                return 0
+            else
+                print_warn "NoizDNS binary is not a valid executable (got: ${file_type})"
+                rm -f /usr/local/bin/noizdns-server
+                return 1
+            fi
+        else
+            # 'file' command not available — check ELF magic bytes (7f 45 4c 46)
+            local magic
+            magic=$(xxd -l 4 -p /usr/local/bin/noizdns-server 2>/dev/null || od -A n -t x1 -N 4 /usr/local/bin/noizdns-server 2>/dev/null | tr -d ' ')
+            if [[ "$magic" == "7f454c46" ]]; then
+                print_ok "NoizDNS server installed and verified"
+                return 0
+            else
+                print_warn "NoizDNS binary is not a valid ELF executable"
+                rm -f /usr/local/bin/noizdns-server
+                return 1
+            fi
+        fi
+    else
+        print_warn "Could not download NoizDNS server (GitHub may be blocked)"
+        print_info "Manual install: curl -fsSL -o /usr/local/bin/noizdns-server ${noizdns_release_url} && chmod +x /usr/local/bin/noizdns-server"
+        return 1
+    fi
+}
+
+# ─── NoizDNS Service Override ─────────────────────────────────────────────────
+
+# Fix NoizDNS tunnel transport in dnsgb config.json
+# We create noiz tunnels with --transport dnstt (dnsgb tunnel add only accepts
+# slipstream or dnstt). Newer dnsgb versions support "noizdns" as a transport
+# type in the router — if so, noiz tunnels should use it for proper decoding.
+# Older versions only know dnstt, so noiz tunnels must stay as dnstt there.
+fix_noizdns_transport() {
+    local config="/etc/dnsgb/config.json"
+    [[ -f "$config" ]] || return 0
+    command -v jq &>/dev/null || return 0
+
+    # Detect if this version of dnsgb supports "noizdns" transport
+    local supports_noizdns=false
+    if dnsgb tunnel add --help 2>&1 | grep -qi "noizdns" || \
+       dnsgb --help 2>&1 | grep -qi "noizdns"; then
+        supports_noizdns=true
+    else
+        # Quick probe: try creating a test config in memory to see if router accepts noizdns
+        local test_config='{"tunnels":[{"tag":"_test","transport":"noizdns","backend":"socks","domain":"test.example.com","port":9999}]}'
+        if echo "$test_config" | dnsgb router validate 2>&1 | grep -qi "valid" 2>/dev/null; then
+            supports_noizdns=true
+        fi
+    fi
+
+    local changed=false
+    local tmp_config="${config}.tmp.$$"
+
+    if [[ "$supports_noizdns" == true ]]; then
+        # Newer dnsgb: noiz tunnels should have transport "noizdns"
+        if jq -e '.tunnels[]? | select(.tag | test("^noiz")) | select(.transport == "dnstt")' "$config" &>/dev/null; then
+            if jq '(.tunnels[]? | select(.tag | test("^noiz")) | select(.transport == "dnstt") | .transport) = "noizdns"' "$config" > "$tmp_config" 2>/dev/null; then
+                mv "$tmp_config" "$config"
+                changed=true
+                print_ok "Fixed NoizDNS tunnel transport in dnsgb config (dnstt → noizdns)"
+            else
+                rm -f "$tmp_config"
+            fi
+        fi
+    else
+        # Older dnsgb: noiz tunnels must stay as "dnstt" (router doesn't know noizdns)
+        if jq -e '.tunnels[]? | select(.tag | test("^noiz")) | select(.transport == "noizdns")' "$config" &>/dev/null; then
+            if jq '(.tunnels[]? | select(.tag | test("^noiz")) | select(.transport == "noizdns") | .transport) = "dnstt"' "$config" > "$tmp_config" 2>/dev/null; then
+                mv "$tmp_config" "$config"
+                changed=true
+                print_ok "Fixed NoizDNS tunnel transport in dnsgb config (noizdns → dnstt for older dnsgb)"
+            else
+                rm -f "$tmp_config"
+            fi
+        fi
+    fi
+}
+
+# Override a DNSTT tunnel's systemd service to use the NoizDNS binary instead.
+# NoizDNS does NOT support -udp flag — it uses Pluggable Transport (PT) mode
+# with TOR_PT_* environment variables for bind address and upstream.
+# Usage: create_noizdns_service_override <tag>
+
+create_edns_service_override() {
+    local tag="$1"
+    local service="dnsgb-${tag}.service"
+    local dropin_dir="/etc/systemd/system/${service}.d"
+    local dropin_file="${dropin_dir}/10-edns-proxy.conf"
+
+    local orig_exec
+    orig_exec=$(systemctl cat "$service" 2>/dev/null | grep '^ExecStart=/' | head -1 || true)
+    if [[ -z "$orig_exec" ]]; then
+        orig_exec=$(systemctl cat "$service" 2>/dev/null | grep '^ExecStart=.*dnstt-server' | tail -1 || true)
+    fi
+    if [[ -z "$orig_exec" ]]; then
+        print_fail "Could not read ExecStart from ${service}"
+        return 1
+    fi
+
+    local tunnel_port
+    tunnel_port=$(echo "$orig_exec" | grep -oE '-udp[[:space:]]+[^ ]+' | grep -oE '[0-9]+
+    local tag="$1"
+    local service="dnsgb-${tag}.service"
+    local dropin_dir="/etc/systemd/system/${service}.d"
+    local dropin_file="${dropin_dir}/10-noizdns-binary.conf"
+
+    # Read original ExecStart to extract port, key, MTU, domain, upstream
+    local orig_exec
+    orig_exec=$(systemctl cat "$service" 2>/dev/null | grep '^ExecStart=/' | head -1 || true)
+    if [[ -z "$orig_exec" ]]; then
+        orig_exec=$(systemctl cat "$service" 2>/dev/null | grep '^ExecStart=.*dnstt-server' | tail -1 || true)
+    fi
+    if [[ -z "$orig_exec" ]]; then
+        print_fail "Could not read ExecStart from ${service}"
+        return 1
+    fi
+
+    # Extract components from original ExecStart
+    # Original: /path/dnstt-server -udp :5300 -privkey-file KEY [-mtu MTU] DOMAIN UPSTREAM
+    local tunnel_port privkey_path mtu_val domain upstream
+
+    # Extract -udp port (e.g., ":5300" or "5300")
+    tunnel_port=$(echo "$orig_exec" | grep -oE '\-udp[[:space:]]+[^ ]+' | grep -oE '[0-9]+$' || true)
+    if [[ -z "$tunnel_port" ]]; then
+        print_fail "Could not detect tunnel port from ${service}"
+        return 1
+    fi
+
+    # Extract -privkey-file path
+    privkey_path=$(echo "$orig_exec" | grep -oE '\-privkey-file\s+[^ ]+' | sed 's/-privkey-file\s*//' || true)
+    if [[ -z "$privkey_path" ]]; then
+        privkey_path="/etc/dnsgb/tunnels/${tag}/server.key"
+    fi
+
+    # Extract -mtu value (optional)
+    mtu_val=$(echo "$orig_exec" | grep -oE '\-mtu\s+[0-9]+' | grep -oE '[0-9]+' || true)
+    local mtu_arg=""
+    if [[ -n "$mtu_val" ]]; then
+        mtu_arg=" -mtu ${mtu_val}"
+    fi
+
+    # Extract domain and upstream (last two positional args)
+    # Strip all flags and their values, leaving just positional args
+    local positional
+    positional=$(echo "$orig_exec" | sed 's|^ExecStart=[^ ]*||; s|-udp[[:space:]]*[^ ]*||; s|-privkey-file[[:space:]]*[^ ]*||; s|-mtu[[:space:]]*[0-9]*||' | xargs || true)
+    domain=$(echo "$positional" | awk '{print $1}')
+    upstream=$(echo "$positional" | awk '{print $2}')
+
+    if [[ -z "$domain" || -z "$upstream" ]]; then
+        print_fail "Could not parse domain/upstream from ${service}"
+        return 1
+    fi
+
+    if ! mkdir -p "$dropin_dir" 2>/dev/null; then
+        print_fail "Could not create drop-in directory: ${dropin_dir}"
+        return 1
+    fi
+
+    # Write PT-mode drop-in (NoizDNS uses TOR_PT_* env vars instead of -udp flag)
+    cat > "$dropin_file" <<EOF || { print_fail "Could not write NoizDNS override: ${dropin_file}"; return 1; }
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/noizdns-server -privkey-file ${privkey_path}${mtu_arg} ${domain}
+Environment=TOR_PT_MANAGED_TRANSPORT_VER=1
+Environment=TOR_PT_SERVER_TRANSPORTS=dnstt
+Environment=TOR_PT_SERVER_BINDADDR=dnstt-0.0.0.0:${tunnel_port}
+Environment=TOR_PT_ORPORT=${upstream}
+EOF
+    print_ok "NoizDNS binary override (PT mode): ${service}"
+}
+
+# ─── VayDNS Binary Download ──────────────────────────────────────────────────
+
+# Download and verify the VayDNS server binary if not already installed.
+# Returns 0 if binary is available (already existed or freshly downloaded), 1 otherwise.
+ensure_vaydns_binary() {
+    local _is_elf=false
+    if [[ -x /usr/local/bin/vaydns-server ]]; then
+        if command -v file &>/dev/null; then
+            file /usr/local/bin/vaydns-server 2>/dev/null | grep -qi "ELF" && _is_elf=true
+        fi
+        if [[ "$_is_elf" != true ]]; then
+            local _magic
+            _magic=$(xxd -l 4 -p /usr/local/bin/vaydns-server 2>/dev/null || od -A n -t x1 -N 4 /usr/local/bin/vaydns-server 2>/dev/null | tr -d ' ')
+            [[ "$_magic" == "7f454c46" ]] && _is_elf=true
+        fi
+        if [[ "$_is_elf" == true ]]; then
+            return 0
+        fi
+        print_warn "Existing VayDNS binary is invalid — re-downloading..."
+        rm -f /usr/local/bin/vaydns-server
+    fi
+
+    print_info "Downloading VayDNS server (optimized DNS tunnel)..."
+
+    local arch
+    arch=$(detect_architecture)
+
+    local vaydns_downloaded=false
+    local vaydns_release_url="https://github.com/net2share/vaydns/releases/latest/download/vaydns-server-linux-${arch}"
+
+    if curl -fSL --progress-bar --connect-timeout 10 --max-time 60 -o /usr/local/bin/vaydns-server "$vaydns_release_url" 2>/dev/null; then
+        vaydns_downloaded=true
+    fi
+
+    if [[ "$vaydns_downloaded" == true ]]; then
+        chmod +x /usr/local/bin/vaydns-server
+        if [[ ! -s /usr/local/bin/vaydns-server ]]; then
+            print_warn "VayDNS binary is empty (download may have failed)"
+            rm -f /usr/local/bin/vaydns-server
+            return 1
+        fi
+        local magic
+        magic=$(xxd -l 4 -p /usr/local/bin/vaydns-server 2>/dev/null || od -A n -t x1 -N 4 /usr/local/bin/vaydns-server 2>/dev/null | tr -d ' ')
+        if [[ "$magic" == "7f454c46" ]]; then
+            print_ok "VayDNS server installed and verified"
+            return 0
+        else
+            print_warn "VayDNS binary is not a valid ELF executable"
+            rm -f /usr/local/bin/vaydns-server
+            return 1
+        fi
+    else
+        print_warn "Could not download VayDNS server (GitHub may be blocked)"
+        print_info "Manual install: curl -fsSL -o /usr/local/bin/vaydns-server ${vaydns_release_url} && chmod +x /usr/local/bin/vaydns-server"
+        return 1
+    fi
+}
+
+# Fix VayDNS tunnel transport in dnsgb config.json.
+# Newer dnsgb may support "vaydns" as a transport type; older only knows "dnstt".
+fix_vaydns_transport() {
+    local config="/etc/dnsgb/config.json"
+    [[ -f "$config" ]] || return 0
+    command -v jq &>/dev/null || return 0
+
+    local supports_vaydns=false
+    if timeout 5 dnsgb tunnel add --help 2>&1 | grep -qi "vaydns" || \
+       timeout 5 dnsgb --help 2>&1 | grep -qi "vaydns"; then
+        supports_vaydns=true
+    fi
+
+    local changed=false
+    local tmp_config="${config}.tmp.$$"
+
+    if [[ "$supports_vaydns" == true ]]; then
+        if jq -e '.tunnels[]? | select(.tag | test("^vay")) | select(.transport == "dnstt")' "$config" &>/dev/null; then
+            if jq '(.tunnels[]? | select(.tag | test("^vay")) | select(.transport == "dnstt") | .transport) = "vaydns"' "$config" > "$tmp_config" 2>/dev/null; then
+                mv "$tmp_config" "$config"
+                changed=true
+                print_ok "Fixed VayDNS tunnel transport in dnsgb config (dnstt → vaydns)"
+            else
+                rm -f "$tmp_config"
+            fi
+        fi
+    else
+        if jq -e '.tunnels[]? | select(.tag | test("^vay")) | select(.transport == "vaydns")' "$config" &>/dev/null; then
+            if jq '(.tunnels[]? | select(.tag | test("^vay")) | select(.transport == "vaydns") | .transport) = "dnstt"' "$config" > "$tmp_config" 2>/dev/null; then
+                mv "$tmp_config" "$config"
+                changed=true
+                print_ok "Fixed VayDNS tunnel transport in dnsgb config (vaydns → dnstt for older dnsgb)"
+            else
+                rm -f "$tmp_config"
+            fi
+        fi
+    fi
+}
+
+# Override a DNSTT tunnel's systemd service to use the VayDNS binary instead.
+# VayDNS supports -udp directly (unlike NoizDNS which needs PT mode) and uses
+# named flags (-domain, -upstream) instead of positional args. Adds -dnstt-compat
+# for backwards compatibility with SlipNet's built-in dnstt client.
+# Usage: create_vaydns_service_override <tag>
+create_vaydns_service_override() {
+    local tag="$1"
+    local service="dnsgb-${tag}.service"
+    local dropin_dir="/etc/systemd/system/${service}.d"
+    local dropin_file="${dropin_dir}/10-vaydns-binary.conf"
+
+    local orig_exec
+    orig_exec=$(systemctl cat "$service" 2>/dev/null | grep '^ExecStart=/' | head -1 || true)
+    if [[ -z "$orig_exec" ]]; then
+        orig_exec=$(systemctl cat "$service" 2>/dev/null | grep '^ExecStart=.*dnstt-server' | tail -1 || true)
+    fi
+    if [[ -z "$orig_exec" ]]; then
+        print_fail "Could not read ExecStart from ${service}"
+        return 1
+    fi
+
+    # Extract components from original ExecStart
+    # Original: /path/dnstt-server -udp :PORT -privkey-file KEY [-mtu MTU] DOMAIN UPSTREAM
+    local tunnel_port privkey_path mtu_val domain upstream
+
+    tunnel_port=$(echo "$orig_exec" | grep -oE '\-udp[[:space:]]+[^ ]+' | grep -oE '[0-9]+$' || true)
+    if [[ -z "$tunnel_port" ]]; then
+        print_fail "Could not detect tunnel port from ${service}"
+        return 1
+    fi
+
+    privkey_path=$(echo "$orig_exec" | grep -oE '\-privkey-file\s+[^ ]+' | sed 's/-privkey-file\s*//' || true)
+    if [[ -z "$privkey_path" ]]; then
+        privkey_path="/etc/dnsgb/tunnels/${tag}/server.key"
+    fi
+
+    mtu_val=$(echo "$orig_exec" | grep -oE '\-mtu\s+[0-9]+' | grep -oE '[0-9]+' || true)
+    local mtu_arg=""
+    if [[ -n "$mtu_val" ]]; then
+        mtu_arg=" -mtu ${mtu_val}"
+    fi
+
+    # Extract domain and upstream (last two positional args in dnstt)
+    local positional
+    positional=$(echo "$orig_exec" | sed 's|^ExecStart=[^ ]*||; s|-udp[[:space:]]*[^ ]*||; s|-privkey-file[[:space:]]*[^ ]*||; s|-mtu[[:space:]]*[0-9]*||' | xargs || true)
+    domain=$(echo "$positional" | awk '{print $1}')
+    upstream=$(echo "$positional" | awk '{print $2}')
+
+    if [[ -z "$domain" || -z "$upstream" ]]; then
+        print_fail "Could not parse domain/upstream from ${service}"
+        return 1
+    fi
+
+    if ! mkdir -p "$dropin_dir" 2>/dev/null; then
+        print_fail "Could not create drop-in directory: ${dropin_dir}"
+        return 1
+    fi
+
+    # VayDNS uses named flags (-domain, -upstream) + -dnstt-compat for SlipNet compatibility
+    cat > "$dropin_file" <<EOF || { print_fail "Could not write VayDNS override: ${dropin_file}"; return 1; }
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/vaydns-server -udp :${tunnel_port} -privkey-file ${privkey_path}${mtu_arg} -dnstt-compat -domain ${domain} -upstream ${upstream}
+EOF
+    print_ok "VayDNS binary override: ${service}"
+}
+
+# Main Xray backend integration function
+do_add_xray() {
+    banner
+
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "  ${CROSS} Not running as root. Please run with: sudo bash $0 --add-xray"
+        exit 1
+    fi
+
+    if ! command -v dnsgb &>/dev/null; then
+        print_fail "dnsgb is not installed. Run the full setup first: sudo bash $0"
+        exit 1
+    fi
+
+    print_header "Xray Backend via DNS Tunnel"
+
+    echo ""
+    echo -e "  ${BOLD}How this works:${NC}"
+    echo -e "  ${DIM}This connects your existing Xray panel (3x-ui) to a DNSTT tunnel.${NC}"
+    echo -e "  ${DIM}A new internal-only Xray inbound is created on 127.0.0.1, then a${NC}"
+    echo -e "  ${DIM}DNSTT tunnel is set up to forward DNS traffic to that inbound.${NC}"
+    echo ""
+    echo -e "  ${DIM}Flow: Phone (SlipNet+Nekobox) → DNS tunnel → Xray inbound → Internet${NC}"
+    echo ""
+
+    # Ensure required tools are available
+    if ! command -v curl &>/dev/null; then
+        print_fail "curl is required but not installed. Install it: apt-get install curl"
+        exit 1
+    fi
+    if ! command -v jq &>/dev/null; then
+        print_info "Installing jq..."
+        if apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq jq >/dev/null 2>&1; then
+            print_ok "Installed jq"
+        else
+            print_fail "Failed to install jq. Install it manually: apt-get install jq"
+            exit 1
+        fi
+    fi
+
+    # Detect server IP
+    SERVER_IP=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || curl -4 -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
+    if [[ -n "$SERVER_IP" ]]; then
+        print_ok "Server IP: ${SERVER_IP}"
+    else
+        print_warn "Could not detect server IP"
+        SERVER_IP=$(prompt_input "Enter server IP manually" "")
+        if [[ -z "$SERVER_IP" ]]; then
+            print_fail "Server IP is required."
+            exit 1
+        fi
+    fi
+
+    # Show current tunnels
+    echo ""
+    print_info "Current tunnels:"
+    echo ""
+    dnsgb tunnel list 2>/dev/null || print_info "(none)"
+    echo ""
+
+    # 1. Detect Xray panel
+    print_info "Detecting Xray panel..."
+    detect_xray_panel
+
+    if [[ "$XRAY_PANEL_TYPE" == "none" ]]; then
+        echo ""
+        print_warn "No Xray installation detected on this server."
+        echo ""
+        echo -e "  ${BOLD}How would you like to set up Xray?${NC}"
+        echo -e "  ${BOLD}1)${NC}  Full panel (3x-ui)   ${DIM}— web dashboard, user management, traffic stats${NC}"
+        echo -e "  ${BOLD}2)${NC}  Headless (Xray only) ${DIM}— no web panel, lightweight, config-based${NC}"
+        echo -e "  ${BOLD}0)${NC}  Cancel"
+        echo ""
+        local install_choice
+        install_choice=$(prompt_input "Select (0-2)" "1")
+
+        case "$install_choice" in
+            1)
+                # Full panel install
+                echo ""
+                echo -e "  ${BOLD}3x-ui Panel Setup${NC}"
+                echo -e "  ${DIM}Choose admin credentials and panel port.${NC}"
+                echo ""
+                local new_user new_pass new_port
+                new_user=$(prompt_input "Panel admin username" "admin")
+                echo ""
+                new_pass=$(prompt_input "Panel admin password" "password")
+                echo ""
+                new_port=$(prompt_input "Panel web port" "2053")
+                if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [[ "$new_port" -lt 1 ]] || [[ "$new_port" -gt 65535 ]]; then
+                    new_port=2053
+                fi
+                echo ""
+
+                install_3xui "$new_user" "$new_pass" "$new_port" || return 1
+
+                # Use ACTUAL values (may differ from requested if sqlite3 failed)
+                XRAY_PANEL_TYPE="3xui"
+                XRAY_PANEL_PORT="${INSTALL_3XUI_ACTUAL_PORT}"
+                XRAY_PANEL_RUNNING=true
+                XRAY_ADMIN_USER="${INSTALL_3XUI_ACTUAL_USER}"
+                XRAY_ADMIN_PASS="${INSTALL_3XUI_ACTUAL_PASS}"
+
+                echo ""
+                echo -e "  ${BOLD}Panel Access${NC}"
+                echo -e "  ${DIM}────────────────────────────────────────${NC}"
+                echo -e "  URL:       ${GREEN}http://${SERVER_IP}:${XRAY_PANEL_PORT}${NC}"
+                echo -e "  Username:  ${GREEN}${XRAY_ADMIN_USER}${NC}"
+                echo -e "  Password:  ${GREEN}${XRAY_ADMIN_PASS}${NC}"
+                echo ""
+                ;;
+            2)
+                # Headless install
+                echo ""
+                install_xray_headless || return 1
+                XRAY_PANEL_TYPE="headless"
+                XRAY_PANEL_RUNNING=true
+                echo ""
+                ;;
+            0|*)
+                echo ""
+                print_info "Cancelled."
+                return 0
+                ;;
+        esac
+    else
+        local _detect_msg="Detected: 3x-ui (port ${XRAY_PANEL_PORT})"
+        [[ -n "${XRAY_PANEL_BASEPATH:-}" ]] && _detect_msg+=", base path: /${XRAY_PANEL_BASEPATH}"
+        print_ok "$_detect_msg"
+    fi
+
+    # 2. Get panel credentials (skip for headless — no panel API needed)
+    if [[ "$XRAY_PANEL_TYPE" == "3xui" && -z "${XRAY_ADMIN_USER:-}" ]]; then
+        get_3xui_credentials || return 1
+    fi
+
+    # 3. Choose protocol
+    pick_xray_protocol || return 1
+
+    # 4. Pick port for internal inbound
+    pick_xray_port || return 1
+
+    # 5. Get domain
+    echo ""
+    echo -e "  ${BOLD}Domain Configuration${NC}"
+    echo -e "  ${DIM}The Xray tunnel will use subdomain: x.<your-domain>${NC}"
+    echo ""
+
+    # Try to detect domain from existing tunnels
+    local detected_domain=""
+    detected_domain=$(dnsgb tunnel list 2>/dev/null | grep -o 'domain=[^ ]*' | head -1 | sed 's/domain=//' | sed 's/^[^.]*\.//' || true)
+
+    if [[ -n "$detected_domain" ]]; then
+        DOMAIN=$(prompt_input "Domain" "$detected_domain")
+    else
+        DOMAIN=$(prompt_input "Enter your domain (e.g. example.com)" "")
+    fi
+
+    if [[ -z "$DOMAIN" ]]; then
+        print_fail "Domain is required."
+        return 1
+    fi
+    print_ok "Tunnel domain: x.${DOMAIN}"
+
+    # Check if x.DOMAIN tunnel already exists (prevent duplicates)
+    if dnsgb tunnel list 2>/dev/null | grep -q "domain=x\.${DOMAIN}"; then
+        print_fail "A tunnel for x.${DOMAIN} already exists."
+        print_info "Remove it first with: sudo bash $0 --remove-tunnel"
+        return 1
+    fi
+
+    # 6. Create Xray inbound
+    echo ""
+    if [[ "$XRAY_PANEL_TYPE" == "headless" ]]; then
+        create_headless_xray_inbound || return 1
+    else
+        create_3xui_inbound || return 1
+    fi
+
+    # 7. Create DNSTT tunnel via dnsgb
+    echo ""
+
+    # Determine tag — check existing xray tags and increment (exact match)
+    local xray_num=1
+    while dnsgb_tag_exists "xray${xray_num}"; do
+        xray_num=$((xray_num + 1))
+    done
+    local tag="xray${xray_num}"
+
+    print_info "Creating DNSTT tunnel: ${tag} (x.${DOMAIN})..."
+    local mtu_flag=""
+    if [[ -n "${DNSTT_MTU:-}" ]]; then
+        mtu_flag="--mtu ${DNSTT_MTU}"
+    fi
+    # shellcheck disable=SC2086
+    local create_output
+    create_output=$(dnsgb tunnel add --transport dnstt --backend socks --domain "x.${DOMAIN}" --tag "$tag" $mtu_flag 2>&1) || true
+    echo "$create_output"
+
+    if ! dnsgb_tag_exists "${tag}"; then
+        print_fail "Tunnel creation failed."
+        if [[ "$XRAY_PANEL_TYPE" == "headless" ]]; then
+            print_info "Note: Xray inbound on port ${XRAY_INBOUND_PORT} was added to config.json but the tunnel failed."
+            print_info "Remove it manually: edit /usr/local/etc/xray/config.json"
+        else
+            print_info "Note: Xray inbound on port ${XRAY_INBOUND_PORT} was created in 3x-ui but the tunnel failed."
+            print_info "Remove it manually from the panel dashboard if needed."
+        fi
+        return 1
+    fi
+    print_ok "Created tunnel: ${tag}"
+
+    # 8. Override upstream to point at Xray instead of microsocks
+    echo ""
+    print_info "Redirecting tunnel upstream to Xray..."
+    if ! create_xray_service_override "$tag" "$XRAY_INBOUND_PORT" "x.${DOMAIN}"; then
+        # Rollback: remove the tunnel we just created
+        print_warn "Service override failed. Rolling back tunnel..."
+        dnsgb tunnel stop --tag "$tag" 2>/dev/null || true
+        dnsgb tunnel remove --tag "$tag" 2>/dev/null || true
+        if [[ "$XRAY_PANEL_TYPE" == "headless" ]]; then
+            print_info "Note: Xray inbound on port ${XRAY_INBOUND_PORT} was added to config.json but not cleaned up."
+            print_info "Remove it manually: edit /usr/local/etc/xray/config.json"
+        else
+            print_info "Note: Xray inbound on port ${XRAY_INBOUND_PORT} was NOT removed from 3x-ui panel."
+            print_info "Remove it manually from the panel dashboard if needed."
+        fi
+        return 1
+    fi
+
+    # 9. Reload and start
+    if ! systemctl daemon-reload 2>/dev/null; then
+        print_warn "systemctl daemon-reload failed — continuing anyway"
+    fi
+    print_info "Starting tunnel: ${tag}..."
+    # Use restart (not start) to ensure the service override takes effect
+    # If the tunnel was auto-started by dnsgb, 'start' would be a no-op
+    if systemctl restart "dnsgb-${tag}.service" 2>/dev/null; then
+        print_ok "Started: ${tag}"
+    elif dnsgb tunnel start --tag "$tag" 2>/dev/null; then
+        print_ok "Started: ${tag}"
+    else
+        print_warn "Could not start tunnel. Check: dnsgb tunnel logs --tag ${tag}"
+    fi
+
+    print_info "Restarting DNS Router..."
+    dnsgb router stop 2>/dev/null || true
+    sleep 1
+    if dnsgb router start 2>/dev/null; then
+        print_ok "DNS Router restarted"
+    else
+        print_warn "DNS Router restart may have issues. Check: dnsgb router logs"
+    fi
+
+    # 10. Save config
+    save_xray_config "$tag" || print_warn "Could not save Xray config (tunnel is running but config not persisted)"
+
+    # 11. Show DNSTT public key
+    local pubkey=""
+    if [[ -f "/etc/dnsgb/tunnels/${tag}/server.pub" ]]; then
+        pubkey=$(cat "/etc/dnsgb/tunnels/${tag}/server.pub" 2>/dev/null || true)
+    fi
+
+    # 12. Summary
+    echo ""
+    echo ""
+    echo -e "  ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${GREEN}${BOLD}  XRAY BACKEND TUNNEL CREATED  ${NC}"
+    echo -e "  ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  ${BOLD}Server Info${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Server IP :  ${GREEN}${SERVER_IP}${NC}"
+    echo -e "  Domain    :  ${GREEN}x.${DOMAIN}${NC}"
+    echo -e "  Tag       :  ${GREEN}${tag}${NC}"
+    echo ""
+    echo -e "  ${BOLD}Xray Inbound${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Protocol  :  ${GREEN}${XRAY_PROTOCOL}${NC}"
+    echo -e "  Port      :  ${GREEN}${XRAY_INBOUND_PORT}${NC} ${DIM}(127.0.0.1 only)${NC}"
+    if [[ -n "$XRAY_UUID" ]]; then
+        echo -e "  UUID      :  ${GREEN}${XRAY_UUID}${NC}"
+    fi
+    if [[ -n "$XRAY_PASSWORD" ]]; then
+        echo -e "  Password  :  ${GREEN}${XRAY_PASSWORD}${NC}"
+    fi
+    echo ""
+
+    if [[ -n "$pubkey" ]]; then
+        echo -e "  ${BOLD}DNSTT Public Key${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}${pubkey}${NC}"
+        echo ""
+    fi
+
+    # Generate client URI
+    local credential
+    if [[ -n "$XRAY_UUID" ]]; then
+        credential="$XRAY_UUID"
+    else
+        credential="$XRAY_PASSWORD"
+    fi
+    # Use 127.0.0.1 as address — client connects through DNSTT tunnel (SlipNet),
+    # so traffic exits on the server side where Xray listens on localhost only
+    local client_uri
+    client_uri=$(generate_xray_client_uri "$XRAY_PROTOCOL" "127.0.0.1" "$XRAY_INBOUND_PORT" "$credential" "DNSTT-${XRAY_PROTOCOL}")
+
+    echo -e "  ${BOLD}Client URI (for Nekobox)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  ${GREEN}${client_uri}${NC}"
+    echo ""
+
+    # Generate slipnet:// URL for this tunnel (include SOCKS auth if configured)
+    if [[ -n "$pubkey" ]]; then
+        local s_user="" s_pass=""
+        detect_socks_auth 2>/dev/null || true
+        if [[ "${SOCKS_AUTH:-}" == true ]]; then
+            s_user="${SOCKS_USER:-}"
+            s_pass="${SOCKS_PASS:-}"
+        fi
+        local slipnet_url
+        slipnet_url=$(generate_slipnet_url "dnstt" "x" "$pubkey" "" "" "$s_user" "$s_pass")
+        echo -e "  ${BOLD}SlipNet URL (for DNSTT tunnel)${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}${slipnet_url}${NC}"
+        echo ""
+    fi
+
+    echo -e "  ${BOLD}Required DNS Record (Cloudflare)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Type: ${YELLOW}NS${NC}  │  Name: ${YELLOW}x${NC}  │  Value: ${YELLOW}ns.${DOMAIN}${NC}"
+    echo -e "  ${DIM}Proxy: OFF (grey cloud)${NC}"
+    echo ""
+
+    echo -e "  ${BOLD}Client Setup (Nekobox + SlipNet)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  ${DIM}1. Import SlipNet URL above into SlipNet app${NC}"
+    echo -e "  ${DIM}2. Enable 'Proxy Only Mode' in SlipNet (SOCKS on 127.0.0.1:1080)${NC}"
+    echo -e "  ${DIM}3. In Nekobox, add new proxy using the Client URI above${NC}"
+    echo -e "  ${DIM}4. In Nekobox, chain it through SlipNet's SOCKS proxy${NC}"
+    echo -e "  ${DIM}5. Enable 'UDP over TCP' in both configs${NC}"
+    echo -e "  ${DIM}6. Bypass SlipNet from Nekobox routing to avoid loops${NC}"
+    echo ""
+    echo -e "  ${DIM}Management: sudo bash $0 --manage${NC}"
+    echo -e "  ${DIM}Status:     sudo bash $0 --status${NC}"
+    echo ""
+}
+
+# ─── --manage ────────────────────────────────────────────────────────────────────
+
+do_manage() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "  ${CROSS} Not running as root. Please run with: sudo bash $0 --manage"
+        exit 1
+    fi
+
+    if ! command -v dnsgb &>/dev/null; then
+        print_fail "dnsgb is not installed. Run the full setup first: sudo bash $0"
+        exit 1
+    fi
+
+    # Trap SIGINT in the parent so Ctrl+C only kills the subshell,
+    # not the entire manage menu. Restore default trap on exit.
+    trap '' INT
+
+    while true; do
+        banner
+        print_header "Management Menu"
+        echo ""
+
+        echo -e "  ${BOLD}1)${NC}  Show status          ${DIM}(tunnels, credentials, share URLs)${NC}"
+        echo -e "  ${BOLD}2)${NC}  Add tunnel            ${DIM}(single tunnel — pick transport & backend)${NC}"
+        echo -e "  ${BOLD}3)${NC}  Remove tunnel         ${DIM}(pick one to remove)${NC}"
+        echo -e "  ${BOLD}4)${NC}  Add backup domain     ${DIM}(new domain → 4 more tunnels)${NC}"
+        echo -e "  ${BOLD}5)${NC}  Manage SSH users      ${DIM}(add, list, update, delete)${NC}"
+        echo -e "  ${BOLD}6)${NC}  Configure SOCKS auth  ${DIM}(enable, disable, or change credentials)${NC}"
+        echo -e "  ${BOLD}7)${NC}  Apply hardening       ${DIM}(systemd security for all services)${NC}"
+        echo -e "  ${BOLD}8)${NC}  Xray backend          ${DIM}(connect 3x-ui panel via DNS tunnel)${NC}"
+        echo -e "  ${BOLD}9)${NC}  Change DNSTT MTU      ${DIM}(change MTU on existing DNSTT tunnels)${NC}"
+        echo ""
+        echo -e "  ${DIM}──────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}10)${NC} Update script         ${DIM}(check for new versions)${NC}"
+        echo -e "  ${BOLD}11)${NC} Cleanup & recover     ${DIM}(emergency disk cleanup, log suppression)${NC}"
+        echo -e "  ${BOLD}${RED}12)${NC} ${RED}Uninstall everything${NC}"
+        echo ""
+        echo -e "  ${BOLD}0)${NC}  Exit"
+        echo ""
+
+        local choice=""
+        read -rp "  Select [0-12]: " choice || break
+
+        case "$choice" in
+            1)
+                ( trap - INT; do_status )  || true
+                ;;
+            2)
+                ( trap - INT; do_add_tunnel ) || true
+                ;;
+            3)
+                ( trap - INT; do_remove_tunnel "" ) || true
+                ;;
+            4)
+                ( trap - INT; do_add_domain ) || true
+                ;;
+            5)
+                ( trap - INT; do_manage_users ) || true
+                ;;
+            6)
+                ( trap - INT; do_configure_socks_auth ) || true
+                ;;
+            7)
+                ( trap - INT; do_harden ) || true
+                ;;
+            8)
+                ( trap - INT; do_add_xray ) || true
+                ;;
+            9)
+                ( trap - INT; do_change_mtu ) || true
+                ;;
+            10)
+                ( trap - INT; do_update ) || true
+                # If update wrote the re-exec marker, restart with new version
+                if [[ -f /tmp/.dnsgb-update-reexec ]]; then
+                    local reexec_path
+                    reexec_path=$(cat /tmp/.dnsgb-update-reexec)
+                    rm -f /tmp/.dnsgb-update-reexec
+                    exec bash "$reexec_path" --manage
+                fi
+                ;;
+            11)
+                ( trap - INT; do_cleanup ) || true
+                ;;
+            12)
+                ( trap - INT; do_uninstall ) || true
+                # If uninstall succeeded, dnsgb is gone — exit menu
+                hash -d dnsgb 2>/dev/null || true
+                if ! command -v dnsgb &>/dev/null; then
+                    echo ""
+                    print_info "dnsgb has been uninstalled. Exiting menu."
+                    break
+                fi
+                ;;
+            0|q|Q)
+                echo ""
+                break
+                ;;
+            "")
+                # Just Enter — redraw menu
+                continue
+                ;;
+            *)
+                print_warn "Invalid choice. Enter 0-12."
+                sleep 1
+                continue
+                ;;
+        esac
+
+        # Pause so user can read output before menu redraws
+        echo ""
+        echo -e "  ${DIM}Press Enter to return to menu...${NC}"
+        read -r || break
+    done
+
+    # Restore default SIGINT handling
+    trap - INT
+}
+
+# ─── Global Variables (must be set before arg parser since --status/--manage use them) ───
+
+DOMAIN=""
+SERVER_IP=""
+DNSTT_PUBKEY=""
+NOIZDNS_PUBKEY=""
+VAYDNS_PUBKEY=""
+SSH_USER=""
+SSH_PASS=""
+SOCKS_USER=""
+SOCKS_PASS=""
+SOCKS_AUTH=false
+TUNNELS_CHANGED=false
+
+# ─── Variables (populated during setup) ─────────────────────────────────────────
+
+SSH_SETUP_DONE=false
+
+# ─── STEP 1: Pre-flight Checks ─────────────────────────────────────────────────
+
+step_preflight() {
+    print_step 1 "Pre-flight Checks"
+
+    # Check root
+    if [[ $EUID -eq 0 ]]; then
+        print_ok "Running as root"
+    else
+        print_fail "Not running as root. Please run with: sudo bash $0"
+        exit 1
+    fi
+
+    # Back up resolv.conf so we can always recover DNS
+    if [[ -f /etc/resolv.conf ]] && [[ ! -f /etc/resolv.conf.dnsgb-backup ]]; then
+        cp -f /etc/resolv.conf /etc/resolv.conf.dnsgb-backup 2>/dev/null || true
+    fi
+
+    # Check OS (read in subshell to avoid overwriting script's VERSION variable)
+    if [[ -f /etc/os-release ]]; then
+        local os_id os_name
+        os_id=$(. /etc/os-release && echo "${ID:-}")
+        os_name=$(. /etc/os-release && echo "${PRETTY_NAME:-$os_id}")
+        if [[ "$os_id" == "ubuntu" || "$os_id" == "debian" ]]; then
+            print_ok "OS: ${os_name}"
+        else
+            print_warn "OS: ${os_name} (not Ubuntu/Debian - may work but untested)"
+        fi
+    else
+        print_warn "Cannot detect OS (missing /etc/os-release)"
+    fi
+
+    # Check curl
+    if command -v curl &>/dev/null; then
+        print_ok "curl is installed"
+    else
+        print_fail "curl is not installed"
+        echo ""
+        if prompt_yn "Install curl now?" "y"; then
+            if apt-get update -qq && apt-get install -y -qq curl; then
+                print_ok "curl installed"
+            else
+                print_fail "Failed to install curl. Check your network/repos."
+                exit 1
+            fi
+        else
+            echo ""
+            print_fail "curl is required. Please install it and re-run."
+            exit 1
+        fi
+    fi
+
+    # Ensure DNS resolution works (may be broken after previous uninstall)
+    if ! curl -4 -s --max-time 3 https://api.ipify.org >/dev/null 2>&1; then
+        if grep -q '127\.0\.0\.53' /etc/resolv.conf 2>/dev/null; then
+            # systemd-resolved stub is dead — replace with public DNS
+            print_warn "DNS broken (stub listener dead) — fixing resolv.conf"
+            chattr -i /etc/resolv.conf 2>/dev/null || true
+            cat > /etc/resolv.conf <<'DNSEOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+DNSEOF
+        fi
+    fi
+
+    # Detect server IP
+    SERVER_IP=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || curl -4 -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
+    if [[ -n "$SERVER_IP" ]]; then
+        print_ok "Server IP: ${SERVER_IP}"
+    else
+        print_warn "Could not auto-detect server IP"
+        SERVER_IP=$(prompt_input "Enter your server's public IP")
+        if [[ -z "$SERVER_IP" ]]; then
+            print_fail "Server IP is required."
+            exit 1
+        fi
+    fi
+
+    echo ""
+    print_ok "All pre-flight checks passed"
+}
+
+# ─── STEP 2: Ask Domain ────────────────────────────────────────────────────────
+
+step_ask_domain() {
+    print_step 2 "Domain Configuration"
+
+    while true; do
+        DOMAIN=$(prompt_input "Enter your domain (e.g. example.com)")
+        # Strip whitespace, http(s)://, trailing slashes
+        DOMAIN=$(echo "$DOMAIN" | sed 's|^[[:space:]]*||;s|[[:space:]]*$||;s|^https\?://||;s|/.*$||')
+        if [[ -z "$DOMAIN" ]]; then
+            print_fail "Domain cannot be empty. Please try again."
+        elif [[ ! "$DOMAIN" =~ \. ]]; then
+            print_fail "Invalid domain (must contain a dot). Please try again."
+        elif [[ "$DOMAIN" =~ \.\. ]]; then
+            print_fail "Invalid domain (consecutive dots not allowed). Please try again."
+        elif [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+            print_fail "Invalid domain (use only letters, numbers, dots, hyphens). Please try again."
+        else
+            break
+        fi
+    done
+
+    echo ""
+    print_ok "Using domain: ${BOLD}${DOMAIN}${NC}"
+}
+
+# ─── Cloudflare API: Auto-create DNS records ────────────────────────────────────
+
+# Create all required DNS records via Cloudflare API.
+# Args: $1=API token, $2=domain, $3=server IP
+cloudflare_create_dns_records() {
+    local api_token="$1"
+    local domain="$2"
+    local server_ip="$3"
+    local cf_api="https://api.cloudflare.com/client/v4"
+
+    # Ensure jq is installed (needed for JSON parsing)
+    if ! command -v jq &>/dev/null; then
+        print_info "Installing jq (needed for Cloudflare API)..."
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y -qq jq >/dev/null 2>&1 || true
+        if ! command -v jq &>/dev/null; then
+            print_fail "Could not install jq. Install manually: apt-get install jq"
+            return 1
+        fi
+    fi
+
+    # Step 1: Get Zone ID
+    print_info "Looking up Cloudflare Zone ID for ${domain}..."
+    local zone_resp
+    zone_resp=$(curl -s -X GET "${cf_api}/zones?name=${domain}" \
+        -H "Authorization: Bearer ${api_token}" \
+        -H "Content-Type: application/json" --max-time 15 2>/dev/null || true)
+
+    if [[ -z "$zone_resp" ]]; then
+        print_fail "Could not connect to Cloudflare API"
+        return 1
+    fi
+
+    local zone_id
+    zone_id=$(echo "$zone_resp" | jq -r '.result[0].id // empty' 2>/dev/null || true)
+    if [[ -z "$zone_id" ]]; then
+        local cf_err
+        cf_err=$(echo "$zone_resp" | jq -r '.errors[0].message // "Unknown error"' 2>/dev/null || echo "Invalid response")
+        print_fail "Could not find zone for ${domain}: ${cf_err}"
+        print_info "Make sure the domain is added to your Cloudflare account and the API token has Zone:Read permission"
+        return 1
+    fi
+    print_ok "Zone ID: ${zone_id}"
+
+    # Helper: create or skip a DNS record
+    local created=0 skipped=0 failed=0
+    _cf_create_record() {
+        local rtype="$1" rname="$2" rcontent="$3" proxied="${4:-false}"
+        local full_name="${rname}.${domain}"
+
+        # Check if record already exists
+        local existing
+        existing=$(curl -s -X GET "${cf_api}/zones/${zone_id}/dns_records?name=${full_name}&type=${rtype}" \
+            -H "Authorization: Bearer ${api_token}" \
+            -H "Content-Type: application/json" --max-time 10 2>/dev/null || true)
+        local count
+        count=$(echo "$existing" | jq '.result | length' 2>/dev/null || echo "0")
+
+        if [[ "$count" -gt 0 ]]; then
+            echo -e "  ${DIM}[skip]${NC} ${rtype} ${rname} — already exists"
+            skipped=$((skipped + 1))
+            return 0
+        fi
+
+        # Create the record
+        local payload
+        if [[ "$rtype" == "A" ]]; then
+            payload=$(jq -n --arg t "$rtype" --arg n "$full_name" --arg c "$rcontent" --argjson p "$proxied" \
+                '{type: $t, name: $n, content: $c, ttl: 3600, proxied: $p}')
+        else
+            payload=$(jq -n --arg t "$rtype" --arg n "$full_name" --arg c "$rcontent" \
+                '{type: $t, name: $n, content: $c, ttl: 3600}')
+        fi
+
+        local create_resp
+        create_resp=$(curl -s -X POST "${cf_api}/zones/${zone_id}/dns_records" \
+            -H "Authorization: Bearer ${api_token}" \
+            -H "Content-Type: application/json" \
+            -d "$payload" --max-time 10 2>/dev/null || true)
+
+        local success
+        success=$(echo "$create_resp" | jq -r '.success // false' 2>/dev/null || echo "false")
+        if [[ "$success" == "true" ]]; then
+            echo -e "  ${GREEN}[created]${NC} ${rtype} ${rname} → ${rcontent}"
+            created=$((created + 1))
+        else
+            local err_msg
+            err_msg=$(echo "$create_resp" | jq -r '.errors[0].message // "Unknown error"' 2>/dev/null || echo "API error")
+            echo -e "  ${RED}[failed]${NC} ${rtype} ${rname}: ${err_msg}"
+            failed=$((failed + 1))
+        fi
+    }
+
+    # Step 2: Create A record
+    echo ""
+    print_info "Creating DNS records..."
+    echo ""
+    _cf_create_record "A" "ns" "$server_ip" "false"
+
+    # Step 3: Create NS records
+    local ns_target="ns.${domain}"
+    local subdomains=("t" "d" "n" "v" "s" "ds" "z" "vz")
+    for sub in "${subdomains[@]}"; do
+        _cf_create_record "NS" "$sub" "$ns_target"
+    done
+
+    echo ""
+    print_ok "Done: ${created} created, ${skipped} skipped, ${failed} failed"
+
+    if [[ $failed -gt 0 ]]; then
+        print_warn "Some records failed — check your Cloudflare dashboard"
+        return 1
+    fi
+    return 0
+}
+
+# ─── STEP 3: Show DNS Records ──────────────────────────────────────────────────
+
+step_dns_records() {
+    print_step 3 "DNS Records (Cloudflare)"
+
+    echo ""
+    echo -e "  ${BOLD}How do you want to set up DNS records?${NC}"
+    echo ""
+    echo -e "  ${BOLD}1)${NC}  Automatic (Cloudflare API)  ${DIM}— enter API token, records created for you${NC}"
+    echo -e "  ${BOLD}2)${NC}  Manual                      ${DIM}— create records yourself in Cloudflare dashboard${NC}"
+    echo ""
+    local dns_choice
+    dns_choice=$(prompt_input "Select (1-2)" "1")
+
+    if [[ "$dns_choice" == "1" ]]; then
+        # Automatic via Cloudflare API
+        echo ""
+        echo -e "  ${BOLD}${YELLOW}How to get a Cloudflare API Token:${NC}"
+        echo ""
+        echo -e "  ${BOLD}1.${NC} Go to: ${GREEN}https://dash.cloudflare.com/profile/api-tokens${NC}"
+        echo -e "  ${BOLD}2.${NC} Click ${BOLD}Create Token${NC}"
+        echo -e "  ${BOLD}3.${NC} Select the ${BOLD}Edit zone DNS${NC} template"
+        echo -e "  ${BOLD}4.${NC} Under ${BOLD}Zone Resources${NC}, select your domain (or All Zones)"
+        echo -e "  ${BOLD}5.${NC} Click ${BOLD}Continue to summary${NC} → ${BOLD}Create Token${NC}"
+        echo -e "  ${BOLD}6.${NC} Copy the token (you'll only see it once!)"
+        echo ""
+        echo -e "  ${DIM}Required permissions: Zone:DNS:Edit + Zone:Zone:Read${NC}"
+        echo -e "  ${DIM}The 'Edit zone DNS' template includes both automatically${NC}"
+        echo ""
+
+        local cf_token
+        cf_token=$(prompt_input "Paste your Cloudflare API Token here")
+        cf_token=$(echo "$cf_token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+        if [[ -z "$cf_token" ]]; then
+            print_fail "API token cannot be empty"
+            exit 1
+        fi
+
+        # Ensure jq is installed (needed for API JSON parsing)
+        if ! command -v jq &>/dev/null; then
+            print_info "Installing jq (needed for Cloudflare API)..."
+            apt-get update -qq >/dev/null 2>&1 || true
+            apt-get install -y -qq jq >/dev/null 2>&1 || true
+            if ! command -v jq &>/dev/null; then
+                print_fail "Could not install jq. Install manually: apt-get install jq"
+                exit 1
+            fi
+        fi
+
+        # Validate token
+        # Try /user/tokens/verify first (standard tokens), then fall back to
+        # /accounts (account-scoped tokens like cfat_*) which works universally.
+        print_info "Validating API token..."
+        local verify_resp token_status token_valid=false
+        verify_resp=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+            -H "Authorization: Bearer ${cf_token}" \
+            -H "Content-Type: application/json" --max-time 10 2>/dev/null || true)
+        token_status=$(echo "$verify_resp" | jq -r '.result.status // empty' 2>/dev/null || true)
+        if [[ "$token_status" == "active" ]]; then
+            token_valid=true
+        else
+            # Fall back: account-scoped tokens don't work with /user/tokens/verify.
+            # Check /accounts — a successful response confirms the token is valid.
+            local accounts_resp accounts_success
+            accounts_resp=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts?per_page=1" \
+                -H "Authorization: Bearer ${cf_token}" \
+                -H "Content-Type: application/json" --max-time 10 2>/dev/null || true)
+            accounts_success=$(echo "$accounts_resp" | jq -r '.success // empty' 2>/dev/null || true)
+            if [[ "$accounts_success" == "true" ]]; then
+                token_valid=true
+            fi
+        fi
+
+        if [[ "$token_valid" != "true" ]]; then
+            print_fail "API token is invalid or expired"
+            print_info "Check your token at: https://dash.cloudflare.com/profile/api-tokens"
+            exit 1
+        fi
+        print_ok "API token is valid"
+
+        # Create DNS records
+        if cloudflare_create_dns_records "$cf_token" "$DOMAIN" "$SERVER_IP"; then
+            print_ok "All DNS records created successfully"
+        else
+            echo ""
+            if ! prompt_yn "Some records failed. Continue anyway?" "n"; then
+                exit 1
+            fi
+        fi
+    else
+        # Manual setup
+        print_info "Create these DNS records in your Cloudflare dashboard:"
+        echo ""
+        print_box \
+            "Record 1:  Type: A   | Name: ns | Value: ${SERVER_IP}" \
+            "           Proxy: OFF (DNS Only - grey cloud)" \
+            "" \
+            "Record 2:  Type: NS  | Name: t   | Value: ns.${DOMAIN}" \
+            "Record 3:  Type: NS  | Name: d   | Value: ns.${DOMAIN}" \
+            "Record 4:  Type: NS  | Name: s   | Value: ns.${DOMAIN}" \
+            "Record 5:  Type: NS  | Name: ds  | Value: ns.${DOMAIN}" \
+            "Record 6:  Type: NS  | Name: n   | Value: ns.${DOMAIN}" \
+            "Record 7:  Type: NS  | Name: z   | Value: ns.${DOMAIN}" \
+            "Record 8:  Type: NS  | Name: v   | Value: ns.${DOMAIN}" \
+            "Record 9:  Type: NS  | Name: vz  | Value: ns.${DOMAIN}"
+
+        echo ""
+        print_warn "IMPORTANT: The A record MUST be DNS Only (grey cloud, NOT orange)"
+        print_warn "IMPORTANT: The A record name must be \"ns\" (not \"tns\")"
+        echo ""
+        echo "  Subdomain purposes:"
+        echo "    t   = Slipstream + SOCKS tunnel"
+        echo "    d   = DNSTT + SOCKS tunnel"
+        echo "    n   = NoizDNS + SOCKS tunnel (DPI-resistant)"
+        echo "    s   = Slipstream + SSH tunnel"
+        echo "    ds  = DNSTT + SSH tunnel"
+        echo "    z   = NoizDNS + SSH tunnel (DPI-resistant)"
+        echo "    v   = VayDNS + SOCKS tunnel (optimized)"
+        echo "    vz  = VayDNS + SSH tunnel (optimized)"
+        echo ""
+
+        if ! prompt_yn "Have you created these DNS records in Cloudflare?" "n"; then
+            echo ""
+            print_info "Please create the DNS records and re-run this script."
+            exit 0
+        fi
+    fi
+
+    echo ""
+    print_ok "DNS records confirmed"
+}
+
+# ─── STEP 4: Free Port 53 ──────────────────────────────────────────────────────
+
+step_free_port53() {
+    print_step 4 "Free Port 53"
+
+    local port53_output
+    port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
+
+    if [[ -z "$port53_output" ]]; then
+        print_ok "Port 53 is free"
+        return
+    fi
+
+    # dnsgb already on port 53 is fine (re-run scenario)
+    if echo "$port53_output" | grep -q "dnsgb"; then
+        print_ok "Port 53 is in use by dnsgb (already set up)"
+        return
+    fi
+
+    print_info "Something is using port 53:"
+    echo -e "  ${DIM}${port53_output}${NC}"
+    echo ""
+
+    if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
+        print_warn "systemd-resolved is occupying port 53"
+        echo ""
+        if prompt_yn "Configure systemd-resolved to disable only DNSStubListener?" "y"; then
+            # Safer than masking resolved entirely: keep DNS management, only free :53.
+            configure_systemd_resolved_no_stub || true
+            sleep 1
+            port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
+
+            # Fallback if stub is still present.
+            if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
+                print_warn "systemd-resolved still occupies port 53; stopping + disabling as fallback"
+                systemctl stop systemd-resolved.socket 2>/dev/null || true
+                systemctl stop systemd-resolved.service 2>/dev/null || true
+                systemctl disable systemd-resolved.service 2>/dev/null || true
+                ensure_resolv_conf_fallback
+                sleep 1
+            fi
+        else
+            print_fail "Port 53 must be free for DNS tunnels to work."
+            exit 1
+        fi
+    else
+        print_fail "An unknown service is using port 53."
+        print_info "Please stop it manually and re-run this script."
+        exit 1
+    fi
+
+    # Verify port is now free
+    port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
+    if [[ -z "$port53_output" ]]; then
+        print_ok "Port 53 is now free"
+    else
+        print_fail "Port 53 is still in use. Please investigate manually."
+        exit 1
+    fi
+}
+
+# ─── STEP 5: Install dnsgb ─────────────────────────────────────────────────────
+
+step_install_dnsgb() {
+    print_step 5 "Install dnsgb"
+
+    # Check if already installed
+    if command -v dnsgb &>/dev/null; then
+        local ver
+        ver=$(dnsgb --version 2>/dev/null || echo "unknown")
+        print_info "dnsgb is already installed (${ver})"
+        echo ""
+        if ! prompt_yn "Re-install / update dnsgb?" "n"; then
+            # Ensure router is in multi mode even if we skip install
+            local current_mode
+            current_mode=$(dnsgb router mode 2>/dev/null | awk '/[Mm]ode/{for(i=1;i<=NF;i++) if($i=="multi"||$i=="single") print $i}' | head -1 || true)
+            if [[ "$current_mode" != "multi" ]]; then
+                print_warn "Router mode is '${current_mode:-unknown}', switching to multi..."
+                if dnsgb router mode multi 2>/dev/null; then
+                    print_ok "Router mode switched to multi"
+                else
+                    print_fail "Failed to switch router mode to multi"
+                    exit 1
+                fi
+            else
+                print_ok "Router mode: multi"
+            fi
+            print_ok "Skipping dnsgb installation"
+            return
+        fi
+    fi
+
+    # Stop and remove ALL tunnels so they get fresh configs after re-install
+    print_info "Stopping dnsgb services..."
+    dnsgb router stop 2>/dev/null || true
+    # Remove all existing tunnels (they'll be recreated in Step 7 with correct ports)
+    local old_tags
+    old_tags=$(dnsgb_get_tags)
+    for tag in $old_tags; do
+        dnsgb tunnel stop --tag "$tag" 2>/dev/null || true
+        dnsgb tunnel remove --tag "$tag" 2>/dev/null || true
+    done
+    # Stop all dnsgb systemd units
+    local unit
+    for unit in $(systemctl list-units --type=service --no-legend 'dnsgb-*' 2>/dev/null | awk '{print $1}' || true); do
+        systemctl stop "$unit" 2>/dev/null || true
+    done
+    systemctl stop dnsgb-dnsrouter 2>/dev/null || true
+    systemctl stop microsocks 2>/dev/null || true
+    # Kill tunnel/router processes by exact name (NOT -f, to avoid killing this script)
+    # slipstream-server comm name is truncated to 15 chars: "slipstream-serv"
+    pkill -9 slipstream-serv 2>/dev/null || true
+    pkill -9 dnstt-server 2>/dev/null || true
+    pkill -9 microsocks 2>/dev/null || true
+    # dnsgb-dnsrouter comm name is truncated to 15 chars: "dnsgb-dnsroute"
+    pkill -9 dnsgb-dnsroute 2>/dev/null || true
+    # Kill the dnsgb binary itself (comm name = "dnsgb", won't match "bash dnsgb-setup.sh")
+    pkill -9 -x dnsgb 2>/dev/null || true
+    sleep 1
+    # Reset systemd failed state before removing binary to prevent start-limit-hit
+    for unit in $(systemctl list-units --all --type=service --no-legend 'dnsgb-*' 2>/dev/null | awk '{print $1}' || true); do
+        systemctl reset-failed "$unit" 2>/dev/null || true
+    done
+    systemctl reset-failed dnsgb-dnsrouter 2>/dev/null || true
+    rm -f /usr/local/bin/dnsgb
+
+    # Download binary
+    print_info "Downloading dnsgb..."
+    local arch
+    arch=$(detect_architecture)
+    if curl -fsSL -o /usr/local/bin/dnsgb "https://github.com/net2share/dnstm/releases/latest/download/dnstm-linux-${arch}"; then
+        chmod +x /usr/local/bin/dnsgb
+        print_ok "Downloaded dnsgb binary for ${arch}"
+    else
+        print_fail "Failed to download dnsgb for ${arch} architecture"
+        exit 1
+    fi
+
+    # ── GLIBC compatibility check ──────────────────────────────────────────
+    # The dnsgb binary requires GLIBC >= 2.34.  Older distros (Debian 11,
+    # Ubuntu 20.04) ship GLIBC 2.31 and will fail with a cryptic loader
+    # error.  Detect this early and give an actionable error message.
+    if ldd /usr/local/bin/dnsgb 2>&1 | grep -qi "not found"; then
+        echo ""
+        local sys_glibc
+        sys_glibc=$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+$' || echo "unknown")
+        print_fail "dnsgb binary is incompatible with this system"
+        echo ""
+        echo -e "  ${BOLD}Problem:${NC}  dnsgb requires GLIBC >= 2.34, but this system has GLIBC ${sys_glibc}"
+        echo ""
+        echo -e "  ${BOLD}Supported distributions:${NC}"
+        echo "    - Ubuntu 22.04 (Jammy) or newer"
+        echo "    - Debian 12 (Bookworm) or newer"
+        echo ""
+        echo -e "  ${BOLD}How to fix:${NC}"
+        echo "    Option 1: Upgrade your OS to a supported version"
+        echo "    Option 2: Re-deploy on a VPS with Ubuntu 22.04+ or Debian 12+"
+        echo ""
+        echo -e "  ${DIM}Technical details:${NC}"
+        ldd /usr/local/bin/dnsgb 2>&1 | grep -i "not found" | while IFS= read -r line; do
+            echo -e "    ${DIM}${line}${NC}"
+        done
+        echo ""
+        rm -f /usr/local/bin/dnsgb
+        exit 1
+    fi
+
+    # Save iptables state before dnsgb install (it may reset firewall rules)
+    local iptables_backup="/tmp/iptables-backup-$$"
+    iptables-save > "$iptables_backup" 2>/dev/null || true
+
+    # Install in multi mode (use --force on re-install)
+    print_info "Running dnsgb install --mode multi ..."
+    echo ""
+    local install_ok=false
+    local install_stderr
+    install_stderr=$(mktemp /tmp/dnsgb-install-err-XXXXXX 2>/dev/null || echo "/tmp/dnsgb-install-err-$$")
+    if dnsgb install --mode multi --force 2> >(tee "$install_stderr" >&2); then
+        echo ""
+        install_ok=true
+        print_ok "dnsgb installed successfully"
+        TUNNELS_CHANGED=true
+    else
+        echo ""
+        print_fail "dnsgb install failed"
+        # Show captured stderr for diagnostics
+        if [[ -s "$install_stderr" ]]; then
+            echo ""
+            print_info "Error details:"
+            head -20 "$install_stderr" | while IFS= read -r line; do
+                echo -e "    ${DIM}${line}${NC}"
+            done
+        fi
+    fi
+    rm -f "$install_stderr"
+
+    # Restore original firewall rules (dnsgb install may have reset them)
+    if [[ -s "$iptables_backup" ]]; then
+        iptables-restore < "$iptables_backup" 2>/dev/null || true
+    else
+        # Do not force permissive policies if we don't have a valid snapshot.
+        print_warn "No iptables snapshot found; leaving existing firewall policy unchanged"
+    fi
+    rm -f "$iptables_backup"
+
+    if [[ "$install_ok" != "true" ]]; then
+        exit 1
+    fi
+
+    # Verify
+    local ver
+    ver=$(dnsgb --version 2>/dev/null || echo "unknown")
+    print_ok "dnsgb version: ${ver}"
+
+    echo ""
+    print_info "dnsgb install sets up:"
+    echo "    - Tunnel binaries (slipstream-server, dnstt-server, microsocks)"
+    echo "    - System user (dnsgb)"
+    echo "    - Firewall rules (port 53)"
+    echo "    - DNS Router service"
+    echo "    - microsocks SOCKS5 proxy"
+
+    # Proactive GLIBC check — compile microsocks from source now if needed,
+    # so it's ready by the time step 9 verifies the proxy.
+    if ! microsocks_binary_works; then
+        echo ""
+        print_warn "microsocks binary incompatible with this system — compiling from source..."
+        compile_microsocks_from_source || print_warn "microsocks compilation failed — will retry in step 9"
+    fi
+
+    # Download NoizDNS server binary (DPI-resistant DNSTT fork)
+    echo ""
+    ensure_noizdns_binary || true
+
+    # Skip downloading vaydns-server if dnsgb v0.7.0+ has native support
+    # (dnsgb downloads/manages its own binary in that case)
+    if ! dnsgb_supports_vaydns; then
+        echo ""
+        ensure_vaydns_binary || true
+    fi
+
+cat >/usr/local/bin/dnsgb-edns-proxy.py <<'EOF_PY'
+#!/usr/bin/env python3
+import socket, struct, concurrent.futures, sys
+if len(sys.argv) < 7:
+    print("Usage: proxy.py listen_host listen_port upstream_host upstream_port ext_mtu int_mtu")
+    sys.exit(1)
+
+LISTEN_HOST = sys.argv[1]
+LISTEN_PORT = int(sys.argv[2])
+UPSTREAM_HOST = sys.argv[3]
+UPSTREAM_PORT = int(sys.argv[4])
+EXTERNAL_EDNS_SIZE = int(sys.argv[5])
+INTERNAL_EDNS_SIZE = int(sys.argv[6])
+
+def extract_and_patch_edns(data: bytes, new_size: int):
+    if len(data) < 12: return data, None
+    try:
+        qdcount, ancount, nscount, arcount = struct.unpack("!HHHH", data[4:12])
+    except struct.error:
+        return data, None
+
+    offset = 12
+
+    def skip_name(buf, off):
+        while True:
+            if off >= len(buf): return len(buf)
+            l = buf[off]; off += 1
+            if l == 0: break
+            if l & 0xC0 == 0xC0:
+                if off >= len(buf): return len(buf)
+                off += 1
+                break
+            off += l
+        return off
+
+    for _ in range(qdcount):
+        offset = skip_name(data, offset)
+        if offset + 4 > len(data): return data, None
+        offset += 4
+
+    def skip_rrs(count, buf, off):
+        for _ in range(count):
+            off = skip_name(buf, off)
+            if off + 10 > len(buf): return len(buf)
+            rtype, rclass, ttl, rdlen = struct.unpack("!HHIH", buf[off:off+10])
+            off += 10
+            if off + rdlen > len(buf): return len(buf)
+            off += rdlen
+        return off
+
+    offset = skip_rrs(ancount, data, offset)
+    offset = skip_rrs(nscount, data, offset)
+
+    new_data = bytearray(data)
+    for _ in range(arcount):
+        offset = skip_name(data, offset)
+        if offset + 10 > len(data): return data, None
+        rtype = struct.unpack("!H", data[offset:offset+2])[0]
+        if rtype == 41:
+            orig_size = struct.unpack("!H", data[offset+2:offset+4])[0]
+            new_data[offset+2:offset+4] = struct.pack("!H", new_size)
+            return bytes(new_data), orig_size
+        rdlen = struct.unpack("!H", data[offset+8:offset+10])[0]
+        offset += 10 + rdlen
+    return data, None
+
+def handle_request(server_sock, data, client_addr):
+    upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        upstream_sock.settimeout(2.0)
+        upstream_data, orig_size = extract_and_patch_edns(data, INTERNAL_EDNS_SIZE)
+        upstream_sock.sendto(upstream_data, (UPSTREAM_HOST, UPSTREAM_PORT))
+        resp, _ = upstream_sock.recvfrom(4096)
+        
+        final_size = max(orig_size if orig_size else 0, EXTERNAL_EDNS_SIZE)
+        resp_patched, _ = extract_and_patch_edns(resp, final_size)
+        server_sock.sendto(resp_patched, client_addr)
+    except Exception:
+        pass
+    finally:
+        upstream_sock.close()
+
+def main():
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8388608)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8388608)
+    except: pass
+    server_sock.bind((LISTEN_HOST, LISTEN_PORT))
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2048) as executor:
+        while True:
+            try:
+                data, client_addr = server_sock.recvfrom(4096)
+                executor.submit(handle_request, server_sock, data, client_addr)
+            except Exception:
+                pass
+
+if __name__ == "__main__":
+    main()
+EOF_PY
+chmod +x /usr/local/bin/dnsgb-edns-proxy.py
+
+
+    print_info "Downloading and Installing High-Performance BadVPN UDPGW..."
+    wget -q -O /usr/local/bin/badvpn-udpgw https://raw.githubusercontent.com/daybreakersx/premscript/master/badvpn-udpgw64
+    chmod +x /usr/local/bin/badvpn-udpgw
+
+    cat >/etc/systemd/system/badvpn-udpgw.service <<EOF
+[Unit]
+Description=BadVPN UDPGW Service
+After=network.target
+
+[Service]
+Type=simple
+LimitNOFILE=1048576
+LimitNPROC=1048576
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 1000 --max-connections-for-client 10
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat >/etc/systemd/system/badvpn-udpgw-ipv6.service <<EOF
+[Unit]
+Description=BadVPN UDPGW Service IPv6
+After=network.target
+
+[Service]
+Type=simple
+LimitNOFILE=1048576
+LimitNPROC=1048576
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr [::1]:7300 --max-clients 1000 --max-connections-for-client 10
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now badvpn-udpgw.service badvpn-udpgw-ipv6.service 2>/dev/null || true
+
+
+    print_info "Installing Auto-Clean and Speed Optimizer..."
+    cat > /usr/local/bin/speed-optimizer << 'EOF_SPEED'
+#!/bin/bash
+# VPS Speed Optimizer & Memory Cleaner
+if [ "$EUID" -ne 0 ]; then exit 1; fi
+cat > /etc/sysctl.conf << 'SYSCTL_EOF'
+fs.file-max = 2097152
+fs.inotify.max_user_instances = 8192
+net.ipv4.ip_forward=1
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65536
+net.ipv4.tcp_max_syn_backlog = 65536
+net.ipv4.tcp_max_tw_buckets = 1440000
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_syncookies = 1
+SYSCTL_EOF
+sysctl -p >/dev/null 2>&1
+sync; echo 3 > /proc/sys/vm/drop_caches
+systemctl restart badvpn-udpgw badvpn-udpgw-ipv6 sshd dnsgb-dnsrouter 2>/dev/null || true
+EOF_SPEED
+    chmod +x /usr/local/bin/speed-optimizer
+    
+    cat > /etc/cron.d/dnsgb-autoclean << 'EOF_CRON'
+0 */2 * * * root /usr/local/bin/speed-optimizer >/dev/null 2>&1
+EOF_CRON
+    chmod 644 /etc/cron.d/dnsgb-autoclean
+    
+    /usr/local/bin/speed-optimizer
+
+}
+
+# ─── STEP 6: Verify Port 53 ────────────────────────────────────────────────────
+
+step_verify_port53() {
+    print_step 6 "Verify Port 53"
+
+    local port53_output
+    port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
+
+    # If systemd-resolved crept back to :53, switch it to no-stub mode.
+    if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
+        print_warn "systemd-resolved came back on :53 — reconfiguring stub listener"
+        configure_systemd_resolved_no_stub || true
+        sleep 2
+        port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
+        if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
+            print_warn "systemd-resolved still occupies :53; stopping + disabling as fallback"
+            systemctl stop systemd-resolved.socket 2>/dev/null || true
+            systemctl stop systemd-resolved.service 2>/dev/null || true
+            systemctl disable systemd-resolved.service 2>/dev/null || true
+            ensure_resolv_conf_fallback
+        fi
+        sleep 2
+        port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
+    fi
+
+    if echo "$port53_output" | grep -q "dnsgb"; then
+        print_ok "dnsgb DNS Router is already on port 53"
+        print_info "Router will be restarted after tunnel creation to pick up any changes"
+    elif [[ -z "$port53_output" ]]; then
+        print_ok "Port 53 is free — ready for DNS Router"
+    else
+        print_warn "Port 53 is in use by an unknown process:"
+        echo "$port53_output"
+        print_fail "Cannot proceed — port 53 must be free for the DNS Router"
+        exit 1
+    fi
+
+    # Firewall
+    print_info "Ensuring firewall allows port 53..."
+
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow 53/tcp &>/dev/null || true
+        ufw allow 53/udp &>/dev/null || true
+        print_ok "ufw: port 53 TCP/UDP allowed"
+    elif command -v ufw &>/dev/null; then
+        print_info "ufw is installed but inactive; skipping ufw rule changes"
+    fi
+
+    if command -v iptables &>/dev/null; then
+        # Check if rules already exist before adding
+        if ! iptables -C INPUT -p tcp --dport 53 -j ACCEPT &>/dev/null; then
+            iptables -A INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+        fi
+        if ! iptables -C INPUT -p udp --dport 53 -j ACCEPT &>/dev/null; then
+            iptables -A INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+        fi
+        print_ok "iptables: port 53 TCP/UDP allowed"
+    fi
+
+    echo ""
+    print_warn "If your hosting provider has an external firewall (web panel),"
+    print_warn "make sure port 53 UDP and TCP are open there too."
+}
+
+# ─── STEP 7: Create Tunnels ────────────────────────────────────────────────────
+
+step_create_tunnels() {
+    print_step 7 "Create Tunnels"
+
+    local any_created=false
+    local _tunnel_count=4
+    [[ -x /usr/local/bin/noizdns-server ]] && _tunnel_count=6
+    if [[ -x /usr/local/bin/vaydns-server ]] || dnsgb_supports_vaydns; then
+        _tunnel_count=$((_tunnel_count + 2))
+    fi
+    print_info "Creating ${_tunnel_count} tunnels for domain: ${BOLD}${DOMAIN}${NC}"
+    echo ""
+
+    # Ask for DNSTT MTU (use CLI value as default if provided via --mtu)
+    local mtu_input
+    mtu_input=$(prompt_input "DNSTT MTU size (512-1400, affects packet size)" "$DNSTT_MTU")
+    if [[ "$mtu_input" =~ ^[0-9]+$ ]] && [[ "$mtu_input" -ge 512 ]] && [[ "$mtu_input" -le 1400 ]]; then
+        DNSTT_MTU="$mtu_input"
+    else
+        print_warn "Invalid MTU value; using default ${DNSTT_MTU}"
+    fi
+    print_ok "DNSTT MTU: ${DNSTT_MTU}"
+    echo ""
+
+    # Tunnel 1: Slipstream + SOCKS
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel 1: Slipstream + SOCKS${NC}"
+    echo ""
+    if dnsgb tunnel add --transport slipstream --backend socks --domain "t.${DOMAIN}" --tag slip1 2>&1; then
+        print_ok "Created: slip1 (Slipstream + SOCKS) on t.${DOMAIN}"
+        any_created=true
+    else
+        print_warn "Tunnel slip1 may already exist or creation failed"
+        print_info "If it already exists, this is OK"
+    fi
+    echo ""
+
+    # Tunnel 2: DNSTT + SOCKS
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel 2: DNSTT + SOCKS${NC}"
+    echo ""
+    local dnstt_output
+    dnstt_output=$(dnsgb tunnel add --transport dnstt --backend socks --domain "d.${DOMAIN}" --tag dnstt1 --mtu "$DNSTT_MTU" 2>&1) || true
+    echo "$dnstt_output"
+
+    # Try to extract DNSTT public key
+    DNSTT_PUBKEY=""
+    if [[ -f /etc/dnsgb/tunnels/dnstt1/server.pub ]]; then
+        DNSTT_PUBKEY=$(cat /etc/dnsgb/tunnels/dnstt1/server.pub 2>/dev/null || true)
+    fi
+
+    create_edns_service_override "dnstt1"
+    systemctl restart dnsgb-dnstt1.service 2>/dev/null || true
+
+    if [[ -n "$DNSTT_PUBKEY" ]]; then
+        print_ok "Created: dnstt1 (DNSTT + SOCKS) on d.${DOMAIN}"
+        any_created=true
+        echo ""
+        echo -e "  ${BOLD}${YELLOW}DNSTT Public Key (save this!):${NC}"
+        echo -e "  ${GREEN}${DNSTT_PUBKEY}${NC}"
+    else
+        print_warn "Tunnel dnstt1 may already exist or creation failed"
+        print_info "If it already exists, this is OK"
+    fi
+    echo ""
+
+    # Tunnel 3: Slipstream + SSH
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel 3: Slipstream + SSH${NC}"
+    echo ""
+    if dnsgb tunnel add --transport slipstream --backend ssh --domain "s.${DOMAIN}" --tag slip-ssh 2>&1; then
+        print_ok "Created: slip-ssh (Slipstream + SSH) on s.${DOMAIN}"
+        any_created=true
+    else
+        print_warn "Tunnel slip-ssh may already exist or creation failed"
+        print_info "If it already exists, this is OK"
+    fi
+    echo ""
+
+    # Tunnel 4: DNSTT + SSH
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel 4: DNSTT + SSH${NC}"
+    echo ""
+    if dnsgb tunnel add --transport dnstt --backend ssh --domain "ds.${DOMAIN}" --tag dnstt-ssh --mtu "$DNSTT_MTU" 2>&1; then
+        print_ok "Created: dnstt-ssh (DNSTT + SSH) on ds.${DOMAIN}"
+        any_created=true
+    else
+        print_warn "Tunnel dnstt-ssh may already exist or creation failed"
+        print_info "If it already exists, this is OK"
+    fi
+    echo ""
+
+    # Re-read DNSTT key if not captured
+    if [[ -z "$DNSTT_PUBKEY" && -f /etc/dnsgb/tunnels/dnstt1/server.pub ]]; then
+        DNSTT_PUBKEY=$(cat /etc/dnsgb/tunnels/dnstt1/server.pub 2>/dev/null || true)
+        if [[ -n "$DNSTT_PUBKEY" ]]; then
+            echo -e "  ${BOLD}${YELLOW}DNSTT Public Key:${NC}"
+            echo -e "  ${GREEN}${DNSTT_PUBKEY}${NC}"
+        fi
+    fi
+
+    # ─── NoizDNS tunnels (5 & 6) ───
+    if [[ -x /usr/local/bin/noizdns-server ]]; then
+        echo ""
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel 5: NoizDNS + SOCKS (DPI-resistant)${NC}"
+        echo ""
+        if dnsgb tunnel add --transport dnstt --backend socks --domain "n.${DOMAIN}" --tag noiz1 --mtu "$DNSTT_MTU" 2>&1; then
+            print_ok "Created: noiz1 (NoizDNS + SOCKS) on n.${DOMAIN}"
+            any_created=true
+        else
+            print_warn "Tunnel noiz1 may already exist or creation failed"
+        fi
+        # Override binary to use noizdns-server
+        create_noizdns_service_override "noiz1" || print_warn "Could not set NoizDNS binary for noiz1"
+        echo ""
+
+        # Extract NoizDNS pubkey
+        if [[ -f /etc/dnsgb/tunnels/noiz1/server.pub ]]; then
+            NOIZDNS_PUBKEY=$(cat /etc/dnsgb/tunnels/noiz1/server.pub 2>/dev/null || true)
+            if [[ -n "$NOIZDNS_PUBKEY" ]]; then
+                echo -e "  ${BOLD}${YELLOW}NoizDNS Public Key:${NC}"
+                echo -e "  ${GREEN}${NOIZDNS_PUBKEY}${NC}"
+            fi
+        fi
+
+        echo ""
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel 6: NoizDNS + SSH (DPI-resistant)${NC}"
+        echo ""
+        if dnsgb tunnel add --transport dnstt --backend ssh --domain "z.${DOMAIN}" --tag noiz-ssh --mtu "$DNSTT_MTU" 2>&1; then
+            print_ok "Created: noiz-ssh (NoizDNS + SSH) on z.${DOMAIN}"
+            any_created=true
+        else
+            print_warn "Tunnel noiz-ssh may already exist or creation failed"
+        fi
+        # Override binary to use noizdns-server
+        create_noizdns_service_override "noiz-ssh" || print_warn "Could not set NoizDNS binary for noiz-ssh"
+        echo ""
+
+        # Stop NoizDNS tunnels so step_start_services can start them fresh
+        # with the correct binary (dnsgb tunnel add auto-starts with dnstt-server,
+        # but we need them to run noizdns-server via the drop-in override)
+        systemctl stop "dnsgb-noiz1.service" 2>/dev/null || true
+        systemctl stop "dnsgb-noiz-ssh.service" 2>/dev/null || true
+
+        # Fix transport field if dnsgb rewrote it from "dnstt" to "noizdns"
+        fix_noizdns_transport
+    else
+        echo ""
+        print_warn "NoizDNS binary not available — skipping NoizDNS tunnels (n, z subdomains)"
+    fi
+
+    # Re-read NoizDNS key if not captured (e.g., tunnel already existed)
+    if [[ -z "$NOIZDNS_PUBKEY" && -f /etc/dnsgb/tunnels/noiz1/server.pub ]]; then
+        NOIZDNS_PUBKEY=$(cat /etc/dnsgb/tunnels/noiz1/server.pub 2>/dev/null || true)
+    fi
+
+    # ─── VayDNS tunnels (7 & 8) ───
+    # dnsgb v0.7.0+ has native VayDNS support — use --transport vaydns directly.
+    # Older dnsgb versions need the legacy DNSTT-with-binary-swap approach.
+    local _vay_native=false
+    if dnsgb_supports_vaydns; then
+        _vay_native=true
+    fi
+
+    if [[ "$_vay_native" == true ]] || [[ -x /usr/local/bin/vaydns-server ]]; then
+        echo ""
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel 7: VayDNS + SOCKS (optimized)${NC}"
+        echo ""
+        if [[ "$_vay_native" == true ]]; then
+            if dnsgb tunnel add --transport vaydns --backend socks --domain "v.${DOMAIN}" --tag vay1 --mtu "$DNSTT_MTU" --dnstt-compat 2>&1; then
+                print_ok "Created: vay1 (VayDNS + SOCKS) on v.${DOMAIN}"
+                any_created=true
+            else
+                print_warn "Tunnel vay1 may already exist or creation failed"
+            fi
+        else
+            if dnsgb tunnel add --transport dnstt --backend socks --domain "v.${DOMAIN}" --tag vay1 --mtu "$DNSTT_MTU" 2>&1; then
+                print_ok "Created: vay1 (VayDNS + SOCKS) on v.${DOMAIN}"
+                any_created=true
+            else
+                print_warn "Tunnel vay1 may already exist or creation failed"
+            fi
+            create_vaydns_service_override "vay1" || print_warn "Could not set VayDNS binary for vay1"
+        fi
+
+        if [[ -f /etc/dnsgb/tunnels/vay1/server.pub ]]; then
+            VAYDNS_PUBKEY=$(cat /etc/dnsgb/tunnels/vay1/server.pub 2>/dev/null || true)
+            if [[ -n "$VAYDNS_PUBKEY" ]]; then
+                echo -e "  ${BOLD}${YELLOW}VayDNS Public Key:${NC}"
+                echo -e "  ${GREEN}${VAYDNS_PUBKEY}${NC}"
+            fi
+        fi
+        echo ""
+
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel 8: VayDNS + SSH (optimized)${NC}"
+        echo ""
+        if [[ "$_vay_native" == true ]]; then
+            if dnsgb tunnel add --transport vaydns --backend ssh --domain "vz.${DOMAIN}" --tag vay-ssh --mtu "$DNSTT_MTU" --dnstt-compat 2>&1; then
+                print_ok "Created: vay-ssh (VayDNS + SSH) on vz.${DOMAIN}"
+                any_created=true
+            else
+                print_warn "Tunnel vay-ssh may already exist or creation failed"
+            fi
+        else
+            if dnsgb tunnel add --transport dnstt --backend ssh --domain "vz.${DOMAIN}" --tag vay-ssh --mtu "$DNSTT_MTU" 2>&1; then
+                print_ok "Created: vay-ssh (VayDNS + SSH) on vz.${DOMAIN}"
+                any_created=true
+            else
+                print_warn "Tunnel vay-ssh may already exist or creation failed"
+            fi
+            create_vaydns_service_override "vay-ssh" || print_warn "Could not set VayDNS binary for vay-ssh"
+        fi
+        echo ""
+
+        # Legacy path needs binary swap to take effect on next start.
+        # Native path: dnsgb already has the right ExecStart, no need to stop.
+        if [[ "$_vay_native" != true ]]; then
+            systemctl stop "dnsgb-vay1.service" 2>/dev/null || true
+            systemctl stop "dnsgb-vay-ssh.service" 2>/dev/null || true
+            fix_vaydns_transport
+        fi
+    else
+        echo ""
+        print_warn "VayDNS binary not available — skipping VayDNS tunnels (v, vz subdomains)"
+    fi
+
+    # Re-read VayDNS key if not captured
+    if [[ -z "$VAYDNS_PUBKEY" && -f /etc/dnsgb/tunnels/vay1/server.pub ]]; then
+        VAYDNS_PUBKEY=$(cat /etc/dnsgb/tunnels/vay1/server.pub 2>/dev/null || true)
+    fi
+
+    if [[ "$any_created" == true ]]; then
+        TUNNELS_CHANGED=true
+    fi
+    print_ok "All tunnels created"
+}
+
+# ─── STEP 8: Start Services ────────────────────────────────────────────────────
+
+step_start_services() {
+    print_step 8 "Start Services"
+
+    # Validate dnstt-server binary supports -udp (detect if NoizDNS binary overwrote it)
+    if [[ -x /usr/local/bin/dnstt-server ]]; then
+        if ! /usr/local/bin/dnstt-server -help 2>&1 | grep -q '\-udp'; then
+            print_warn "dnstt-server binary does not support -udp (may be NoizDNS fork) — re-downloading correct binary..."
+            local _dnstt_arch
+            _dnstt_arch=$(detect_architecture)
+            if curl -fsSL --connect-timeout 10 --max-time 30 -o /usr/local/bin/dnstt-server \
+                "https://github.com/net2share/dnstt/releases/download/latest/dnstt-server-linux-${_dnstt_arch}" 2>/dev/null; then
+                chmod +x /usr/local/bin/dnstt-server
+                print_ok "Re-downloaded correct dnstt-server binary"
+            else
+                print_warn "Could not re-download dnstt-server — DNSTT tunnels may fail"
+            fi
+        fi
+    fi
+
+    # Reload systemd to pick up any service overrides (e.g., NoizDNS binary swap)
+    systemctl daemon-reload 2>/dev/null || true
+
+    # ── 1. Start tunnels FIRST (before router) ──────────────────────────────────
+    # The DNS Router crash-loops if any configured backend tunnel isn't running.
+    # So we must start all tunnels and verify they're healthy BEFORE starting the router.
+
+    # Stop router while we start tunnels (it may be running from a previous install)
+    if [[ "$TUNNELS_CHANGED" == "true" ]]; then
+        print_info "Stopping DNS Router (to reload tunnel config)..."
+        dnsgb router stop 2>/dev/null || true
+        sleep 1
+    fi
+
+    echo ""
+
+    # Start all tunnels
+    local all_tags
+    all_tags=$(dnsgb_get_tags)
+    if [[ -z "$all_tags" ]]; then
+        all_tags="slip1 dnstt1 slip-ssh dnstt-ssh"
+        [[ -x /usr/local/bin/noizdns-server ]] && all_tags+=" noiz1 noiz-ssh"
+        if [[ -x /usr/local/bin/vaydns-server ]] || dnsgb_supports_vaydns; then
+            all_tags+=" vay1 vay-ssh"
+        fi
+    fi
+    for tag in $all_tags; do
+        print_info "Starting tunnel: ${tag}..."
+        if dnsgb tunnel start --tag "$tag" 2>/dev/null; then
+            print_ok "Started: ${tag}"
+        else
+            if dnsgb_tag_exists "$tag" && dnsgb tunnel list 2>/dev/null | grep -wF "$tag" | grep -qi "running"; then
+                print_ok "Already running: ${tag}"
+            else
+                print_warn "Could not start: ${tag}. Check: dnsgb tunnel logs --tag ${tag}"
+            fi
+        fi
+    done
+
+    # ── 2. Verify NoizDNS tunnels actually started ──────────────────────────────
+    # If NoizDNS services failed (wrong binary, bad config, etc.), remove them
+    # so the DNS Router doesn't crash-loop trying to connect to dead backends.
+    sleep 3
+    for noiz_tag in noiz1 noiz-ssh; do
+        if dnsgb tunnel list 2>/dev/null | grep -q "tag=${noiz_tag}"; then
+            if ! systemctl is-active --quiet "dnsgb-${noiz_tag}.service" 2>/dev/null; then
+                # Retry — give it more time before removing
+                print_info "Waiting for ${noiz_tag} to start..."
+                sleep 5
+                systemctl restart "dnsgb-${noiz_tag}.service" 2>/dev/null || true
+                sleep 3
+                if ! systemctl is-active --quiet "dnsgb-${noiz_tag}.service" 2>/dev/null; then
+                    print_warn "NoizDNS tunnel ${noiz_tag} failed to start — removing to protect DNS Router"
+                    local noiz_log
+                    noiz_log=$(journalctl -u "dnsgb-${noiz_tag}.service" -n 5 --no-pager 2>/dev/null || true)
+                    if [[ -n "$noiz_log" ]]; then
+                        echo -e "  ${DIM}Last log lines:${NC}"
+                        echo "$noiz_log" | while IFS= read -r l; do echo -e "  ${DIM}${l}${NC}"; done
+                    fi
+                    dnsgb tunnel stop --tag "$noiz_tag" 2>/dev/null || true
+                    dnsgb tunnel remove --tag "$noiz_tag" 2>/dev/null || true
+                    rm -f "/etc/systemd/system/dnsgb-${noiz_tag}.service.d/10-noizdns-binary.conf" 2>/dev/null || true
+                    rmdir "/etc/systemd/system/dnsgb-${noiz_tag}.service.d" 2>/dev/null || true
+                    systemctl daemon-reload 2>/dev/null || true
+                    print_info "Removed ${noiz_tag} — other tunnels will work normally"
+                else
+                    print_ok "NoizDNS tunnel ${noiz_tag} started successfully (after retry)"
+                fi
+            fi
+        fi
+    done
+
+    # Fix transport field if dnsgb rewrote it during start
+    fix_noizdns_transport
+
+    # ── 2b. Verify VayDNS tunnels actually started ──────────────────────────────
+    for vay_tag in vay1 vay-ssh; do
+        if dnsgb tunnel list 2>/dev/null | grep -q "tag=${vay_tag}"; then
+            if ! systemctl is-active --quiet "dnsgb-${vay_tag}.service" 2>/dev/null; then
+                print_info "Waiting for ${vay_tag} to start..."
+                sleep 5
+                systemctl restart "dnsgb-${vay_tag}.service" 2>/dev/null || true
+                sleep 3
+                if ! systemctl is-active --quiet "dnsgb-${vay_tag}.service" 2>/dev/null; then
+                    print_warn "VayDNS tunnel ${vay_tag} failed to start — removing to protect DNS Router"
+                    local vay_log
+                    vay_log=$(journalctl -u "dnsgb-${vay_tag}.service" -n 5 --no-pager 2>/dev/null || true)
+                    if [[ -n "$vay_log" ]]; then
+                        echo -e "  ${DIM}Last log lines:${NC}"
+                        echo "$vay_log" | while IFS= read -r l; do echo -e "  ${DIM}${l}${NC}"; done
+                    fi
+                    dnsgb tunnel stop --tag "$vay_tag" 2>/dev/null || true
+                    dnsgb tunnel remove --tag "$vay_tag" 2>/dev/null || true
+                    rm -f "/etc/systemd/system/dnsgb-${vay_tag}.service.d/10-vaydns-binary.conf" 2>/dev/null || true
+                    rmdir "/etc/systemd/system/dnsgb-${vay_tag}.service.d" 2>/dev/null || true
+                    systemctl daemon-reload 2>/dev/null || true
+                    print_info "Removed ${vay_tag} — other tunnels will work normally"
+                else
+                    print_ok "VayDNS tunnel ${vay_tag} started successfully (after retry)"
+                fi
+            fi
+        fi
+    done
+
+    fix_vaydns_transport
+
+    echo ""
+
+    # ── 3. Start DNS Router (now that all healthy tunnels are running) ───────────
+    if [[ "$TUNNELS_CHANGED" == "true" ]]; then
+        print_info "Starting DNS Router..."
+        if dnsgb router start 2>/dev/null; then
+            print_ok "DNS Router started"
+        else
+            print_warn "DNS Router start returned an error. Checking status..."
+            if dnsgb router status 2>/dev/null | grep -qi "running"; then
+                print_ok "DNS Router is running"
+            else
+                print_fail "DNS Router failed to start. Check: dnsgb router logs"
+                exit 1
+            fi
+        fi
+
+        # Wait for router to bind to port 53
+        local attempts=0
+        local max_attempts=10
+        while [[ $attempts -lt $max_attempts ]]; do
+            sleep 1
+            if ss -ulnp 2>/dev/null | grep -E ':53\b' | grep -q "dnsgb"; then
+                print_ok "DNS Router confirmed on port 53"
+                break
+            fi
+            attempts=$((attempts + 1))
+        done
+
+        if [[ $attempts -ge $max_attempts ]]; then
+            print_warn "DNS Router may not be on port 53 yet. Check: dnsgb router logs"
+        fi
+    else
+        # No changes — just verify router is running
+        if ss -ulnp 2>/dev/null | grep -E ':53\b' | grep -q "dnsgb"; then
+            print_ok "DNS Router already running on port 53 (no restart needed)"
+        else
+            print_warn "DNS Router not detected on port 53. Attempting start..."
+            dnsgb router start 2>/dev/null || true
+            sleep 2
+            if ss -ulnp 2>/dev/null | grep -E ':53\b' | grep -q "dnsgb"; then
+                print_ok "DNS Router started on port 53"
+            else
+                print_fail "DNS Router failed to start. Check: dnsgb router logs"
+                exit 1
+            fi
+        fi
+    fi
+
+    echo ""
+    print_info "Current tunnel status:"
+    echo ""
+    dnsgb tunnel list 2>/dev/null || print_warn "Could not get tunnel list"
+    echo ""
+
+    if apply_service_hardening; then
+        print_ok "Runtime hardening applied to dnsgb and microsocks services"
+    else
+        print_warn "Runtime hardening reported issues; review systemctl status for dnsgb units"
+    fi
+}
+
+# ─── STEP 9: Verify microsocks ─────────────────────────────────────────────────
+
+step_verify_microsocks() {
+    print_step 9 "Verify SOCKS Proxy (microsocks)"
+
+    # Ask about SOCKS authentication
+    echo ""
+    print_info "SOCKS tunnels (t/d) currently have no authentication."
+    print_info "Adding authentication makes the proxy secure — only clients with"
+    print_info "the correct username and password can connect."
+    echo ""
+    if prompt_yn "Enable SOCKS5 authentication for the proxy?" "y"; then
+        echo ""
+        SOCKS_USER=$(prompt_input "Enter SOCKS proxy username" "proxy")
+        SOCKS_USER=$(echo "$SOCKS_USER" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [[ -z "$SOCKS_USER" ]]; then
+            print_fail "Username cannot be empty"
+            SOCKS_USER="proxy"
+        fi
+        # Reject pipe and colon in username (breaks slipnet URL format and curl --proxy-user)
+        if [[ "$SOCKS_USER" == *"|"* || "$SOCKS_USER" == *":"* ]]; then
+            print_warn "Username cannot contain | or : characters — using default 'proxy'"
+            SOCKS_USER="proxy"
+        fi
+        SOCKS_PASS=$(prompt_input "Enter SOCKS proxy password")
+        SOCKS_PASS=$(echo "$SOCKS_PASS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [[ -z "$SOCKS_PASS" ]]; then
+            print_fail "Password cannot be empty — disabling SOCKS auth"
+            SOCKS_USER=""
+            SOCKS_PASS=""
+        # Reject pipe in password (breaks slipnet URL pipe-delimited format)
+        elif [[ "$SOCKS_PASS" == *"|"* ]]; then
+            print_fail "Password cannot contain the | character — disabling SOCKS auth"
+            SOCKS_USER=""
+            SOCKS_PASS=""
+        else
+            SOCKS_AUTH=true
+            print_ok "SOCKS authentication enabled (user: ${SOCKS_USER})"
+        fi
+    else
+        print_warn "SOCKS proxy will run without authentication (open to anyone who knows the domain)"
+    fi
+    echo ""
+
+    # Check if microsocks is running (dnsgb manages the binary and service)
+    local microsocks_running=false
+    if pgrep -x microsocks &>/dev/null || systemctl is-active --quiet microsocks 2>/dev/null; then
+        print_ok "microsocks is running"
+        microsocks_running=true
+    else
+        print_warn "microsocks is not running"
+        print_info "Starting microsocks..."
+
+        systemctl enable microsocks 2>/dev/null || true
+        if systemctl start microsocks 2>/dev/null; then
+            sleep 1
+            if pgrep -x microsocks &>/dev/null; then
+                print_ok "microsocks started"
+                microsocks_running=true
+            else
+                # May have crashed immediately — check for GLIBC issue
+                if ! microsocks_binary_works; then
+                    print_warn "microsocks crashed (GLIBC incompatibility detected)"
+                    if compile_microsocks_from_source; then
+                        microsocks_running=true
+                    fi
+                else
+                    print_fail "Failed to start microsocks"
+                    print_info "Check: systemctl status microsocks"
+                fi
+            fi
+        else
+            # systemctl start failed — check for GLIBC issue
+            if ! microsocks_binary_works; then
+                print_warn "microsocks binary incompatible — compiling from source..."
+                if compile_microsocks_from_source; then
+                    microsocks_running=true
+                fi
+            else
+                print_fail "Failed to start microsocks"
+                print_info "Check: systemctl status microsocks"
+            fi
+        fi
+    fi
+
+    # Apply SOCKS authentication via dnsgb (v0.6.8+) — only if microsocks is running
+    if [[ "$microsocks_running" == true && "$SOCKS_AUTH" == true && -n "$SOCKS_USER" && -n "$SOCKS_PASS" ]]; then
+        print_info "Configuring SOCKS5 authentication via dnsgb..."
+        if dnsgb backend auth -t socks -u "$SOCKS_USER" -p "$SOCKS_PASS"; then
+            print_ok "SOCKS5 authentication enabled (user: ${SOCKS_USER})"
+            # dnsgb backend auth rewrites ExecStart and restarts microsocks;
+            # give it a moment to come back up
+            sleep 2
+            if pgrep -x microsocks &>/dev/null || systemctl is-active --quiet microsocks 2>/dev/null; then
+                print_ok "microsocks restarted with authentication"
+            else
+                print_warn "microsocks may not have restarted — check: systemctl status microsocks"
+            fi
+        else
+            print_warn "Failed to configure SOCKS5 authentication via dnsgb"
+            print_info "Try manually: dnsgb backend auth -t socks -u ${SOCKS_USER} -p <password>"
+            SOCKS_AUTH=false
+        fi
+    fi
+
+    if [[ "$microsocks_running" != true ]]; then
+        print_warn "Skipping SOCKS proxy test — microsocks is not running"
+        return
+    fi
+
+    # Detect actual microsocks port (3 methods, most reliable first)
+    local socks_port=""
+    # Method 1: parse ss output — find the listen port on the microsocks line
+    socks_port=$(ss -tlnp 2>/dev/null | grep microsocks | awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/) {split($i,a,":"); print a[length(a)]; exit}}' || true)
+    # Method 2: parse the systemd unit file for -p flag
+    if [[ -z "$socks_port" ]]; then
+        socks_port=$(sed -n 's/.*-p[[:space:]]*\([0-9]*\).*/\1/p' /etc/systemd/system/microsocks.service 2>/dev/null | head -1 || true)
+    fi
+    # Method 3: fallback
+    if [[ -z "$socks_port" ]]; then
+        socks_port="19801"
+    fi
+
+    # Test SOCKS proxy
+    echo ""
+    print_info "Testing SOCKS proxy on 127.0.0.1:${socks_port}..."
+    local test_ip
+    if [[ "$SOCKS_AUTH" == true ]]; then
+        test_ip=$(curl -s --max-time 10 --socks5-basic --proxy "socks5://127.0.0.1:${socks_port}" --proxy-user "${SOCKS_USER}:${SOCKS_PASS}" https://api.ipify.org 2>/dev/null || true)
+    else
+        test_ip=$(curl -s --max-time 10 --socks5 "127.0.0.1:${socks_port}" https://api.ipify.org 2>/dev/null || true)
+    fi
+
+    if [[ -n "$test_ip" ]]; then
+        print_ok "SOCKS proxy works! Response: ${test_ip}"
+    else
+        print_warn "SOCKS proxy test failed (this may be OK if internet is restricted)"
+        print_info "The proxy may still work for DNS tunnel clients"
+    fi
+
+    # Negative test: verify unauthenticated access is rejected when auth is enabled
+    if [[ "$SOCKS_AUTH" == true && -n "$test_ip" ]]; then
+        local noauth_ip
+        noauth_ip=$(curl -s --max-time 5 --socks5 "127.0.0.1:${socks_port}" https://api.ipify.org 2>/dev/null || true)
+        if [[ -z "$noauth_ip" ]]; then
+            print_ok "Auth enforced: unauthenticated connections are rejected"
+        else
+            print_warn "Auth NOT enforced: proxy works without credentials!"
+            print_info "Try: dnsgb backend auth -t socks -u ${SOCKS_USER} -p <password>"
+        fi
+    fi
+}
+
+# ─── STEP 10: SSH User (Optional) ──────────────────────────────────────────────
+
+step_ssh_user() {
+    print_step 10 "SSH Tunnel User"
+
+    print_info "An SSH tunnel user allows clients to connect via Slipstream + SSH or DNSTT + SSH."
+    print_info "This user can only create tunnels and has no shell access."
+    print_warn "Without an SSH tunnel user, the SSH tunnels (s/ds) will NOT work."
+    echo ""
+
+    if ! prompt_yn "Create an SSH tunnel user? (required for SSH tunnels to work)" "y"; then
+        print_warn "Skipping SSH user setup — SSH tunnels (s.${DOMAIN}, ds.${DOMAIN}) will not work"
+        print_info "You can create one later with: sshtun-user create <username> --insecure-password <pass>"
+        return
+    fi
+
+    echo ""
+
+    # Install sshtun-user if not present
+    if ! command -v sshtun-user &>/dev/null; then
+        print_info "Downloading sshtun-user..."
+        local arch
+        arch=$(detect_architecture)
+        if curl -fsSL -o /usr/local/bin/sshtun-user "https://github.com/net2share/sshtun-user/releases/latest/download/sshtun-user-linux-${arch}"; then
+            chmod +x /usr/local/bin/sshtun-user
+            print_ok "Downloaded sshtun-user for ${arch}"
+        else
+            print_fail "Failed to download sshtun-user for ${arch} architecture"
+            return
+        fi
+    else
+        print_ok "sshtun-user already installed"
+    fi
+
+    # Configure SSH (only needed once)
+    print_info "Applying SSH security configuration..."
+    mkdir -p /run/sshd 2>/dev/null || true
+
+    # Back up sshd_config before any modification
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        cp -f /etc/ssh/sshd_config /etc/ssh/sshd_config.dnsgb-backup 2>/dev/null || true
+    fi
+
+    local configure_output
+    configure_output=$(timeout --kill-after=3 30 sshtun-user configure </dev/null 2>&1) || true
+    if echo "$configure_output" | grep -qi "already"; then
+        print_ok "SSH already configured"
+    elif echo "$configure_output" | grep -qi "error\|fail"; then
+        print_warn "sshtun-user configure had issues:"
+        echo -e "  ${DIM}${configure_output}${NC}"
+    else
+        print_ok "SSH configuration applied"
+    fi
+
+    # Validate sshd_config — rollback if broken
+    if command -v sshd &>/dev/null && ! sshd -t 2>/dev/null; then
+        print_warn "sshd_config validation failed — rolling back"
+        if [[ -f /etc/ssh/sshd_config.dnsgb-backup ]]; then
+            cp -f /etc/ssh/sshd_config.dnsgb-backup /etc/ssh/sshd_config
+            print_ok "Restored sshd_config from backup"
+        fi
+    fi
+
+    # Fix ETM-only MACs for client compatibility (Bitvise, older clients)
+    fix_ssh_macs
+
+    echo ""
+
+    # Get username
+    SSH_USER=$(prompt_input "Enter username for SSH tunnel user" "tunnel")
+    SSH_USER=$(echo "$SSH_USER" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [[ -z "$SSH_USER" ]]; then
+        print_fail "Username cannot be empty"
+        return
+    fi
+    if [[ "$SSH_USER" == *"|"* ]]; then
+        print_fail "Username cannot contain the | character"
+        return
+    fi
+
+    # Get password
+    SSH_PASS=$(prompt_input "Enter password for SSH tunnel user")
+    SSH_PASS=$(echo "$SSH_PASS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [[ -z "$SSH_PASS" ]]; then
+        print_fail "Password cannot be empty"
+        return
+    fi
+    if [[ "$SSH_PASS" == *"|"* ]]; then
+        print_fail "Password cannot contain the | character"
+        return
+    fi
+
+    echo ""
+
+    # Create user
+    print_info "Creating SSH tunnel user: ${SSH_USER}..."
+    if timeout --kill-after=3 30 sshtun-user create "$SSH_USER" --insecure-password "$SSH_PASS" </dev/null 2>&1; then
+        SSH_SETUP_DONE=true
+        print_ok "SSH tunnel user created: ${SSH_USER}"
+    else
+        print_warn "User creation may have failed or user already exists"
+        SSH_SETUP_DONE=true  # Still show in summary
+    fi
+    # Store credentials (root-only) for status page URL generation
+    mkdir -p /etc/dnsgb 2>/dev/null || true
+    echo "${SSH_USER}:${SSH_PASS}" > /etc/dnsgb/ssh-credentials
+    chmod 600 /etc/dnsgb/ssh-credentials
+
+    # Verify and auto-fix sshd reachability on localhost (required for SSH tunnels)
+    if ! timeout 3 bash -c 'echo | nc -w2 127.0.0.1 22' &>/dev/null; then
+        print_warn "sshd NOT reachable on 127.0.0.1:22 — attempting auto-fix..."
+        # Try restarting sshd first
+        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+        sleep 1
+        if ! timeout 3 bash -c 'echo | nc -w2 127.0.0.1 22' &>/dev/null; then
+            # Check if firewall is blocking localhost
+            if command -v iptables &>/dev/null; then
+                # Allow SSH on localhost
+                iptables -I INPUT -i lo -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+                print_info "Added firewall rule: allow SSH on localhost"
+            fi
+            if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+                ufw allow from 127.0.0.1 to any port 22 2>/dev/null || true
+                print_info "Added UFW rule: allow SSH from localhost"
+            fi
+            sleep 1
+            if timeout 3 bash -c 'echo | nc -w2 127.0.0.1 22' &>/dev/null; then
+                print_ok "sshd now reachable on 127.0.0.1:22"
+            else
+                print_warn "Could not auto-fix — SSH tunnels may not work"
+                print_info "Manually check: sudo iptables -L -n | grep 22"
+            fi
+        else
+            print_ok "sshd now reachable on 127.0.0.1:22 (after restart)"
+        fi
+    else
+        print_ok "sshd reachable on 127.0.0.1:22"
+    fi
+}
+
+# ─── STEP 11: Run Tests ────────────────────────────────────────────────────────
+
+step_tests() {
+    print_step 11 "Verification Tests"
+
+    local pass=0
+    local fail=0
+
+    # Test 1: SOCKS proxy — detect actual port
+    echo -e "  ${BOLD}Test 1: SOCKS Proxy${NC}"
+    local socks_port=""
+    socks_port=$(ss -tlnp 2>/dev/null | grep microsocks | awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/) {split($i,a,":"); print a[length(a)]; exit}}' || true)
+    if [[ -z "$socks_port" ]]; then
+        socks_port=$(sed -n 's/.*-p[[:space:]]*\([0-9]*\).*/\1/p' /etc/systemd/system/microsocks.service 2>/dev/null | head -1 || true)
+    fi
+    if [[ -z "$socks_port" ]]; then
+        socks_port="19801"
+    fi
+
+    local socks_result
+    if [[ "$SOCKS_AUTH" == true ]]; then
+        socks_result=$(curl -s --max-time 10 --socks5-basic --proxy "socks5://127.0.0.1:${socks_port}" --proxy-user "${SOCKS_USER}:${SOCKS_PASS}" https://api.ipify.org 2>/dev/null || true)
+    else
+        socks_result=$(curl -s --max-time 10 --socks5 "127.0.0.1:${socks_port}" https://api.ipify.org 2>/dev/null || true)
+    fi
+    if [[ -n "$socks_result" ]]; then
+        print_ok "SOCKS proxy: PASS (IP: ${socks_result}) on port ${socks_port}"
+        pass=$((pass + 1))
+        # Verify auth enforcement
+        if [[ "$SOCKS_AUTH" == true ]]; then
+            local noauth_result
+            noauth_result=$(curl -s --max-time 5 --socks5 "127.0.0.1:${socks_port}" https://api.ipify.org 2>/dev/null || true)
+            if [[ -z "$noauth_result" ]]; then
+                print_ok "SOCKS auth enforcement: PASS (unauthenticated rejected)"
+                pass=$((pass + 1))
+            else
+                print_fail "SOCKS auth enforcement: FAIL (works without credentials!)"
+                fail=$((fail + 1))
+            fi
+        fi
+    elif ss -tlnp 2>/dev/null | grep -q "microsocks"; then
+        print_warn "SOCKS proxy: LISTENING on port ${socks_port} but connectivity test failed"
+        print_info "microsocks is running but outbound may be blocked or tunnels not ready"
+        fail=$((fail + 1))
+    else
+        print_fail "SOCKS proxy: FAIL (microsocks not running)"
+        fail=$((fail + 1))
+    fi
+    echo ""
+
+    # Test 2: Tunnel list
+    echo -e "  ${BOLD}Test 2: Tunnel Status${NC}"
+    local tunnel_output
+    tunnel_output=$(dnsgb tunnel list 2>/dev/null || true)
+    if [[ -n "$tunnel_output" ]]; then
+        local running_count
+        running_count=$(echo "$tunnel_output" | grep -ci "running" || echo "0")
+        local expected_tunnels=4
+        [[ -x /usr/local/bin/noizdns-server ]] && expected_tunnels=6
+        if [[ -x /usr/local/bin/vaydns-server ]] || dnsgb_supports_vaydns; then
+            expected_tunnels=$((expected_tunnels + 2))
+        fi
+        if [[ "$running_count" -ge "$expected_tunnels" ]]; then
+            print_ok "All tunnels running: PASS (${running_count} running)"
+            pass=$((pass + 1))
+        elif [[ "$running_count" -ge 1 ]]; then
+            print_warn "Some tunnels running: ${running_count}/${expected_tunnels}"
+            pass=$((pass + 1))
+        else
+            print_fail "No tunnels running: FAIL"
+            fail=$((fail + 1))
+        fi
+    else
+        print_fail "Cannot get tunnel list: FAIL"
+        fail=$((fail + 1))
+    fi
+    echo ""
+
+    # Test 3: Router status
+    echo -e "  ${BOLD}Test 3: DNS Router${NC}"
+    if dnsgb router status 2>/dev/null | grep -qi "running"; then
+        print_ok "DNS Router: PASS (running)"
+        pass=$((pass + 1))
+    else
+        print_fail "DNS Router: FAIL (not running)"
+        fail=$((fail + 1))
+    fi
+    echo ""
+
+    # Test 4: Port 53
+    echo -e "  ${BOLD}Test 4: Port 53${NC}"
+    if ss -ulnp 2>/dev/null | grep -E ':53\b' | grep -q "dnsgb"; then
+        print_ok "Port 53: PASS (dnsgb listening)"
+        pass=$((pass + 1))
+    else
+        print_fail "Port 53: FAIL (dnsgb not listening)"
+        fail=$((fail + 1))
+    fi
+    echo ""
+
+    # Test 5: DNS delegation (end-to-end reachability)
+    echo -e "  ${BOLD}Test 5: DNS Delegation${NC}"
+    if command -v dig &>/dev/null; then
+        local dig_result
+        dig_result=$(dig +short +timeout=5 +tries=1 "dnsgb-test.t.${DOMAIN}" @8.8.8.8 2>/dev/null || true)
+        if [[ -n "$dig_result" ]]; then
+            print_ok "DNS delegation: PASS (query reached server via 8.8.8.8)"
+            pass=$((pass + 1))
+        else
+            # Try Cloudflare resolver as fallback
+            dig_result=$(dig +short +timeout=5 +tries=1 "dnsgb-test.t.${DOMAIN}" @1.1.1.1 2>/dev/null || true)
+            if [[ -n "$dig_result" ]]; then
+                print_ok "DNS delegation: PASS (query reached server via 1.1.1.1)"
+                pass=$((pass + 1))
+            else
+                print_warn "DNS delegation: No response from public resolvers"
+                print_info "This may mean DNS records are not set up correctly in Cloudflare,"
+                print_info "or it may take a few minutes for DNS to propagate."
+                print_info "Test manually: dig t.${DOMAIN} @8.8.8.8"
+                fail=$((fail + 1))
+            fi
+        fi
+    else
+        print_info "DNS delegation: SKIPPED (dig not installed — install with: apt install dnsutils)"
+        print_info "Test manually: nslookup t.${DOMAIN} 8.8.8.8"
+        pass=$((pass + 1))
+    fi
+    echo ""
+
+    # Test 6: SSH readiness
+    echo -e "  ${BOLD}Test 6: SSH Tunnel Readiness${NC}"
+    if ss -tlnp 2>/dev/null | grep -E ':22\b' | grep -q "sshd"; then
+        if [[ "$SSH_SETUP_DONE" == true ]]; then
+            print_ok "SSH: PASS (sshd running, tunnel user '${SSH_USER}' created)"
+            pass=$((pass + 1))
+        else
+            print_warn "SSH: sshd running but no tunnel user created — SSH tunnels (s/ds) will not work"
+            print_info "Create one with: sshtun-user create <username> --insecure-password <pass>"
+            fail=$((fail + 1))
+        fi
+    else
+        print_warn "SSH: sshd not detected on port 22 — SSH tunnels (s/ds) will not work"
+        print_info "Start sshd with: systemctl start sshd"
+        fail=$((fail + 1))
+    fi
+    echo ""
+
+    # Summary
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    if [[ $fail -eq 0 ]]; then
+        print_ok "${GREEN}All ${pass} tests passed!${NC}"
+    else
+        print_warn "${pass} passed, ${fail} failed"
+        print_info "Check logs with: dnsgb router logs / dnsgb tunnel logs --tag <tag>"
+    fi
+}
+
+# ─── STEP 12: Summary ──────────────────────────────────────────────────────────
+
+step_summary() {
+    print_step 12 "Setup Complete!"
+
+    local w=54
+    local border empty
+    border=$(printf '═%.0s' $(seq 1 $w))
+    empty=$(printf ' %.0s' $(seq 1 $w))
+    local msg="SETUP COMPLETE!"
+    local ml=$(( (w - ${#msg}) / 2 ))
+    local mr=$(( w - ${#msg} - ml ))
+
+    echo -e "${BOLD}${GREEN}"
+    printf "  ╔%s╗\n" "$border"
+    printf "  ║%s║\n" "$empty"
+    printf "  ║%${ml}s%s%${mr}s║\n" "" "$msg" ""
+    printf "  ║%s║\n" "$empty"
+    printf "  ╚%s╝\n" "$border"
+    echo -e "${NC}"
+
+    echo -e "  ${BOLD}Server Information${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Server IP:     ${GREEN}${SERVER_IP}${NC}"
+    echo -e "  Domain:        ${GREEN}${DOMAIN}${NC}"
+    echo ""
+
+    echo -e "  ${BOLD}Tunnel Endpoints${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Slipstream + SOCKS:  ${GREEN}t.${DOMAIN}${NC}"
+    echo -e "  DNSTT + SOCKS:       ${GREEN}d.${DOMAIN}${NC}"
+    if [[ -x /usr/local/bin/noizdns-server ]]; then
+        echo -e "  NoizDNS + SOCKS:     ${GREEN}n.${DOMAIN}${NC}  ${DIM}(DPI-resistant)${NC}"
+    fi
+    if [[ -x /usr/local/bin/vaydns-server ]]; then
+        echo -e "  VayDNS + SOCKS:      ${GREEN}v.${DOMAIN}${NC}  ${DIM}(optimized)${NC}"
+    fi
+    echo -e "  Slipstream + SSH:    ${GREEN}s.${DOMAIN}${NC}"
+    echo -e "  DNSTT + SSH:         ${GREEN}ds.${DOMAIN}${NC}"
+    if [[ -x /usr/local/bin/noizdns-server ]]; then
+        echo -e "  NoizDNS + SSH:       ${GREEN}z.${DOMAIN}${NC}  ${DIM}(DPI-resistant)${NC}"
+    fi
+    if [[ -x /usr/local/bin/vaydns-server ]]; then
+        echo -e "  VayDNS + SSH:        ${GREEN}vz.${DOMAIN}${NC}  ${DIM}(optimized)${NC}"
+    fi
+    echo ""
+
+    if [[ -n "$DNSTT_PUBKEY" ]]; then
+        echo -e "  ${BOLD}DNSTT Public Keys${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}dnstt1 (SOCKS):${NC}  ${DNSTT_PUBKEY}"
+        local _dnstt_ssh_pk=""
+        if [[ -f /etc/dnsgb/tunnels/dnstt-ssh/server.pub ]]; then
+            _dnstt_ssh_pk=$(cat /etc/dnsgb/tunnels/dnstt-ssh/server.pub 2>/dev/null || true)
+        fi
+        if [[ -n "$_dnstt_ssh_pk" ]]; then
+            echo -e "  ${GREEN}dnstt-ssh (SSH):${NC} ${_dnstt_ssh_pk}"
+        fi
+        echo ""
+    fi
+
+    if [[ -n "$NOIZDNS_PUBKEY" ]]; then
+        echo -e "  ${BOLD}NoizDNS Public Keys${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}noiz1 (SOCKS):${NC}   ${NOIZDNS_PUBKEY}"
+        local _noiz_ssh_pk=""
+        if [[ -f /etc/dnsgb/tunnels/noiz-ssh/server.pub ]]; then
+            _noiz_ssh_pk=$(cat /etc/dnsgb/tunnels/noiz-ssh/server.pub 2>/dev/null || true)
+        fi
+        if [[ -n "$_noiz_ssh_pk" ]]; then
+            echo -e "  ${GREEN}noiz-ssh (SSH):${NC}  ${_noiz_ssh_pk}"
+        fi
+        echo ""
+    fi
+
+    if [[ -n "$VAYDNS_PUBKEY" ]]; then
+        echo -e "  ${BOLD}VayDNS Public Keys${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}vay1 (SOCKS):${NC}    ${VAYDNS_PUBKEY}"
+        local _vay_ssh_pk=""
+        if [[ -f /etc/dnsgb/tunnels/vay-ssh/server.pub ]]; then
+            _vay_ssh_pk=$(cat /etc/dnsgb/tunnels/vay-ssh/server.pub 2>/dev/null || true)
+        fi
+        if [[ -n "$_vay_ssh_pk" ]]; then
+            echo -e "  ${GREEN}vay-ssh (SSH):${NC}   ${_vay_ssh_pk}"
+        fi
+        echo ""
+    fi
+
+    # Generate share URLs (dnst:// for dnstc CLI)
+    echo -e "  ${BOLD}Share URLs — dnst:// (for dnstc CLI)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    local share_url
+    for tag in slip1 dnstt1 noiz1 vay1; do
+        share_url=$(dnsgb tunnel share -t "$tag" 2>/dev/null || true)
+        if [[ -n "$share_url" ]]; then
+            echo -e "  ${GREEN}${tag}:${NC} ${share_url}"
+        fi
+    done
+    if [[ "$SSH_SETUP_DONE" == true && -n "$SSH_USER" && -n "$SSH_PASS" ]]; then
+        for tag in slip-ssh dnstt-ssh noiz-ssh vay-ssh; do
+            share_url=$(dnsgb tunnel share -t "$tag" --user "$SSH_USER" --password "$SSH_PASS" 2>/dev/null || true)
+            if [[ -n "$share_url" ]]; then
+                echo -e "  ${GREEN}${tag}:${NC} ${share_url}"
+            fi
+        done
+    fi
+    echo ""
+
+    # Generate SlipNet deep-link URLs (slipnet:// for SlipNet Android app)
+    echo -e "  ${BOLD}Share URLs — slipnet:// (for SlipNet app)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    local slipnet_url
+    local s_user="" s_pass=""
+    if [[ "$SOCKS_AUTH" == true ]]; then
+        s_user="$SOCKS_USER"
+        s_pass="$SOCKS_PASS"
+    fi
+    # Slipstream + SOCKS — SlipNet needs pubkey even for slipstream
+    local _slip_pk=""
+    _slip_pk=$(cat /etc/dnsgb/tunnels/*/server.pub 2>/dev/null | head -1 || true)
+    slipnet_url=$(generate_slipnet_url "ss" "t" "$_slip_pk" "" "" "$s_user" "$s_pass")
+    echo -e "  ${GREEN}slip1:${NC}    ${slipnet_url}"
+    # DNSTT + SOCKS
+    if [[ -n "$DNSTT_PUBKEY" ]]; then
+        slipnet_url=$(generate_slipnet_url "dnstt" "d" "$DNSTT_PUBKEY" "" "" "$s_user" "$s_pass")
+        echo -e "  ${GREEN}dnstt1:${NC}    ${slipnet_url}"
+    fi
+    # NoizDNS + SOCKS
+    if [[ -n "$NOIZDNS_PUBKEY" ]]; then
+        slipnet_url=$(generate_slipnet_url "sayedns" "n" "$NOIZDNS_PUBKEY" "" "" "$s_user" "$s_pass")
+        echo -e "  ${GREEN}noiz1:${NC}     ${slipnet_url}"
+    fi
+    # VayDNS + SOCKS
+    if [[ -n "$VAYDNS_PUBKEY" ]]; then
+        slipnet_url=$(generate_slipnet_url "dnstt" "v" "$VAYDNS_PUBKEY" "" "" "$s_user" "$s_pass")
+        echo -e "  ${GREEN}vay1:${NC}      ${slipnet_url}"
+    fi
+    # SSH tunnels
+    if [[ "$SSH_SETUP_DONE" == true && -n "$SSH_USER" && -n "$SSH_PASS" ]]; then
+        local _any_pk=""
+        _any_pk=$(cat /etc/dnsgb/tunnels/*/server.pub 2>/dev/null | head -1 || true)
+        slipnet_url=$(generate_slipnet_url "slipstream_ssh" "s" "$_any_pk" "$SSH_USER" "$SSH_PASS" "$s_user" "$s_pass")
+        echo -e "  ${GREEN}slip-ssh:${NC}  ${slipnet_url}"
+        # dnstt-ssh has its own keypair
+        local dnstt_ssh_pubkey=""
+        if [[ -f /etc/dnsgb/tunnels/dnstt-ssh/server.pub ]]; then
+            dnstt_ssh_pubkey=$(cat /etc/dnsgb/tunnels/dnstt-ssh/server.pub 2>/dev/null || true)
+        fi
+        if [[ -n "$dnstt_ssh_pubkey" ]]; then
+            slipnet_url=$(generate_slipnet_url "dnstt_ssh" "ds" "$dnstt_ssh_pubkey" "$SSH_USER" "$SSH_PASS" "$s_user" "$s_pass")
+            echo -e "  ${GREEN}dnstt-ssh:${NC} ${slipnet_url}"
+        fi
+        # NoizDNS + SSH
+        local noiz_ssh_pubkey=""
+        if [[ -f /etc/dnsgb/tunnels/noiz-ssh/server.pub ]]; then
+            noiz_ssh_pubkey=$(cat /etc/dnsgb/tunnels/noiz-ssh/server.pub 2>/dev/null || true)
+        fi
+        if [[ -n "$noiz_ssh_pubkey" ]]; then
+            slipnet_url=$(generate_slipnet_url "sayedns_ssh" "z" "$noiz_ssh_pubkey" "$SSH_USER" "$SSH_PASS" "$s_user" "$s_pass")
+            echo -e "  ${GREEN}noiz-ssh:${NC}  ${slipnet_url}"
+        fi
+        # VayDNS + SSH
+        local vay_ssh_pubkey=""
+        if [[ -f /etc/dnsgb/tunnels/vay-ssh/server.pub ]]; then
+            vay_ssh_pubkey=$(cat /etc/dnsgb/tunnels/vay-ssh/server.pub 2>/dev/null || true)
+        fi
+        if [[ -n "$vay_ssh_pubkey" ]]; then
+            slipnet_url=$(generate_slipnet_url "dnstt_ssh" "vz" "$vay_ssh_pubkey" "$SSH_USER" "$SSH_PASS" "$s_user" "$s_pass")
+            echo -e "  ${GREEN}vay-ssh:${NC}   ${slipnet_url}"
+        fi
+    fi
+    echo ""
+
+    if [[ "$SOCKS_AUTH" == true ]]; then
+        echo -e "  ${BOLD}SOCKS Proxy Authentication${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  Username:  ${GREEN}${SOCKS_USER}${NC}"
+        echo -e "  Password:  ${GREEN}${SOCKS_PASS}${NC}"
+        echo ""
+    else
+        echo -e "  ${BOLD}SOCKS Proxy Authentication${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${YELLOW}⚠ No authentication — SOCKS tunnels (t/d) are open${NC}"
+        echo ""
+    fi
+
+    if [[ "$SSH_SETUP_DONE" == true ]]; then
+        echo -e "  ${BOLD}SSH Tunnel User${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  Username:  ${GREEN}${SSH_USER}${NC}"
+        echo -e "  Password:  ${GREEN}${SSH_PASS}${NC}"
+        echo -e "  Port:      ${GREEN}22${NC}"
+        echo ""
+    else
+        echo -e "  ${BOLD}SSH Tunnel User${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${YELLOW}⚠ Not configured — SSH tunnels (s/ds) will not work${NC}"
+        echo -e "  Create one with: ${BOLD}sshtun-user create <username> --insecure-password <pass>${NC}"
+        echo ""
+    fi
+
+    echo -e "  ${BOLD}DNS Resolvers (use in SlipNet)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo "  8.8.8.8:53        (Google)"
+    echo "  1.1.1.1:53        (Cloudflare)"
+    echo "  9.9.9.9:53        (Quad9)"
+    echo "  208.67.222.222:53 (OpenDNS)"
+    echo "  94.140.14.14:53   (AdGuard)"
+    echo "  185.228.168.9:53  (CleanBrowsing)"
+    echo ""
+
+    echo -e "  ${BOLD}Client App${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo "  SlipNet (Android): https://github.com/anonvector/SlipNet/releases"
+    echo ""
+
+    echo -e "  ${BOLD}Useful Commands${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo "  dnsgb tunnel list               Show all tunnels"
+    echo "  dnsgb tunnel share -t <tag>     Generate share URL"
+    echo "  dnsgb router status             Show router status"
+    echo "  dnsgb router logs               View router logs"
+    echo "  dnsgb tunnel logs --tag slip1   View tunnel logs"
+    echo ""
+
+    echo -e "  ${BOLD}Management TUI${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Run ${GREEN}dnsgb-setup --manage${NC} to open the full management menu."
+    echo "  From there you can:"
+    echo "    - Add/remove tunnels and domains"
+    echo "    - Add Xray backend (VLESS/VMess/Trojan)"
+    echo "    - Manage SSH tunnel users"
+    echo "    - Change DNSTT MTU"
+    echo "    - View status, logs, and share URLs"
+    echo "    - Update to latest version"
+    echo "    - Harden or uninstall"
+    echo ""
+
+    echo -e "  ${DIM}Setup by dnsgb-setup v${VERSION} — SamNet Technologies${NC}"
+    echo -e "  ${DIM}https://github.com/SamNet-dev/dnstm-setup${NC}"
+    echo ""
+}
+
+# ─── Install to PATH ─────────────────────────────────────────────────────────────
+
+install_to_path() {
+    local script_path
+    script_path=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+    local target="/usr/local/bin/dnsgb-setup"
+
+    # Skip if already installed there
+    [[ "$script_path" == "$target" ]] && return 0
+
+    cp -f "$script_path" "$target" 2>/dev/null || return 0
+    chmod +x "$target"
+    print_ok "Installed dnsgb-setup to PATH (run 'dnsgb-setup --manage' from anywhere)"
+}
+
+# ─── Add Domain ──────────────────────────────────────────────────────────────────
+
+# Detect next available tunnel number by scanning existing tags
+detect_next_tunnel_num() {
+    local max=1
+    local tags
+    tags=$(dnsgb_get_tags)
+    for tag in $tags; do
+        local num
+        num=$(echo "$tag" | grep -oE '[0-9]+$' || true)
+        if [[ -n "$num" && "$num" -ge "$max" ]]; then
+            max=$((num + 1))
+        fi
+    done
+    echo "$max"
+}
+
+do_add_domain() {
+    banner
+    print_header "Add Backup Domain"
+
+    # Check root
+    if [[ $EUID -ne 0 ]]; then
+        print_fail "Not running as root. Please run with: sudo bash $0 --add-domain"
+        exit 1
+    fi
+
+    # Check dnsgb is installed
+    if ! command -v dnsgb &>/dev/null; then
+        print_fail "dnsgb is not installed. Run the full setup first: sudo bash $0"
+        exit 1
+    fi
+
+    # Check router is running
+    if ! dnsgb router status 2>/dev/null | grep -qi "running"; then
+        print_warn "DNS Router is not running. Starting it..."
+        dnsgb router start 2>/dev/null || true
+    fi
+
+    # Ensure router is in multi mode (required for multiple domains)
+    local current_mode
+    current_mode=$(dnsgb router mode 2>/dev/null | awk '/[Mm]ode/{for(i=1;i<=NF;i++) if($i=="multi"||$i=="single") print $i}' | head -1 || true)
+    if [[ "$current_mode" != "multi" ]]; then
+        print_warn "Router mode is '${current_mode:-unknown}', switching to multi..."
+        if dnsgb router mode multi 2>/dev/null; then
+            print_ok "Router mode switched to multi"
+        else
+            print_fail "Failed to switch router mode to multi. Multiple domains require multi mode."
+            exit 1
+        fi
+    else
+        print_ok "Router mode: multi"
+    fi
+
+    # Detect server IP
+    SERVER_IP=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || curl -4 -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
+    if [[ -z "$SERVER_IP" ]]; then
+        SERVER_IP=$(prompt_input "Enter your server's public IP")
+        if [[ -z "$SERVER_IP" ]]; then
+            print_fail "Server IP is required."
+            exit 1
+        fi
+    fi
+    print_ok "Server IP: ${SERVER_IP}"
+
+    # Show existing tunnels
+    echo ""
+    print_info "Current tunnels:"
+    echo ""
+    dnsgb tunnel list 2>/dev/null || true
+    echo ""
+
+    # Detect next tunnel number
+    local num
+    num=$(detect_next_tunnel_num)
+    print_info "Next tunnel set number: ${num}"
+    echo ""
+
+    # Get existing tunnel domains for duplicate check
+    local existing_domains
+    existing_domains=$(dnsgb tunnel list 2>/dev/null | grep -o 'domain=[^ ]*' | sed 's/domain=//;s/^[a-z0-9]*\.//' | sort -u || true)
+
+    # Use domain from argument if provided, otherwise prompt
+    if [[ -n "$ADD_DOMAIN_ARG" ]]; then
+        DOMAIN="$ADD_DOMAIN_ARG"
+        DOMAIN=$(echo "$DOMAIN" | sed 's|^[[:space:]]*||;s|[[:space:]]*$||;s|^https\?://||;s|/.*$||')
+        if [[ -z "$DOMAIN" ]] || [[ ! "$DOMAIN" =~ \. ]]; then
+            print_fail "Invalid domain: ${ADD_DOMAIN_ARG}"
+            exit 1
+        fi
+        if [[ -n "$existing_domains" ]] && echo "$existing_domains" | grep -qx "$DOMAIN"; then
+            print_fail "Domain '${DOMAIN}' is already in use by an existing tunnel."
+            exit 1
+        fi
+    else
+        # Interactive prompt — reopen /dev/tty in case stdin is a pipe
+        while true; do
+            echo -ne "  ${BOLD}Enter the new backup domain (e.g. backup.com)${NC} ${DIM}(h=help)${NC}: " >&2
+            read -r DOMAIN </dev/tty || { print_fail "Cannot read input (stdin is a pipe). Pass domain as argument: --add-domain example.com"; exit 1; }
+            DOMAIN=$(echo "$DOMAIN" | sed 's|^[[:space:]]*||;s|[[:space:]]*$||;s|^https\?://||;s|/.*$||')
+            if [[ -z "$DOMAIN" ]]; then
+                print_fail "Domain cannot be empty. Please try again."
+            elif [[ ! "$DOMAIN" =~ \. ]]; then
+                print_fail "Invalid domain (must contain a dot). Please try again."
+            elif [[ "$DOMAIN" =~ \.\. ]]; then
+                print_fail "Invalid domain (consecutive dots not allowed). Please try again."
+            elif [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+                print_fail "Invalid domain (use only letters, numbers, dots, hyphens). Please try again."
+            elif [[ -n "$existing_domains" ]] && echo "$existing_domains" | grep -qx "$DOMAIN"; then
+                print_fail "Domain '${DOMAIN}' is already in use by an existing tunnel. Please enter a different domain."
+            else
+                break
+            fi
+        done
+    fi
+
+    echo ""
+    print_ok "Domain: ${DOMAIN}"
+    echo ""
+
+    # DNS record setup
+    print_header "DNS Records for ${DOMAIN}"
+
+    echo ""
+    echo -e "  ${BOLD}How do you want to set up DNS records?${NC}"
+    echo ""
+    echo -e "  ${BOLD}1)${NC}  Automatic (Cloudflare API)"
+    echo -e "  ${BOLD}2)${NC}  Manual (create in dashboard)"
+    echo ""
+    local dns_choice
+    dns_choice=$(prompt_input "Select (1-2)" "2")
+
+    if [[ "$dns_choice" == "1" ]]; then
+        local cf_token
+        cf_token=$(prompt_input "Cloudflare API Token")
+        cf_token=$(echo "$cf_token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [[ -n "$cf_token" ]]; then
+            cloudflare_create_dns_records "$cf_token" "$DOMAIN" "$SERVER_IP" || true
+        else
+            print_fail "API token cannot be empty"
+            exit 1
+        fi
+    else
+        print_info "Create these records in Cloudflare for ${BOLD}${DOMAIN}${NC}:"
+        echo ""
+        print_box \
+            "Record 1:  Type: A   | Name: ns  | Value: ${SERVER_IP}" \
+            "           Proxy: OFF (DNS Only - grey cloud)" \
+            "" \
+            "Record 2:  Type: NS  | Name: t   | Value: ns.${DOMAIN}" \
+            "Record 3:  Type: NS  | Name: d   | Value: ns.${DOMAIN}" \
+            "Record 4:  Type: NS  | Name: s   | Value: ns.${DOMAIN}" \
+            "Record 5:  Type: NS  | Name: ds  | Value: ns.${DOMAIN}" \
+            "Record 6:  Type: NS  | Name: n   | Value: ns.${DOMAIN}" \
+            "Record 7:  Type: NS  | Name: z   | Value: ns.${DOMAIN}" \
+            "Record 8:  Type: NS  | Name: v   | Value: ns.${DOMAIN}" \
+            "Record 9:  Type: NS  | Name: vz  | Value: ns.${DOMAIN}"
+
+        echo ""
+        print_warn "IMPORTANT: The A record MUST be DNS Only (grey cloud, NOT orange)"
+        echo ""
+
+        if ! prompt_yn "Have you created these DNS records in Cloudflare?" "n"; then
+            echo ""
+            print_info "Please create the DNS records and re-run: sudo bash $0 --add-domain"
+            exit 0
+        fi
+    fi
+
+    echo ""
+
+    # Create tunnels with numbered tags
+    local slip_tag="slip${num}"
+    local dnstt_tag="dnstt${num}"
+    local slip_ssh_tag="slip-ssh${num}"
+    local dnstt_ssh_tag="dnstt-ssh${num}"
+
+    print_header "Creating Tunnels for ${DOMAIN}"
+
+    print_info "Creating 4 tunnels (set #${num}) for domain: ${BOLD}${DOMAIN}${NC}"
+    echo ""
+
+    # Detect existing SOCKS authentication via dnsgb
+    if detect_socks_auth; then
+        print_ok "Detected existing SOCKS authentication (user: ${SOCKS_USER})"
+    else
+        print_info "SOCKS proxy has no authentication configured"
+    fi
+    echo ""
+
+    # Ask for DNSTT MTU (use CLI value as default if provided via --mtu)
+    local mtu_input
+    mtu_input=$(prompt_input "DNSTT MTU size (512-1400, affects packet size)" "$DNSTT_MTU")
+    if [[ "$mtu_input" =~ ^[0-9]+$ ]] && [[ "$mtu_input" -ge 512 ]] && [[ "$mtu_input" -le 1400 ]]; then
+        DNSTT_MTU="$mtu_input"
+    else
+        print_warn "Invalid MTU value; using default ${DNSTT_MTU}"
+    fi
+    print_ok "DNSTT MTU: ${DNSTT_MTU}"
+    echo ""
+
+    # Tunnel 1: Slipstream + SOCKS
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel: Slipstream + SOCKS${NC}"
+    echo ""
+    if dnsgb tunnel add --transport slipstream --backend socks --domain "t.${DOMAIN}" --tag "$slip_tag" 2>&1; then
+        print_ok "Created: ${slip_tag} (Slipstream + SOCKS) on t.${DOMAIN}"
+    else
+        print_warn "Tunnel ${slip_tag} may already exist or creation failed"
+    fi
+    echo ""
+
+    # Tunnel 2: DNSTT + SOCKS
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel: DNSTT + SOCKS${NC}"
+    echo ""
+    local dnstt_output
+    dnstt_output=$(dnsgb tunnel add --transport dnstt --backend socks --domain "d.${DOMAIN}" --tag "$dnstt_tag" --mtu "$DNSTT_MTU" 2>&1) || true
+    echo "$dnstt_output"
+
+    DNSTT_PUBKEY=""
+    if [[ -f "/etc/dnsgb/tunnels/${dnstt_tag}/server.pub" ]]; then
+        DNSTT_PUBKEY=$(cat "/etc/dnsgb/tunnels/${dnstt_tag}/server.pub" 2>/dev/null || true)
+    fi
+
+    if [[ -n "$DNSTT_PUBKEY" ]]; then
+        print_ok "Created: ${dnstt_tag} (DNSTT + SOCKS) on d.${DOMAIN}"
+        echo ""
+        echo -e "  ${BOLD}${YELLOW}DNSTT Public Key (save this!):${NC}"
+        echo -e "  ${GREEN}${DNSTT_PUBKEY}${NC}"
+    else
+        print_warn "Tunnel ${dnstt_tag} may already exist or creation failed"
+    fi
+    echo ""
+
+    # Tunnel 3: Slipstream + SSH
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel: Slipstream + SSH${NC}"
+    echo ""
+    if dnsgb tunnel add --transport slipstream --backend ssh --domain "s.${DOMAIN}" --tag "$slip_ssh_tag" 2>&1; then
+        print_ok "Created: ${slip_ssh_tag} (Slipstream + SSH) on s.${DOMAIN}"
+    else
+        print_warn "Tunnel ${slip_ssh_tag} may already exist or creation failed"
+    fi
+    echo ""
+
+    # Tunnel 4: DNSTT + SSH
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel: DNSTT + SSH${NC}"
+    echo ""
+    if dnsgb tunnel add --transport dnstt --backend ssh --domain "ds.${DOMAIN}" --tag "$dnstt_ssh_tag" --mtu "$DNSTT_MTU" 2>&1; then
+        print_ok "Created: ${dnstt_ssh_tag} (DNSTT + SSH) on ds.${DOMAIN}"
+
+        create_edns_service_override "$dnstt_ssh_tag"
+        systemctl restart dnsgb-${dnstt_ssh_tag}.service 2>/dev/null || true
+    else
+        print_warn "Tunnel ${dnstt_ssh_tag} may already exist or creation failed"
+    fi
+    echo ""
+
+    # Re-read DNSTT key if not captured
+    if [[ -z "$DNSTT_PUBKEY" && -f "/etc/dnsgb/tunnels/${dnstt_tag}/server.pub" ]]; then
+        DNSTT_PUBKEY=$(cat "/etc/dnsgb/tunnels/${dnstt_tag}/server.pub" 2>/dev/null || true)
+    fi
+
+    # NoizDNS tunnels — download binary if not available, then create tunnels
+    ensure_noizdns_binary || true
+    if [[ -x /usr/local/bin/noizdns-server ]]; then
+        local noiz_tag="noiz${num}"
+        local noiz_ssh_tag="noiz-ssh${num}"
+
+        echo ""
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel: NoizDNS + SOCKS (DPI-resistant)${NC}"
+        echo ""
+        if dnsgb tunnel add --transport dnstt --backend socks --domain "n.${DOMAIN}" --tag "$noiz_tag" --mtu "$DNSTT_MTU" 2>&1; then
+            print_ok "Created: ${noiz_tag} (NoizDNS + SOCKS) on n.${DOMAIN}"
+        else
+            print_warn "Tunnel ${noiz_tag} may already exist or creation failed"
+        fi
+        create_noizdns_service_override "$noiz_tag" || print_warn "Could not set NoizDNS binary for ${noiz_tag}"
+
+        # Extract NoizDNS pubkey
+        if [[ -f "/etc/dnsgb/tunnels/${noiz_tag}/server.pub" ]]; then
+            NOIZDNS_PUBKEY=$(cat "/etc/dnsgb/tunnels/${noiz_tag}/server.pub" 2>/dev/null || true)
+        fi
+        echo ""
+
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel: NoizDNS + SSH (DPI-resistant)${NC}"
+        echo ""
+        if dnsgb tunnel add --transport dnstt --backend ssh --domain "z.${DOMAIN}" --tag "$noiz_ssh_tag" --mtu "$DNSTT_MTU" 2>&1; then
+            print_ok "Created: ${noiz_ssh_tag} (NoizDNS + SSH) on z.${DOMAIN}"
+        else
+            print_warn "Tunnel ${noiz_ssh_tag} may already exist or creation failed"
+        fi
+        create_noizdns_service_override "$noiz_ssh_tag" || print_warn "Could not set NoizDNS binary for ${noiz_ssh_tag}"
+        echo ""
+
+        # Stop NoizDNS tunnels so they restart with the correct binary
+        # (dnsgb tunnel add auto-starts with dnstt-server, not noizdns-server)
+        systemctl stop "dnsgb-${noiz_tag}.service" 2>/dev/null || true
+        systemctl stop "dnsgb-${noiz_ssh_tag}.service" 2>/dev/null || true
+
+        # Fix transport field if dnsgb rewrote it from "dnstt" to "noizdns"
+        fix_noizdns_transport
+    fi
+
+    # VayDNS tunnels — native (dnsgb v0.7.0+) or legacy (binary swap)
+    local _vay_native=false
+    if dnsgb_supports_vaydns; then
+        _vay_native=true
+    else
+        ensure_vaydns_binary || true
+    fi
+
+    if [[ "$_vay_native" == true ]] || [[ -x /usr/local/bin/vaydns-server ]]; then
+        local vay_tag="vay${num}"
+        local vay_ssh_tag="vay-ssh${num}"
+
+        echo ""
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel: VayDNS + SOCKS (optimized)${NC}"
+        echo ""
+        if [[ "$_vay_native" == true ]]; then
+            if dnsgb tunnel add --transport vaydns --backend socks --domain "v.${DOMAIN}" --tag "$vay_tag" --mtu "$DNSTT_MTU" --dnstt-compat 2>&1; then
+                print_ok "Created: ${vay_tag} (VayDNS + SOCKS) on v.${DOMAIN}"
+            else
+                print_warn "Tunnel ${vay_tag} may already exist or creation failed"
+            fi
+        else
+            if dnsgb tunnel add --transport dnstt --backend socks --domain "v.${DOMAIN}" --tag "$vay_tag" --mtu "$DNSTT_MTU" 2>&1; then
+                print_ok "Created: ${vay_tag} (VayDNS + SOCKS) on v.${DOMAIN}"
+            else
+                print_warn "Tunnel ${vay_tag} may already exist or creation failed"
+            fi
+            create_vaydns_service_override "$vay_tag" || print_warn "Could not set VayDNS binary for ${vay_tag}"
+        fi
+
+        if [[ -f "/etc/dnsgb/tunnels/${vay_tag}/server.pub" ]]; then
+            VAYDNS_PUBKEY=$(cat "/etc/dnsgb/tunnels/${vay_tag}/server.pub" 2>/dev/null || true)
+        fi
+        echo ""
+
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel: VayDNS + SSH (optimized)${NC}"
+        echo ""
+        if [[ "$_vay_native" == true ]]; then
+            if dnsgb tunnel add --transport vaydns --backend ssh --domain "vz.${DOMAIN}" --tag "$vay_ssh_tag" --mtu "$DNSTT_MTU" --dnstt-compat 2>&1; then
+                print_ok "Created: ${vay_ssh_tag} (VayDNS + SSH) on vz.${DOMAIN}"
+            else
+                print_warn "Tunnel ${vay_ssh_tag} may already exist or creation failed"
+            fi
+        else
+            if dnsgb tunnel add --transport dnstt --backend ssh --domain "vz.${DOMAIN}" --tag "$vay_ssh_tag" --mtu "$DNSTT_MTU" 2>&1; then
+                print_ok "Created: ${vay_ssh_tag} (VayDNS + SSH) on vz.${DOMAIN}"
+            else
+                print_warn "Tunnel ${vay_ssh_tag} may already exist or creation failed"
+            fi
+            create_vaydns_service_override "$vay_ssh_tag" || print_warn "Could not set VayDNS binary for ${vay_ssh_tag}"
+        fi
+        echo ""
+
+        # Legacy: stop services so they restart with the new binary
+        if [[ "$_vay_native" != true ]]; then
+            systemctl stop "dnsgb-${vay_tag}.service" 2>/dev/null || true
+            systemctl stop "dnsgb-${vay_ssh_tag}.service" 2>/dev/null || true
+            fix_vaydns_transport
+        fi
+    fi
+
+    print_ok "All tunnels created"
+    echo ""
+
+    # Reload systemd to pick up any service overrides (NoizDNS binary swap)
+    systemctl daemon-reload 2>/dev/null || true
+
+    # Stop router while we start tunnels (router crash-loops if backends are dead)
+    print_info "Stopping DNS Router..."
+    dnsgb router stop 2>/dev/null || true
+    sleep 1
+
+    # Start new tunnels FIRST (before router)
+    local _start_tags="$slip_tag $dnstt_tag $slip_ssh_tag $dnstt_ssh_tag"
+    if [[ -x /usr/local/bin/noizdns-server ]]; then
+        _start_tags+=" ${noiz_tag:-} ${noiz_ssh_tag:-}"
+    fi
+    if [[ -n "${vay_tag:-}" ]]; then
+        _start_tags+=" ${vay_tag} ${vay_ssh_tag:-}"
+    fi
+    print_info "Starting new tunnels..."
+    for tag in $_start_tags; do
+        [[ -z "$tag" ]] && continue
+        if dnsgb tunnel start --tag "$tag" 2>/dev/null; then
+            print_ok "Started: ${tag}"
+        else
+            if dnsgb_tag_exists "$tag" && dnsgb tunnel list 2>/dev/null | grep -wF "$tag" | grep -qi "running"; then
+                print_ok "Already running: ${tag}"
+            else
+                print_warn "Could not start: ${tag}. Check: dnsgb tunnel logs --tag ${tag}"
+            fi
+        fi
+    done
+
+    # Verify NoizDNS tunnels started — remove dead ones to protect router
+    sleep 3
+    for _ntag in ${noiz_tag:-} ${noiz_ssh_tag:-}; do
+        [[ -z "$_ntag" ]] && continue
+        if dnsgb_tag_exists "$_ntag"; then
+            if ! systemctl is-active --quiet "dnsgb-${_ntag}.service" 2>/dev/null; then
+                # Retry — give it more time before removing
+                print_info "Waiting for ${_ntag} to start..."
+                sleep 5
+                systemctl restart "dnsgb-${_ntag}.service" 2>/dev/null || true
+                sleep 3
+                if systemctl is-active --quiet "dnsgb-${_ntag}.service" 2>/dev/null; then
+                    print_ok "NoizDNS tunnel ${_ntag} started successfully (after retry)"
+                    continue
+                fi
+                print_warn "NoizDNS tunnel ${_ntag} failed to start — removing to protect DNS Router"
+                dnsgb tunnel stop --tag "$_ntag" 2>/dev/null || true
+                dnsgb tunnel remove --tag "$_ntag" 2>/dev/null || true
+                rm -f "/etc/systemd/system/dnsgb-${_ntag}.service.d/10-noizdns-binary.conf" 2>/dev/null || true
+                rmdir "/etc/systemd/system/dnsgb-${_ntag}.service.d" 2>/dev/null || true
+                systemctl daemon-reload 2>/dev/null || true
+                print_info "Removed ${_ntag} — other tunnels will work normally"
+            fi
+        fi
+    done
+
+    # Fix transport field if dnsgb rewrote it during start
+    fix_noizdns_transport
+
+    # Verify VayDNS tunnels started
+    for _vtag in ${vay_tag:-} ${vay_ssh_tag:-}; do
+        [[ -z "$_vtag" ]] && continue
+        if dnsgb_tag_exists "$_vtag"; then
+            if ! systemctl is-active --quiet "dnsgb-${_vtag}.service" 2>/dev/null; then
+                print_info "Waiting for ${_vtag} to start..."
+                sleep 5
+                systemctl restart "dnsgb-${_vtag}.service" 2>/dev/null || true
+                sleep 3
+                if systemctl is-active --quiet "dnsgb-${_vtag}.service" 2>/dev/null; then
+                    print_ok "VayDNS tunnel ${_vtag} started successfully (after retry)"
+                else
+                    print_warn "VayDNS tunnel ${_vtag} failed to start — removing to protect DNS Router"
+                    dnsgb tunnel stop --tag "$_vtag" 2>/dev/null || true
+                    dnsgb tunnel remove --tag "$_vtag" 2>/dev/null || true
+                    rm -f "/etc/systemd/system/dnsgb-${_vtag}.service.d/10-vaydns-binary.conf" 2>/dev/null || true
+                    rmdir "/etc/systemd/system/dnsgb-${_vtag}.service.d" 2>/dev/null || true
+                fi
+            fi
+        fi
+    done
+    fix_vaydns_transport
+
+    # NOW start the router (all backends are healthy)
+    echo ""
+    print_info "Starting DNS Router..."
+    if dnsgb router start 2>/dev/null; then
+        print_ok "DNS Router restarted"
+    else
+        print_warn "DNS Router restart may have issues. Check: dnsgb router logs"
+    fi
+
+    echo ""
+    print_info "All tunnels:"
+    echo ""
+    dnsgb tunnel list 2>/dev/null || true
+    echo ""
+
+    if apply_service_hardening; then
+        print_ok "Runtime hardening applied to dnsgb and microsocks services"
+    else
+        print_warn "Runtime hardening reported issues; review systemctl status for dnsgb units"
+    fi
+
+    # Summary
+    local w=54
+    local border empty
+    border=$(printf '═%.0s' $(seq 1 $w))
+    empty=$(printf ' %.0s' $(seq 1 $w))
+    local msg="DOMAIN ADDED!"
+    local ml=$(( (w - ${#msg}) / 2 ))
+    local mr=$(( w - ${#msg} - ml ))
+
+    echo -e "${BOLD}${GREEN}"
+    printf "  ╔%s╗\n" "$border"
+    printf "  ║%s║\n" "$empty"
+    printf "  ║%${ml}s%s%${mr}s║\n" "" "$msg" ""
+    printf "  ║%s║\n" "$empty"
+    printf "  ╚%s╝\n" "$border"
+    echo -e "${NC}"
+
+    echo -e "  ${BOLD}Server Information${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Server IP:     ${GREEN}${SERVER_IP}${NC}"
+    echo -e "  Domain:        ${GREEN}${DOMAIN}${NC}"
+    echo ""
+
+    echo -e "  ${BOLD}Tunnel Endpoints${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Slipstream + SOCKS:  ${GREEN}t.${DOMAIN}${NC}  (${slip_tag})"
+    echo -e "  DNSTT + SOCKS:       ${GREEN}d.${DOMAIN}${NC}  (${dnstt_tag})"
+    if [[ -n "${noiz_tag:-}" ]]; then
+        echo -e "  NoizDNS + SOCKS:     ${GREEN}n.${DOMAIN}${NC}  (${noiz_tag})  ${DIM}(DPI-resistant)${NC}"
+    fi
+    if [[ -n "${vay_tag:-}" ]]; then
+        echo -e "  VayDNS + SOCKS:      ${GREEN}v.${DOMAIN}${NC}  (${vay_tag})  ${DIM}(optimized)${NC}"
+    fi
+    echo -e "  Slipstream + SSH:    ${GREEN}s.${DOMAIN}${NC}  (${slip_ssh_tag})"
+    echo -e "  DNSTT + SSH:         ${GREEN}ds.${DOMAIN}${NC}  (${dnstt_ssh_tag})"
+    if [[ -n "${noiz_ssh_tag:-}" ]]; then
+        echo -e "  NoizDNS + SSH:       ${GREEN}z.${DOMAIN}${NC}  (${noiz_ssh_tag})  ${DIM}(DPI-resistant)${NC}"
+    fi
+    if [[ -n "${vay_ssh_tag:-}" ]]; then
+        echo -e "  VayDNS + SSH:        ${GREEN}vz.${DOMAIN}${NC}  (${vay_ssh_tag})  ${DIM}(optimized)${NC}"
+    fi
+    echo ""
+
+    if [[ -n "$DNSTT_PUBKEY" ]]; then
+        echo -e "  ${BOLD}DNSTT Public Keys${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}${dnstt_tag} (SOCKS):${NC}  ${DNSTT_PUBKEY}"
+        local _dnstt_ssh_pk=""
+        if [[ -f "/etc/dnsgb/tunnels/${dnstt_ssh_tag}/server.pub" ]]; then
+            _dnstt_ssh_pk=$(cat "/etc/dnsgb/tunnels/${dnstt_ssh_tag}/server.pub" 2>/dev/null || true)
+        fi
+        if [[ -n "$_dnstt_ssh_pk" ]]; then
+            echo -e "  ${GREEN}${dnstt_ssh_tag} (SSH):${NC} ${_dnstt_ssh_pk}"
+        fi
+        echo ""
+    fi
+
+    if [[ -n "${NOIZDNS_PUBKEY:-}" ]]; then
+        echo -e "  ${BOLD}NoizDNS Public Keys${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}${noiz_tag} (SOCKS):${NC}   ${NOIZDNS_PUBKEY}"
+        local _noiz_ssh_pk=""
+        if [[ -n "${noiz_ssh_tag:-}" && -f "/etc/dnsgb/tunnels/${noiz_ssh_tag}/server.pub" ]]; then
+            _noiz_ssh_pk=$(cat "/etc/dnsgb/tunnels/${noiz_ssh_tag}/server.pub" 2>/dev/null || true)
+        fi
+        if [[ -n "$_noiz_ssh_pk" ]]; then
+            echo -e "  ${GREEN}${noiz_ssh_tag} (SSH):${NC}  ${_noiz_ssh_pk}"
+        fi
+        echo ""
+    fi
+
+    if [[ -n "${VAYDNS_PUBKEY:-}" ]]; then
+        echo -e "  ${BOLD}VayDNS Public Keys${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}${vay_tag} (SOCKS):${NC}    ${VAYDNS_PUBKEY}"
+        local _vay_ssh_pk=""
+        if [[ -n "${vay_ssh_tag:-}" && -f "/etc/dnsgb/tunnels/${vay_ssh_tag}/server.pub" ]]; then
+            _vay_ssh_pk=$(cat "/etc/dnsgb/tunnels/${vay_ssh_tag}/server.pub" 2>/dev/null || true)
+        fi
+        if [[ -n "$_vay_ssh_pk" ]]; then
+            echo -e "  ${GREEN}${vay_ssh_tag} (SSH):${NC}   ${_vay_ssh_pk}"
+        fi
+        echo ""
+    fi
+
+    # Generate share URLs for new tunnels (dnst:// for dnstc CLI)
+    echo -e "  ${BOLD}Share URLs — dnst:// (for dnstc CLI)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    local share_url
+    local _socks_tags="$slip_tag $dnstt_tag"
+    [[ -n "${noiz_tag:-}" ]] && _socks_tags+=" $noiz_tag"
+    [[ -n "${vay_tag:-}" ]] && _socks_tags+=" $vay_tag"
+    for tag in $_socks_tags; do
+        share_url=$(dnsgb tunnel share -t "$tag" 2>/dev/null || true)
+        if [[ -n "$share_url" ]]; then
+            echo -e "  ${GREEN}${tag}:${NC} ${share_url}"
+        fi
+    done
+    echo ""
+    echo -e "  ${DIM}Note: SSH tunnel share URLs require credentials. Generate them with:${NC}"
+    echo -e "  ${DIM}  dnsgb tunnel share -t ${slip_ssh_tag} --user <username> --password <pass>${NC}"
+    echo -e "  ${DIM}  dnsgb tunnel share -t ${dnstt_ssh_tag} --user <username> --password <pass>${NC}"
+    if [[ -n "${noiz_ssh_tag:-}" ]]; then
+        echo -e "  ${DIM}  dnsgb tunnel share -t ${noiz_ssh_tag} --user <username> --password <pass>${NC}"
+    fi
+    if [[ -n "${vay_ssh_tag:-}" ]]; then
+        echo -e "  ${DIM}  dnsgb tunnel share -t ${vay_ssh_tag} --user <username> --password <pass>${NC}"
+    fi
+    echo ""
+
+    # Generate SlipNet deep-link URLs for new tunnels (slipnet:// for SlipNet app)
+    echo -e "  ${BOLD}Share URLs — slipnet:// (for SlipNet app)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    local slipnet_url
+    local s_user="" s_pass=""
+    if [[ "$SOCKS_AUTH" == true ]]; then
+        s_user="$SOCKS_USER"
+        s_pass="$SOCKS_PASS"
+    fi
+    local _slip_pk2=""
+    _slip_pk2=$(cat /etc/dnsgb/tunnels/*/server.pub 2>/dev/null | head -1 || true)
+    slipnet_url=$(generate_slipnet_url "ss" "t" "$_slip_pk2" "" "" "$s_user" "$s_pass")
+    echo -e "  ${GREEN}${slip_tag}:${NC}      ${slipnet_url}"
+    if [[ -n "$DNSTT_PUBKEY" ]]; then
+        slipnet_url=$(generate_slipnet_url "dnstt" "d" "$DNSTT_PUBKEY" "" "" "$s_user" "$s_pass")
+        echo -e "  ${GREEN}${dnstt_tag}:${NC}     ${slipnet_url}"
+    fi
+    if [[ -n "${NOIZDNS_PUBKEY:-}" ]]; then
+        slipnet_url=$(generate_slipnet_url "sayedns" "n" "$NOIZDNS_PUBKEY" "" "" "$s_user" "$s_pass")
+        echo -e "  ${GREEN}${noiz_tag}:${NC}      ${slipnet_url}"
+    fi
+    if [[ -n "${VAYDNS_PUBKEY:-}" ]]; then
+        slipnet_url=$(generate_slipnet_url "dnstt" "v" "$VAYDNS_PUBKEY" "" "" "$s_user" "$s_pass")
+        echo -e "  ${GREEN}${vay_tag}:${NC}       ${slipnet_url}"
+    fi
+
+    # Ask user for SSH credentials to generate SSH tunnel URLs
+    echo ""
+    if prompt_yn "Generate SSH tunnel slipnet:// URLs?" "y"; then
+        local ssh_tun_user ssh_tun_pass
+        ssh_tun_user=$(prompt_input "SSH tunnel username")
+        ssh_tun_pass=$(prompt_input "SSH tunnel password")
+        if [[ "$ssh_tun_user" == *"|"* || "$ssh_tun_pass" == *"|"* ]]; then
+            print_fail "Username/password cannot contain the | character"
+        elif [[ -n "$ssh_tun_user" && -n "$ssh_tun_pass" ]]; then
+            local _any_pk2=""
+            _any_pk2=$(cat /etc/dnsgb/tunnels/*/server.pub 2>/dev/null | head -1 || true)
+            slipnet_url=$(generate_slipnet_url "slipstream_ssh" "s" "$_any_pk2" "$ssh_tun_user" "$ssh_tun_pass" "$s_user" "$s_pass")
+            echo -e "  ${GREEN}${slip_ssh_tag}:${NC}  ${slipnet_url}"
+            # dnstt-ssh has its own keypair — read from its own tunnel dir
+            local _dnstt_ssh_pk=""
+            if [[ -f "/etc/dnsgb/tunnels/${dnstt_ssh_tag}/server.pub" ]]; then
+                _dnstt_ssh_pk=$(cat "/etc/dnsgb/tunnels/${dnstt_ssh_tag}/server.pub" 2>/dev/null || true)
+            fi
+            if [[ -n "$_dnstt_ssh_pk" ]]; then
+                slipnet_url=$(generate_slipnet_url "dnstt_ssh" "ds" "$_dnstt_ssh_pk" "$ssh_tun_user" "$ssh_tun_pass" "$s_user" "$s_pass")
+                echo -e "  ${GREEN}${dnstt_ssh_tag}:${NC} ${slipnet_url}"
+            fi
+            if [[ -n "${NOIZDNS_PUBKEY:-}" && -n "${noiz_ssh_tag:-}" ]]; then
+                local _noiz_ssh_pk2=""
+                if [[ -f "/etc/dnsgb/tunnels/${noiz_ssh_tag}/server.pub" ]]; then
+                    _noiz_ssh_pk2=$(cat "/etc/dnsgb/tunnels/${noiz_ssh_tag}/server.pub" 2>/dev/null || true)
+                fi
+                if [[ -n "$_noiz_ssh_pk2" ]]; then
+                    slipnet_url=$(generate_slipnet_url "sayedns_ssh" "z" "$_noiz_ssh_pk2" "$ssh_tun_user" "$ssh_tun_pass" "$s_user" "$s_pass")
+                    echo -e "  ${GREEN}${noiz_ssh_tag}:${NC} ${slipnet_url}"
+                fi
+            fi
+            if [[ -n "${VAYDNS_PUBKEY:-}" && -n "${vay_ssh_tag:-}" ]]; then
+                local _vay_ssh_pk2=""
+                if [[ -f "/etc/dnsgb/tunnels/${vay_ssh_tag}/server.pub" ]]; then
+                    _vay_ssh_pk2=$(cat "/etc/dnsgb/tunnels/${vay_ssh_tag}/server.pub" 2>/dev/null || true)
+                fi
+                if [[ -n "$_vay_ssh_pk2" ]]; then
+                    slipnet_url=$(generate_slipnet_url "dnstt_ssh" "vz" "$_vay_ssh_pk2" "$ssh_tun_user" "$ssh_tun_pass" "$s_user" "$s_pass")
+                    echo -e "  ${GREEN}${vay_ssh_tag}:${NC} ${slipnet_url}"
+                fi
+            fi
+        else
+            echo -e "  ${DIM}Skipped — username or password was empty.${NC}"
+        fi
+    fi
+    echo ""
+
+    echo -e "  ${DIM}To add more domains, run again: sudo bash $0 --add-domain${NC}"
+    echo ""
+}
+
+# ─── Parse Arguments ────────────────────────────────────────────────────────────
+
+ADD_DOMAIN_MODE=false
+ADD_DOMAIN_ARG=""
+ADD_XRAY_MODE=false
+HARDEN_ONLY_MODE=false
+CLEANUP_MODE=false
+UPDATE_MODE=false
+MANAGE_USERS_MODE=false
+DNSTT_MTU=1232
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        --about)
+            show_about
+            exit 0
+            ;;
+        --status)
+            do_status
+            exit 0
+            ;;
+        --monitor)
+            do_monitor
+            exit 0
+            ;;
+        --diag)
+            do_diag
+            exit 0
+            ;;
+        --manage)
+            do_manage
+            exit 0
+            ;;
+        --uninstall)
+            do_uninstall
+            exit 0
+            ;;
+        --remove-tunnel)
+            # If $2 looks like another flag (starts with --), treat as no tag given
+            if [[ -n "${2:-}" ]] && [[ "${2:0:2}" != "--" ]]; then
+                do_remove_tunnel "$2"
+            else
+                do_remove_tunnel ""
+            fi
+            exit 0
+            ;;
+        --add-tunnel)
+            do_add_tunnel
+            exit 0
+            ;;
+        --add-xray)
+            ADD_XRAY_MODE=true
+            shift
+            ;;
+        --add-domain)
+            ADD_DOMAIN_MODE=true
+            # Accept optional domain argument: --add-domain example.com
+            if [[ -n "${2:-}" ]] && [[ ! "$2" =~ ^-- ]]; then
+                ADD_DOMAIN_ARG="$2"
+                shift 2
+            else
+                shift
+            fi
+            ;;
+        --users)
+            MANAGE_USERS_MODE=true
+            shift
+            ;;
+        --harden)
+            HARDEN_ONLY_MODE=true
+            shift
+            ;;
+        --cleanup)
+            CLEANUP_MODE=true
+            shift
+            ;;
+        --update)
+            UPDATE_MODE=true
+            shift
+            ;;
+        --mtu)
+            if [[ -n "${2:-}" ]] && [[ "$2" =~ ^[0-9]+$ ]] && [[ "$2" -ge 512 ]] && [[ "$2" -le 1400 ]]; then
+                DNSTT_MTU="$2"
+                shift 2
+            else
+                echo "Error: --mtu requires a value between 512 and 1400"
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information."
+            exit 1
+            ;;
+    esac
+done
+
+# ─── Validate conflicting flags ──────────────────────────────────────────────────
+
+mode_count=0
+[[ "$ADD_DOMAIN_MODE" == true ]] && ((mode_count++)) || true
+[[ "$ADD_XRAY_MODE" == true ]] && ((mode_count++)) || true
+[[ "$HARDEN_ONLY_MODE" == true ]] && ((mode_count++)) || true
+[[ "$CLEANUP_MODE" == true ]] && ((mode_count++)) || true
+[[ "$UPDATE_MODE" == true ]] && ((mode_count++)) || true
+[[ "$MANAGE_USERS_MODE" == true ]] && ((mode_count++)) || true
+if [[ $mode_count -gt 1 ]]; then
+    echo "Error: --add-domain, --add-xray, --harden, --cleanup, --update, and --users cannot be combined."
+    exit 1
+fi
+
+# ─── Main ───────────────────────────────────────────────────────────────────────
+
+main() {
+    banner
+    echo -e "  ${DIM}Tip: Press 'h' at any prompt for help${NC}"
+
+    step_preflight
+    step_ask_domain
+    step_dns_records
+    step_free_port53
+    step_install_dnsgb
+    step_verify_port53
+    step_create_tunnels
+    step_start_services
+    step_verify_microsocks
+    step_ssh_user
+    step_tests
+    install_to_path
+    step_summary
+    unset SSH_PASS 2>/dev/null || true
+}
+
+if [[ "$HARDEN_ONLY_MODE" == true ]]; then
+    do_harden
+elif [[ "$CLEANUP_MODE" == true ]]; then
+    do_cleanup
+elif [[ "$UPDATE_MODE" == true ]]; then
+    do_update
+elif [[ "$ADD_DOMAIN_MODE" == true ]]; then
+    do_add_domain
+elif [[ "$ADD_XRAY_MODE" == true ]]; then
+    do_add_xray
+elif [[ "$MANAGE_USERS_MODE" == true ]]; then
+    do_manage_users
+else
+    main
+fi
+ || true)
+    if [[ -z "$tunnel_port" ]]; then return 1; fi
+
+    local privkey_path
+    privkey_path=$(echo "$orig_exec" | grep -oE '-privkey-files+[^ ]+' | sed 's/-privkey-files*//' || true)
+    if [[ -z "$privkey_path" ]]; then privkey_path="/etc/dnsgb/tunnels/${tag}/server.key"; fi
+
+    local mtu_val
+    mtu_val=$(echo "$orig_exec" | grep -oE '-mtus+[0-9]+' | grep -oE '[0-9]+' || true)
+    if [[ -z "$mtu_val" ]]; then mtu_val=1398; fi
+
+    local positional
+    positional=$(echo "$orig_exec" | sed 's|^ExecStart=[^ ]*||; s|-udp[[:space:]]*[^ ]*||; s|-privkey-file[[:space:]]*[^ ]*||; s|-mtu[[:space:]]*[0-9]*||' | xargs || true)
+    domain=$(echo "$positional" | awk '{print $1}')
+    upstream=$(echo "$positional" | awk '{print $2}')
+    if [[ -z "$domain" || -z "$upstream" ]]; then return 1; fi
+
+    local up_port=$((tunnel_port + 10000))
+    if [[ "$up_port" -gt 65535 ]]; then up_port=$((tunnel_port - 10000)); fi
+
+    mkdir -p "$dropin_dir" 2>/dev/null || true
+
+    cat > "$dropin_file" <<EOF
+[Service]
+ExecStart=
+ExecStart=/bin/sh -c 'python3 /usr/local/bin/dnsgb-edns-proxy.py 127.0.0.1 ${tunnel_port} 127.0.0.1 ${up_port} 1800 ${mtu_val} & exec /usr/local/bin/dnstt-server -udp :${up_port} -privkey-file ${privkey_path} -mtu ${mtu_val} ${domain} ${upstream}'
+EOF
+    systemctl daemon-reload
+    print_ok "EDNS Proxy override added: ${service}"
+}
+
+create_noizdns_service_override() {
+    local tag="$1"
+    local service="dnsgb-${tag}.service"
+    local dropin_dir="/etc/systemd/system/${service}.d"
+    local dropin_file="${dropin_dir}/10-noizdns-binary.conf"
+
+    # Read original ExecStart to extract port, key, MTU, domain, upstream
+    local orig_exec
+    orig_exec=$(systemctl cat "$service" 2>/dev/null | grep '^ExecStart=/' | head -1 || true)
+    if [[ -z "$orig_exec" ]]; then
+        orig_exec=$(systemctl cat "$service" 2>/dev/null | grep '^ExecStart=.*dnstt-server' | tail -1 || true)
+    fi
+    if [[ -z "$orig_exec" ]]; then
+        print_fail "Could not read ExecStart from ${service}"
+        return 1
+    fi
+
+    # Extract components from original ExecStart
+    # Original: /path/dnstt-server -udp :5300 -privkey-file KEY [-mtu MTU] DOMAIN UPSTREAM
+    local tunnel_port privkey_path mtu_val domain upstream
+
+    # Extract -udp port (e.g., ":5300" or "5300")
+    tunnel_port=$(echo "$orig_exec" | grep -oE '\-udp[[:space:]]+[^ ]+' | grep -oE '[0-9]+$' || true)
+    if [[ -z "$tunnel_port" ]]; then
+        print_fail "Could not detect tunnel port from ${service}"
+        return 1
+    fi
+
+    # Extract -privkey-file path
+    privkey_path=$(echo "$orig_exec" | grep -oE '\-privkey-file\s+[^ ]+' | sed 's/-privkey-file\s*//' || true)
+    if [[ -z "$privkey_path" ]]; then
+        privkey_path="/etc/dnsgb/tunnels/${tag}/server.key"
+    fi
+
+    # Extract -mtu value (optional)
+    mtu_val=$(echo "$orig_exec" | grep -oE '\-mtu\s+[0-9]+' | grep -oE '[0-9]+' || true)
+    local mtu_arg=""
+    if [[ -n "$mtu_val" ]]; then
+        mtu_arg=" -mtu ${mtu_val}"
+    fi
+
+    # Extract domain and upstream (last two positional args)
+    # Strip all flags and their values, leaving just positional args
+    local positional
+    positional=$(echo "$orig_exec" | sed 's|^ExecStart=[^ ]*||; s|-udp[[:space:]]*[^ ]*||; s|-privkey-file[[:space:]]*[^ ]*||; s|-mtu[[:space:]]*[0-9]*||' | xargs || true)
+    domain=$(echo "$positional" | awk '{print $1}')
+    upstream=$(echo "$positional" | awk '{print $2}')
+
+    if [[ -z "$domain" || -z "$upstream" ]]; then
+        print_fail "Could not parse domain/upstream from ${service}"
+        return 1
+    fi
+
+    if ! mkdir -p "$dropin_dir" 2>/dev/null; then
+        print_fail "Could not create drop-in directory: ${dropin_dir}"
+        return 1
+    fi
+
+    # Write PT-mode drop-in (NoizDNS uses TOR_PT_* env vars instead of -udp flag)
+    cat > "$dropin_file" <<EOF || { print_fail "Could not write NoizDNS override: ${dropin_file}"; return 1; }
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/noizdns-server -privkey-file ${privkey_path}${mtu_arg} ${domain}
+Environment=TOR_PT_MANAGED_TRANSPORT_VER=1
+Environment=TOR_PT_SERVER_TRANSPORTS=dnstt
+Environment=TOR_PT_SERVER_BINDADDR=dnstt-0.0.0.0:${tunnel_port}
+Environment=TOR_PT_ORPORT=${upstream}
+EOF
+    print_ok "NoizDNS binary override (PT mode): ${service}"
+}
+
+# ─── VayDNS Binary Download ──────────────────────────────────────────────────
+
+# Download and verify the VayDNS server binary if not already installed.
+# Returns 0 if binary is available (already existed or freshly downloaded), 1 otherwise.
+ensure_vaydns_binary() {
+    local _is_elf=false
+    if [[ -x /usr/local/bin/vaydns-server ]]; then
+        if command -v file &>/dev/null; then
+            file /usr/local/bin/vaydns-server 2>/dev/null | grep -qi "ELF" && _is_elf=true
+        fi
+        if [[ "$_is_elf" != true ]]; then
+            local _magic
+            _magic=$(xxd -l 4 -p /usr/local/bin/vaydns-server 2>/dev/null || od -A n -t x1 -N 4 /usr/local/bin/vaydns-server 2>/dev/null | tr -d ' ')
+            [[ "$_magic" == "7f454c46" ]] && _is_elf=true
+        fi
+        if [[ "$_is_elf" == true ]]; then
+            return 0
+        fi
+        print_warn "Existing VayDNS binary is invalid — re-downloading..."
+        rm -f /usr/local/bin/vaydns-server
+    fi
+
+    print_info "Downloading VayDNS server (optimized DNS tunnel)..."
+
+    local arch
+    arch=$(detect_architecture)
+
+    local vaydns_downloaded=false
+    local vaydns_release_url="https://github.com/net2share/vaydns/releases/latest/download/vaydns-server-linux-${arch}"
+
+    if curl -fSL --progress-bar --connect-timeout 10 --max-time 60 -o /usr/local/bin/vaydns-server "$vaydns_release_url" 2>/dev/null; then
+        vaydns_downloaded=true
+    fi
+
+    if [[ "$vaydns_downloaded" == true ]]; then
+        chmod +x /usr/local/bin/vaydns-server
+        if [[ ! -s /usr/local/bin/vaydns-server ]]; then
+            print_warn "VayDNS binary is empty (download may have failed)"
+            rm -f /usr/local/bin/vaydns-server
+            return 1
+        fi
+        local magic
+        magic=$(xxd -l 4 -p /usr/local/bin/vaydns-server 2>/dev/null || od -A n -t x1 -N 4 /usr/local/bin/vaydns-server 2>/dev/null | tr -d ' ')
+        if [[ "$magic" == "7f454c46" ]]; then
+            print_ok "VayDNS server installed and verified"
+            return 0
+        else
+            print_warn "VayDNS binary is not a valid ELF executable"
+            rm -f /usr/local/bin/vaydns-server
+            return 1
+        fi
+    else
+        print_warn "Could not download VayDNS server (GitHub may be blocked)"
+        print_info "Manual install: curl -fsSL -o /usr/local/bin/vaydns-server ${vaydns_release_url} && chmod +x /usr/local/bin/vaydns-server"
+        return 1
+    fi
+}
+
+# Fix VayDNS tunnel transport in dnsgb config.json.
+# Newer dnsgb may support "vaydns" as a transport type; older only knows "dnstt".
+fix_vaydns_transport() {
+    local config="/etc/dnsgb/config.json"
+    [[ -f "$config" ]] || return 0
+    command -v jq &>/dev/null || return 0
+
+    local supports_vaydns=false
+    if timeout 5 dnsgb tunnel add --help 2>&1 | grep -qi "vaydns" || \
+       timeout 5 dnsgb --help 2>&1 | grep -qi "vaydns"; then
+        supports_vaydns=true
+    fi
+
+    local changed=false
+    local tmp_config="${config}.tmp.$$"
+
+    if [[ "$supports_vaydns" == true ]]; then
+        if jq -e '.tunnels[]? | select(.tag | test("^vay")) | select(.transport == "dnstt")' "$config" &>/dev/null; then
+            if jq '(.tunnels[]? | select(.tag | test("^vay")) | select(.transport == "dnstt") | .transport) = "vaydns"' "$config" > "$tmp_config" 2>/dev/null; then
+                mv "$tmp_config" "$config"
+                changed=true
+                print_ok "Fixed VayDNS tunnel transport in dnsgb config (dnstt → vaydns)"
+            else
+                rm -f "$tmp_config"
+            fi
+        fi
+    else
+        if jq -e '.tunnels[]? | select(.tag | test("^vay")) | select(.transport == "vaydns")' "$config" &>/dev/null; then
+            if jq '(.tunnels[]? | select(.tag | test("^vay")) | select(.transport == "vaydns") | .transport) = "dnstt"' "$config" > "$tmp_config" 2>/dev/null; then
+                mv "$tmp_config" "$config"
+                changed=true
+                print_ok "Fixed VayDNS tunnel transport in dnsgb config (vaydns → dnstt for older dnsgb)"
+            else
+                rm -f "$tmp_config"
+            fi
+        fi
+    fi
+}
+
+# Override a DNSTT tunnel's systemd service to use the VayDNS binary instead.
+# VayDNS supports -udp directly (unlike NoizDNS which needs PT mode) and uses
+# named flags (-domain, -upstream) instead of positional args. Adds -dnstt-compat
+# for backwards compatibility with SlipNet's built-in dnstt client.
+# Usage: create_vaydns_service_override <tag>
+create_vaydns_service_override() {
+    local tag="$1"
+    local service="dnsgb-${tag}.service"
+    local dropin_dir="/etc/systemd/system/${service}.d"
+    local dropin_file="${dropin_dir}/10-vaydns-binary.conf"
+
+    local orig_exec
+    orig_exec=$(systemctl cat "$service" 2>/dev/null | grep '^ExecStart=/' | head -1 || true)
+    if [[ -z "$orig_exec" ]]; then
+        orig_exec=$(systemctl cat "$service" 2>/dev/null | grep '^ExecStart=.*dnstt-server' | tail -1 || true)
+    fi
+    if [[ -z "$orig_exec" ]]; then
+        print_fail "Could not read ExecStart from ${service}"
+        return 1
+    fi
+
+    # Extract components from original ExecStart
+    # Original: /path/dnstt-server -udp :PORT -privkey-file KEY [-mtu MTU] DOMAIN UPSTREAM
+    local tunnel_port privkey_path mtu_val domain upstream
+
+    tunnel_port=$(echo "$orig_exec" | grep -oE '\-udp[[:space:]]+[^ ]+' | grep -oE '[0-9]+$' || true)
+    if [[ -z "$tunnel_port" ]]; then
+        print_fail "Could not detect tunnel port from ${service}"
+        return 1
+    fi
+
+    privkey_path=$(echo "$orig_exec" | grep -oE '\-privkey-file\s+[^ ]+' | sed 's/-privkey-file\s*//' || true)
+    if [[ -z "$privkey_path" ]]; then
+        privkey_path="/etc/dnsgb/tunnels/${tag}/server.key"
+    fi
+
+    mtu_val=$(echo "$orig_exec" | grep -oE '\-mtu\s+[0-9]+' | grep -oE '[0-9]+' || true)
+    local mtu_arg=""
+    if [[ -n "$mtu_val" ]]; then
+        mtu_arg=" -mtu ${mtu_val}"
+    fi
+
+    # Extract domain and upstream (last two positional args in dnstt)
+    local positional
+    positional=$(echo "$orig_exec" | sed 's|^ExecStart=[^ ]*||; s|-udp[[:space:]]*[^ ]*||; s|-privkey-file[[:space:]]*[^ ]*||; s|-mtu[[:space:]]*[0-9]*||' | xargs || true)
+    domain=$(echo "$positional" | awk '{print $1}')
+    upstream=$(echo "$positional" | awk '{print $2}')
+
+    if [[ -z "$domain" || -z "$upstream" ]]; then
+        print_fail "Could not parse domain/upstream from ${service}"
+        return 1
+    fi
+
+    if ! mkdir -p "$dropin_dir" 2>/dev/null; then
+        print_fail "Could not create drop-in directory: ${dropin_dir}"
+        return 1
+    fi
+
+    # VayDNS uses named flags (-domain, -upstream) + -dnstt-compat for SlipNet compatibility
+    cat > "$dropin_file" <<EOF || { print_fail "Could not write VayDNS override: ${dropin_file}"; return 1; }
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/vaydns-server -udp :${tunnel_port} -privkey-file ${privkey_path}${mtu_arg} -dnstt-compat -domain ${domain} -upstream ${upstream}
+EOF
+    print_ok "VayDNS binary override: ${service}"
+}
+
+# Main Xray backend integration function
+do_add_xray() {
+    banner
+
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "  ${CROSS} Not running as root. Please run with: sudo bash $0 --add-xray"
+        exit 1
+    fi
+
+    if ! command -v dnsgb &>/dev/null; then
+        print_fail "dnsgb is not installed. Run the full setup first: sudo bash $0"
+        exit 1
+    fi
+
+    print_header "Xray Backend via DNS Tunnel"
+
+    echo ""
+    echo -e "  ${BOLD}How this works:${NC}"
+    echo -e "  ${DIM}This connects your existing Xray panel (3x-ui) to a DNSTT tunnel.${NC}"
+    echo -e "  ${DIM}A new internal-only Xray inbound is created on 127.0.0.1, then a${NC}"
+    echo -e "  ${DIM}DNSTT tunnel is set up to forward DNS traffic to that inbound.${NC}"
+    echo ""
+    echo -e "  ${DIM}Flow: Phone (SlipNet+Nekobox) → DNS tunnel → Xray inbound → Internet${NC}"
+    echo ""
+
+    # Ensure required tools are available
+    if ! command -v curl &>/dev/null; then
+        print_fail "curl is required but not installed. Install it: apt-get install curl"
+        exit 1
+    fi
+    if ! command -v jq &>/dev/null; then
+        print_info "Installing jq..."
+        if apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq jq >/dev/null 2>&1; then
+            print_ok "Installed jq"
+        else
+            print_fail "Failed to install jq. Install it manually: apt-get install jq"
+            exit 1
+        fi
+    fi
+
+    # Detect server IP
+    SERVER_IP=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || curl -4 -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
+    if [[ -n "$SERVER_IP" ]]; then
+        print_ok "Server IP: ${SERVER_IP}"
+    else
+        print_warn "Could not detect server IP"
+        SERVER_IP=$(prompt_input "Enter server IP manually" "")
+        if [[ -z "$SERVER_IP" ]]; then
+            print_fail "Server IP is required."
+            exit 1
+        fi
+    fi
+
+    # Show current tunnels
+    echo ""
+    print_info "Current tunnels:"
+    echo ""
+    dnsgb tunnel list 2>/dev/null || print_info "(none)"
+    echo ""
+
+    # 1. Detect Xray panel
+    print_info "Detecting Xray panel..."
+    detect_xray_panel
+
+    if [[ "$XRAY_PANEL_TYPE" == "none" ]]; then
+        echo ""
+        print_warn "No Xray installation detected on this server."
+        echo ""
+        echo -e "  ${BOLD}How would you like to set up Xray?${NC}"
+        echo -e "  ${BOLD}1)${NC}  Full panel (3x-ui)   ${DIM}— web dashboard, user management, traffic stats${NC}"
+        echo -e "  ${BOLD}2)${NC}  Headless (Xray only) ${DIM}— no web panel, lightweight, config-based${NC}"
+        echo -e "  ${BOLD}0)${NC}  Cancel"
+        echo ""
+        local install_choice
+        install_choice=$(prompt_input "Select (0-2)" "1")
+
+        case "$install_choice" in
+            1)
+                # Full panel install
+                echo ""
+                echo -e "  ${BOLD}3x-ui Panel Setup${NC}"
+                echo -e "  ${DIM}Choose admin credentials and panel port.${NC}"
+                echo ""
+                local new_user new_pass new_port
+                new_user=$(prompt_input "Panel admin username" "admin")
+                echo ""
+                new_pass=$(prompt_input "Panel admin password" "password")
+                echo ""
+                new_port=$(prompt_input "Panel web port" "2053")
+                if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [[ "$new_port" -lt 1 ]] || [[ "$new_port" -gt 65535 ]]; then
+                    new_port=2053
+                fi
+                echo ""
+
+                install_3xui "$new_user" "$new_pass" "$new_port" || return 1
+
+                # Use ACTUAL values (may differ from requested if sqlite3 failed)
+                XRAY_PANEL_TYPE="3xui"
+                XRAY_PANEL_PORT="${INSTALL_3XUI_ACTUAL_PORT}"
+                XRAY_PANEL_RUNNING=true
+                XRAY_ADMIN_USER="${INSTALL_3XUI_ACTUAL_USER}"
+                XRAY_ADMIN_PASS="${INSTALL_3XUI_ACTUAL_PASS}"
+
+                echo ""
+                echo -e "  ${BOLD}Panel Access${NC}"
+                echo -e "  ${DIM}────────────────────────────────────────${NC}"
+                echo -e "  URL:       ${GREEN}http://${SERVER_IP}:${XRAY_PANEL_PORT}${NC}"
+                echo -e "  Username:  ${GREEN}${XRAY_ADMIN_USER}${NC}"
+                echo -e "  Password:  ${GREEN}${XRAY_ADMIN_PASS}${NC}"
+                echo ""
+                ;;
+            2)
+                # Headless install
+                echo ""
+                install_xray_headless || return 1
+                XRAY_PANEL_TYPE="headless"
+                XRAY_PANEL_RUNNING=true
+                echo ""
+                ;;
+            0|*)
+                echo ""
+                print_info "Cancelled."
+                return 0
+                ;;
+        esac
+    else
+        local _detect_msg="Detected: 3x-ui (port ${XRAY_PANEL_PORT})"
+        [[ -n "${XRAY_PANEL_BASEPATH:-}" ]] && _detect_msg+=", base path: /${XRAY_PANEL_BASEPATH}"
+        print_ok "$_detect_msg"
+    fi
+
+    # 2. Get panel credentials (skip for headless — no panel API needed)
+    if [[ "$XRAY_PANEL_TYPE" == "3xui" && -z "${XRAY_ADMIN_USER:-}" ]]; then
+        get_3xui_credentials || return 1
+    fi
+
+    # 3. Choose protocol
+    pick_xray_protocol || return 1
+
+    # 4. Pick port for internal inbound
+    pick_xray_port || return 1
+
+    # 5. Get domain
+    echo ""
+    echo -e "  ${BOLD}Domain Configuration${NC}"
+    echo -e "  ${DIM}The Xray tunnel will use subdomain: x.<your-domain>${NC}"
+    echo ""
+
+    # Try to detect domain from existing tunnels
+    local detected_domain=""
+    detected_domain=$(dnsgb tunnel list 2>/dev/null | grep -o 'domain=[^ ]*' | head -1 | sed 's/domain=//' | sed 's/^[^.]*\.//' || true)
+
+    if [[ -n "$detected_domain" ]]; then
+        DOMAIN=$(prompt_input "Domain" "$detected_domain")
+    else
+        DOMAIN=$(prompt_input "Enter your domain (e.g. example.com)" "")
+    fi
+
+    if [[ -z "$DOMAIN" ]]; then
+        print_fail "Domain is required."
+        return 1
+    fi
+    print_ok "Tunnel domain: x.${DOMAIN}"
+
+    # Check if x.DOMAIN tunnel already exists (prevent duplicates)
+    if dnsgb tunnel list 2>/dev/null | grep -q "domain=x\.${DOMAIN}"; then
+        print_fail "A tunnel for x.${DOMAIN} already exists."
+        print_info "Remove it first with: sudo bash $0 --remove-tunnel"
+        return 1
+    fi
+
+    # 6. Create Xray inbound
+    echo ""
+    if [[ "$XRAY_PANEL_TYPE" == "headless" ]]; then
+        create_headless_xray_inbound || return 1
+    else
+        create_3xui_inbound || return 1
+    fi
+
+    # 7. Create DNSTT tunnel via dnsgb
+    echo ""
+
+    # Determine tag — check existing xray tags and increment (exact match)
+    local xray_num=1
+    while dnsgb_tag_exists "xray${xray_num}"; do
+        xray_num=$((xray_num + 1))
+    done
+    local tag="xray${xray_num}"
+
+    print_info "Creating DNSTT tunnel: ${tag} (x.${DOMAIN})..."
+    local mtu_flag=""
+    if [[ -n "${DNSTT_MTU:-}" ]]; then
+        mtu_flag="--mtu ${DNSTT_MTU}"
+    fi
+    # shellcheck disable=SC2086
+    local create_output
+    create_output=$(dnsgb tunnel add --transport dnstt --backend socks --domain "x.${DOMAIN}" --tag "$tag" $mtu_flag 2>&1) || true
+    echo "$create_output"
+
+    if ! dnsgb_tag_exists "${tag}"; then
+        print_fail "Tunnel creation failed."
+        if [[ "$XRAY_PANEL_TYPE" == "headless" ]]; then
+            print_info "Note: Xray inbound on port ${XRAY_INBOUND_PORT} was added to config.json but the tunnel failed."
+            print_info "Remove it manually: edit /usr/local/etc/xray/config.json"
+        else
+            print_info "Note: Xray inbound on port ${XRAY_INBOUND_PORT} was created in 3x-ui but the tunnel failed."
+            print_info "Remove it manually from the panel dashboard if needed."
+        fi
+        return 1
+    fi
+    print_ok "Created tunnel: ${tag}"
+
+    # 8. Override upstream to point at Xray instead of microsocks
+    echo ""
+    print_info "Redirecting tunnel upstream to Xray..."
+    if ! create_xray_service_override "$tag" "$XRAY_INBOUND_PORT" "x.${DOMAIN}"; then
+        # Rollback: remove the tunnel we just created
+        print_warn "Service override failed. Rolling back tunnel..."
+        dnsgb tunnel stop --tag "$tag" 2>/dev/null || true
+        dnsgb tunnel remove --tag "$tag" 2>/dev/null || true
+        if [[ "$XRAY_PANEL_TYPE" == "headless" ]]; then
+            print_info "Note: Xray inbound on port ${XRAY_INBOUND_PORT} was added to config.json but not cleaned up."
+            print_info "Remove it manually: edit /usr/local/etc/xray/config.json"
+        else
+            print_info "Note: Xray inbound on port ${XRAY_INBOUND_PORT} was NOT removed from 3x-ui panel."
+            print_info "Remove it manually from the panel dashboard if needed."
+        fi
+        return 1
+    fi
+
+    # 9. Reload and start
+    if ! systemctl daemon-reload 2>/dev/null; then
+        print_warn "systemctl daemon-reload failed — continuing anyway"
+    fi
+    print_info "Starting tunnel: ${tag}..."
+    # Use restart (not start) to ensure the service override takes effect
+    # If the tunnel was auto-started by dnsgb, 'start' would be a no-op
+    if systemctl restart "dnsgb-${tag}.service" 2>/dev/null; then
+        print_ok "Started: ${tag}"
+    elif dnsgb tunnel start --tag "$tag" 2>/dev/null; then
+        print_ok "Started: ${tag}"
+    else
+        print_warn "Could not start tunnel. Check: dnsgb tunnel logs --tag ${tag}"
+    fi
+
+    print_info "Restarting DNS Router..."
+    dnsgb router stop 2>/dev/null || true
+    sleep 1
+    if dnsgb router start 2>/dev/null; then
+        print_ok "DNS Router restarted"
+    else
+        print_warn "DNS Router restart may have issues. Check: dnsgb router logs"
+    fi
+
+    # 10. Save config
+    save_xray_config "$tag" || print_warn "Could not save Xray config (tunnel is running but config not persisted)"
+
+    # 11. Show DNSTT public key
+    local pubkey=""
+    if [[ -f "/etc/dnsgb/tunnels/${tag}/server.pub" ]]; then
+        pubkey=$(cat "/etc/dnsgb/tunnels/${tag}/server.pub" 2>/dev/null || true)
+    fi
+
+    # 12. Summary
+    echo ""
+    echo ""
+    echo -e "  ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${GREEN}${BOLD}  XRAY BACKEND TUNNEL CREATED  ${NC}"
+    echo -e "  ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  ${BOLD}Server Info${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Server IP :  ${GREEN}${SERVER_IP}${NC}"
+    echo -e "  Domain    :  ${GREEN}x.${DOMAIN}${NC}"
+    echo -e "  Tag       :  ${GREEN}${tag}${NC}"
+    echo ""
+    echo -e "  ${BOLD}Xray Inbound${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Protocol  :  ${GREEN}${XRAY_PROTOCOL}${NC}"
+    echo -e "  Port      :  ${GREEN}${XRAY_INBOUND_PORT}${NC} ${DIM}(127.0.0.1 only)${NC}"
+    if [[ -n "$XRAY_UUID" ]]; then
+        echo -e "  UUID      :  ${GREEN}${XRAY_UUID}${NC}"
+    fi
+    if [[ -n "$XRAY_PASSWORD" ]]; then
+        echo -e "  Password  :  ${GREEN}${XRAY_PASSWORD}${NC}"
+    fi
+    echo ""
+
+    if [[ -n "$pubkey" ]]; then
+        echo -e "  ${BOLD}DNSTT Public Key${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}${pubkey}${NC}"
+        echo ""
+    fi
+
+    # Generate client URI
+    local credential
+    if [[ -n "$XRAY_UUID" ]]; then
+        credential="$XRAY_UUID"
+    else
+        credential="$XRAY_PASSWORD"
+    fi
+    # Use 127.0.0.1 as address — client connects through DNSTT tunnel (SlipNet),
+    # so traffic exits on the server side where Xray listens on localhost only
+    local client_uri
+    client_uri=$(generate_xray_client_uri "$XRAY_PROTOCOL" "127.0.0.1" "$XRAY_INBOUND_PORT" "$credential" "DNSTT-${XRAY_PROTOCOL}")
+
+    echo -e "  ${BOLD}Client URI (for Nekobox)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  ${GREEN}${client_uri}${NC}"
+    echo ""
+
+    # Generate slipnet:// URL for this tunnel (include SOCKS auth if configured)
+    if [[ -n "$pubkey" ]]; then
+        local s_user="" s_pass=""
+        detect_socks_auth 2>/dev/null || true
+        if [[ "${SOCKS_AUTH:-}" == true ]]; then
+            s_user="${SOCKS_USER:-}"
+            s_pass="${SOCKS_PASS:-}"
+        fi
+        local slipnet_url
+        slipnet_url=$(generate_slipnet_url "dnstt" "x" "$pubkey" "" "" "$s_user" "$s_pass")
+        echo -e "  ${BOLD}SlipNet URL (for DNSTT tunnel)${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}${slipnet_url}${NC}"
+        echo ""
+    fi
+
+    echo -e "  ${BOLD}Required DNS Record (Cloudflare)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Type: ${YELLOW}NS${NC}  │  Name: ${YELLOW}x${NC}  │  Value: ${YELLOW}ns.${DOMAIN}${NC}"
+    echo -e "  ${DIM}Proxy: OFF (grey cloud)${NC}"
+    echo ""
+
+    echo -e "  ${BOLD}Client Setup (Nekobox + SlipNet)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  ${DIM}1. Import SlipNet URL above into SlipNet app${NC}"
+    echo -e "  ${DIM}2. Enable 'Proxy Only Mode' in SlipNet (SOCKS on 127.0.0.1:1080)${NC}"
+    echo -e "  ${DIM}3. In Nekobox, add new proxy using the Client URI above${NC}"
+    echo -e "  ${DIM}4. In Nekobox, chain it through SlipNet's SOCKS proxy${NC}"
+    echo -e "  ${DIM}5. Enable 'UDP over TCP' in both configs${NC}"
+    echo -e "  ${DIM}6. Bypass SlipNet from Nekobox routing to avoid loops${NC}"
+    echo ""
+    echo -e "  ${DIM}Management: sudo bash $0 --manage${NC}"
+    echo -e "  ${DIM}Status:     sudo bash $0 --status${NC}"
+    echo ""
+}
+
+# ─── --manage ────────────────────────────────────────────────────────────────────
+
+do_manage() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "  ${CROSS} Not running as root. Please run with: sudo bash $0 --manage"
+        exit 1
+    fi
+
+    if ! command -v dnsgb &>/dev/null; then
+        print_fail "dnsgb is not installed. Run the full setup first: sudo bash $0"
+        exit 1
+    fi
+
+    # Trap SIGINT in the parent so Ctrl+C only kills the subshell,
+    # not the entire manage menu. Restore default trap on exit.
+    trap '' INT
+
+    while true; do
+        banner
+        print_header "Management Menu"
+        echo ""
+
+        echo -e "  ${BOLD}1)${NC}  Show status          ${DIM}(tunnels, credentials, share URLs)${NC}"
+        echo -e "  ${BOLD}2)${NC}  Add tunnel            ${DIM}(single tunnel — pick transport & backend)${NC}"
+        echo -e "  ${BOLD}3)${NC}  Remove tunnel         ${DIM}(pick one to remove)${NC}"
+        echo -e "  ${BOLD}4)${NC}  Add backup domain     ${DIM}(new domain → 4 more tunnels)${NC}"
+        echo -e "  ${BOLD}5)${NC}  Manage SSH users      ${DIM}(add, list, update, delete)${NC}"
+        echo -e "  ${BOLD}6)${NC}  Configure SOCKS auth  ${DIM}(enable, disable, or change credentials)${NC}"
+        echo -e "  ${BOLD}7)${NC}  Apply hardening       ${DIM}(systemd security for all services)${NC}"
+        echo -e "  ${BOLD}8)${NC}  Xray backend          ${DIM}(connect 3x-ui panel via DNS tunnel)${NC}"
+        echo -e "  ${BOLD}9)${NC}  Change DNSTT MTU      ${DIM}(change MTU on existing DNSTT tunnels)${NC}"
+        echo ""
+        echo -e "  ${DIM}──────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}10)${NC} Update script         ${DIM}(check for new versions)${NC}"
+        echo -e "  ${BOLD}11)${NC} Cleanup & recover     ${DIM}(emergency disk cleanup, log suppression)${NC}"
+        echo -e "  ${BOLD}${RED}12)${NC} ${RED}Uninstall everything${NC}"
+        echo ""
+        echo -e "  ${BOLD}0)${NC}  Exit"
+        echo ""
+
+        local choice=""
+        read -rp "  Select [0-12]: " choice || break
+
+        case "$choice" in
+            1)
+                ( trap - INT; do_status )  || true
+                ;;
+            2)
+                ( trap - INT; do_add_tunnel ) || true
+                ;;
+            3)
+                ( trap - INT; do_remove_tunnel "" ) || true
+                ;;
+            4)
+                ( trap - INT; do_add_domain ) || true
+                ;;
+            5)
+                ( trap - INT; do_manage_users ) || true
+                ;;
+            6)
+                ( trap - INT; do_configure_socks_auth ) || true
+                ;;
+            7)
+                ( trap - INT; do_harden ) || true
+                ;;
+            8)
+                ( trap - INT; do_add_xray ) || true
+                ;;
+            9)
+                ( trap - INT; do_change_mtu ) || true
+                ;;
+            10)
+                ( trap - INT; do_update ) || true
+                # If update wrote the re-exec marker, restart with new version
+                if [[ -f /tmp/.dnsgb-update-reexec ]]; then
+                    local reexec_path
+                    reexec_path=$(cat /tmp/.dnsgb-update-reexec)
+                    rm -f /tmp/.dnsgb-update-reexec
+                    exec bash "$reexec_path" --manage
+                fi
+                ;;
+            11)
+                ( trap - INT; do_cleanup ) || true
+                ;;
+            12)
+                ( trap - INT; do_uninstall ) || true
+                # If uninstall succeeded, dnsgb is gone — exit menu
+                hash -d dnsgb 2>/dev/null || true
+                if ! command -v dnsgb &>/dev/null; then
+                    echo ""
+                    print_info "dnsgb has been uninstalled. Exiting menu."
+                    break
+                fi
+                ;;
+            0|q|Q)
+                echo ""
+                break
+                ;;
+            "")
+                # Just Enter — redraw menu
+                continue
+                ;;
+            *)
+                print_warn "Invalid choice. Enter 0-12."
+                sleep 1
+                continue
+                ;;
+        esac
+
+        # Pause so user can read output before menu redraws
+        echo ""
+        echo -e "  ${DIM}Press Enter to return to menu...${NC}"
+        read -r || break
+    done
+
+    # Restore default SIGINT handling
+    trap - INT
+}
+
+# ─── Global Variables (must be set before arg parser since --status/--manage use them) ───
+
+DOMAIN=""
+SERVER_IP=""
+DNSTT_PUBKEY=""
+NOIZDNS_PUBKEY=""
+VAYDNS_PUBKEY=""
+SSH_USER=""
+SSH_PASS=""
+SOCKS_USER=""
+SOCKS_PASS=""
+SOCKS_AUTH=false
+TUNNELS_CHANGED=false
+
+# ─── Variables (populated during setup) ─────────────────────────────────────────
+
+SSH_SETUP_DONE=false
+
+# ─── STEP 1: Pre-flight Checks ─────────────────────────────────────────────────
+
+step_preflight() {
+    print_step 1 "Pre-flight Checks"
+
+    # Check root
+    if [[ $EUID -eq 0 ]]; then
+        print_ok "Running as root"
+    else
+        print_fail "Not running as root. Please run with: sudo bash $0"
+        exit 1
+    fi
+
+    # Back up resolv.conf so we can always recover DNS
+    if [[ -f /etc/resolv.conf ]] && [[ ! -f /etc/resolv.conf.dnsgb-backup ]]; then
+        cp -f /etc/resolv.conf /etc/resolv.conf.dnsgb-backup 2>/dev/null || true
+    fi
+
+    # Check OS (read in subshell to avoid overwriting script's VERSION variable)
+    if [[ -f /etc/os-release ]]; then
+        local os_id os_name
+        os_id=$(. /etc/os-release && echo "${ID:-}")
+        os_name=$(. /etc/os-release && echo "${PRETTY_NAME:-$os_id}")
+        if [[ "$os_id" == "ubuntu" || "$os_id" == "debian" ]]; then
+            print_ok "OS: ${os_name}"
+        else
+            print_warn "OS: ${os_name} (not Ubuntu/Debian - may work but untested)"
+        fi
+    else
+        print_warn "Cannot detect OS (missing /etc/os-release)"
+    fi
+
+    # Check curl
+    if command -v curl &>/dev/null; then
+        print_ok "curl is installed"
+    else
+        print_fail "curl is not installed"
+        echo ""
+        if prompt_yn "Install curl now?" "y"; then
+            if apt-get update -qq && apt-get install -y -qq curl; then
+                print_ok "curl installed"
+            else
+                print_fail "Failed to install curl. Check your network/repos."
+                exit 1
+            fi
+        else
+            echo ""
+            print_fail "curl is required. Please install it and re-run."
+            exit 1
+        fi
+    fi
+
+    # Ensure DNS resolution works (may be broken after previous uninstall)
+    if ! curl -4 -s --max-time 3 https://api.ipify.org >/dev/null 2>&1; then
+        if grep -q '127\.0\.0\.53' /etc/resolv.conf 2>/dev/null; then
+            # systemd-resolved stub is dead — replace with public DNS
+            print_warn "DNS broken (stub listener dead) — fixing resolv.conf"
+            chattr -i /etc/resolv.conf 2>/dev/null || true
+            cat > /etc/resolv.conf <<'DNSEOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+DNSEOF
+        fi
+    fi
+
+    # Detect server IP
+    SERVER_IP=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || curl -4 -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
+    if [[ -n "$SERVER_IP" ]]; then
+        print_ok "Server IP: ${SERVER_IP}"
+    else
+        print_warn "Could not auto-detect server IP"
+        SERVER_IP=$(prompt_input "Enter your server's public IP")
+        if [[ -z "$SERVER_IP" ]]; then
+            print_fail "Server IP is required."
+            exit 1
+        fi
+    fi
+
+    echo ""
+    print_ok "All pre-flight checks passed"
+}
+
+# ─── STEP 2: Ask Domain ────────────────────────────────────────────────────────
+
+step_ask_domain() {
+    print_step 2 "Domain Configuration"
+
+    while true; do
+        DOMAIN=$(prompt_input "Enter your domain (e.g. example.com)")
+        # Strip whitespace, http(s)://, trailing slashes
+        DOMAIN=$(echo "$DOMAIN" | sed 's|^[[:space:]]*||;s|[[:space:]]*$||;s|^https\?://||;s|/.*$||')
+        if [[ -z "$DOMAIN" ]]; then
+            print_fail "Domain cannot be empty. Please try again."
+        elif [[ ! "$DOMAIN" =~ \. ]]; then
+            print_fail "Invalid domain (must contain a dot). Please try again."
+        elif [[ "$DOMAIN" =~ \.\. ]]; then
+            print_fail "Invalid domain (consecutive dots not allowed). Please try again."
+        elif [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+            print_fail "Invalid domain (use only letters, numbers, dots, hyphens). Please try again."
+        else
+            break
+        fi
+    done
+
+    echo ""
+    print_ok "Using domain: ${BOLD}${DOMAIN}${NC}"
+}
+
+# ─── Cloudflare API: Auto-create DNS records ────────────────────────────────────
+
+# Create all required DNS records via Cloudflare API.
+# Args: $1=API token, $2=domain, $3=server IP
+cloudflare_create_dns_records() {
+    local api_token="$1"
+    local domain="$2"
+    local server_ip="$3"
+    local cf_api="https://api.cloudflare.com/client/v4"
+
+    # Ensure jq is installed (needed for JSON parsing)
+    if ! command -v jq &>/dev/null; then
+        print_info "Installing jq (needed for Cloudflare API)..."
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y -qq jq >/dev/null 2>&1 || true
+        if ! command -v jq &>/dev/null; then
+            print_fail "Could not install jq. Install manually: apt-get install jq"
+            return 1
+        fi
+    fi
+
+    # Step 1: Get Zone ID
+    print_info "Looking up Cloudflare Zone ID for ${domain}..."
+    local zone_resp
+    zone_resp=$(curl -s -X GET "${cf_api}/zones?name=${domain}" \
+        -H "Authorization: Bearer ${api_token}" \
+        -H "Content-Type: application/json" --max-time 15 2>/dev/null || true)
+
+    if [[ -z "$zone_resp" ]]; then
+        print_fail "Could not connect to Cloudflare API"
+        return 1
+    fi
+
+    local zone_id
+    zone_id=$(echo "$zone_resp" | jq -r '.result[0].id // empty' 2>/dev/null || true)
+    if [[ -z "$zone_id" ]]; then
+        local cf_err
+        cf_err=$(echo "$zone_resp" | jq -r '.errors[0].message // "Unknown error"' 2>/dev/null || echo "Invalid response")
+        print_fail "Could not find zone for ${domain}: ${cf_err}"
+        print_info "Make sure the domain is added to your Cloudflare account and the API token has Zone:Read permission"
+        return 1
+    fi
+    print_ok "Zone ID: ${zone_id}"
+
+    # Helper: create or skip a DNS record
+    local created=0 skipped=0 failed=0
+    _cf_create_record() {
+        local rtype="$1" rname="$2" rcontent="$3" proxied="${4:-false}"
+        local full_name="${rname}.${domain}"
+
+        # Check if record already exists
+        local existing
+        existing=$(curl -s -X GET "${cf_api}/zones/${zone_id}/dns_records?name=${full_name}&type=${rtype}" \
+            -H "Authorization: Bearer ${api_token}" \
+            -H "Content-Type: application/json" --max-time 10 2>/dev/null || true)
+        local count
+        count=$(echo "$existing" | jq '.result | length' 2>/dev/null || echo "0")
+
+        if [[ "$count" -gt 0 ]]; then
+            echo -e "  ${DIM}[skip]${NC} ${rtype} ${rname} — already exists"
+            skipped=$((skipped + 1))
+            return 0
+        fi
+
+        # Create the record
+        local payload
+        if [[ "$rtype" == "A" ]]; then
+            payload=$(jq -n --arg t "$rtype" --arg n "$full_name" --arg c "$rcontent" --argjson p "$proxied" \
+                '{type: $t, name: $n, content: $c, ttl: 3600, proxied: $p}')
+        else
+            payload=$(jq -n --arg t "$rtype" --arg n "$full_name" --arg c "$rcontent" \
+                '{type: $t, name: $n, content: $c, ttl: 3600}')
+        fi
+
+        local create_resp
+        create_resp=$(curl -s -X POST "${cf_api}/zones/${zone_id}/dns_records" \
+            -H "Authorization: Bearer ${api_token}" \
+            -H "Content-Type: application/json" \
+            -d "$payload" --max-time 10 2>/dev/null || true)
+
+        local success
+        success=$(echo "$create_resp" | jq -r '.success // false' 2>/dev/null || echo "false")
+        if [[ "$success" == "true" ]]; then
+            echo -e "  ${GREEN}[created]${NC} ${rtype} ${rname} → ${rcontent}"
+            created=$((created + 1))
+        else
+            local err_msg
+            err_msg=$(echo "$create_resp" | jq -r '.errors[0].message // "Unknown error"' 2>/dev/null || echo "API error")
+            echo -e "  ${RED}[failed]${NC} ${rtype} ${rname}: ${err_msg}"
+            failed=$((failed + 1))
+        fi
+    }
+
+    # Step 2: Create A record
+    echo ""
+    print_info "Creating DNS records..."
+    echo ""
+    _cf_create_record "A" "ns" "$server_ip" "false"
+
+    # Step 3: Create NS records
+    local ns_target="ns.${domain}"
+    local subdomains=("t" "d" "n" "v" "s" "ds" "z" "vz")
+    for sub in "${subdomains[@]}"; do
+        _cf_create_record "NS" "$sub" "$ns_target"
+    done
+
+    echo ""
+    print_ok "Done: ${created} created, ${skipped} skipped, ${failed} failed"
+
+    if [[ $failed -gt 0 ]]; then
+        print_warn "Some records failed — check your Cloudflare dashboard"
+        return 1
+    fi
+    return 0
+}
+
+# ─── STEP 3: Show DNS Records ──────────────────────────────────────────────────
+
+step_dns_records() {
+    print_step 3 "DNS Records (Cloudflare)"
+
+    echo ""
+    echo -e "  ${BOLD}How do you want to set up DNS records?${NC}"
+    echo ""
+    echo -e "  ${BOLD}1)${NC}  Automatic (Cloudflare API)  ${DIM}— enter API token, records created for you${NC}"
+    echo -e "  ${BOLD}2)${NC}  Manual                      ${DIM}— create records yourself in Cloudflare dashboard${NC}"
+    echo ""
+    local dns_choice
+    dns_choice=$(prompt_input "Select (1-2)" "1")
+
+    if [[ "$dns_choice" == "1" ]]; then
+        # Automatic via Cloudflare API
+        echo ""
+        echo -e "  ${BOLD}${YELLOW}How to get a Cloudflare API Token:${NC}"
+        echo ""
+        echo -e "  ${BOLD}1.${NC} Go to: ${GREEN}https://dash.cloudflare.com/profile/api-tokens${NC}"
+        echo -e "  ${BOLD}2.${NC} Click ${BOLD}Create Token${NC}"
+        echo -e "  ${BOLD}3.${NC} Select the ${BOLD}Edit zone DNS${NC} template"
+        echo -e "  ${BOLD}4.${NC} Under ${BOLD}Zone Resources${NC}, select your domain (or All Zones)"
+        echo -e "  ${BOLD}5.${NC} Click ${BOLD}Continue to summary${NC} → ${BOLD}Create Token${NC}"
+        echo -e "  ${BOLD}6.${NC} Copy the token (you'll only see it once!)"
+        echo ""
+        echo -e "  ${DIM}Required permissions: Zone:DNS:Edit + Zone:Zone:Read${NC}"
+        echo -e "  ${DIM}The 'Edit zone DNS' template includes both automatically${NC}"
+        echo ""
+
+        local cf_token
+        cf_token=$(prompt_input "Paste your Cloudflare API Token here")
+        cf_token=$(echo "$cf_token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+        if [[ -z "$cf_token" ]]; then
+            print_fail "API token cannot be empty"
+            exit 1
+        fi
+
+        # Ensure jq is installed (needed for API JSON parsing)
+        if ! command -v jq &>/dev/null; then
+            print_info "Installing jq (needed for Cloudflare API)..."
+            apt-get update -qq >/dev/null 2>&1 || true
+            apt-get install -y -qq jq >/dev/null 2>&1 || true
+            if ! command -v jq &>/dev/null; then
+                print_fail "Could not install jq. Install manually: apt-get install jq"
+                exit 1
+            fi
+        fi
+
+        # Validate token
+        # Try /user/tokens/verify first (standard tokens), then fall back to
+        # /accounts (account-scoped tokens like cfat_*) which works universally.
+        print_info "Validating API token..."
+        local verify_resp token_status token_valid=false
+        verify_resp=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+            -H "Authorization: Bearer ${cf_token}" \
+            -H "Content-Type: application/json" --max-time 10 2>/dev/null || true)
+        token_status=$(echo "$verify_resp" | jq -r '.result.status // empty' 2>/dev/null || true)
+        if [[ "$token_status" == "active" ]]; then
+            token_valid=true
+        else
+            # Fall back: account-scoped tokens don't work with /user/tokens/verify.
+            # Check /accounts — a successful response confirms the token is valid.
+            local accounts_resp accounts_success
+            accounts_resp=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts?per_page=1" \
+                -H "Authorization: Bearer ${cf_token}" \
+                -H "Content-Type: application/json" --max-time 10 2>/dev/null || true)
+            accounts_success=$(echo "$accounts_resp" | jq -r '.success // empty' 2>/dev/null || true)
+            if [[ "$accounts_success" == "true" ]]; then
+                token_valid=true
+            fi
+        fi
+
+        if [[ "$token_valid" != "true" ]]; then
+            print_fail "API token is invalid or expired"
+            print_info "Check your token at: https://dash.cloudflare.com/profile/api-tokens"
+            exit 1
+        fi
+        print_ok "API token is valid"
+
+        # Create DNS records
+        if cloudflare_create_dns_records "$cf_token" "$DOMAIN" "$SERVER_IP"; then
+            print_ok "All DNS records created successfully"
+        else
+            echo ""
+            if ! prompt_yn "Some records failed. Continue anyway?" "n"; then
+                exit 1
+            fi
+        fi
+    else
+        # Manual setup
+        print_info "Create these DNS records in your Cloudflare dashboard:"
+        echo ""
+        print_box \
+            "Record 1:  Type: A   | Name: ns | Value: ${SERVER_IP}" \
+            "           Proxy: OFF (DNS Only - grey cloud)" \
+            "" \
+            "Record 2:  Type: NS  | Name: t   | Value: ns.${DOMAIN}" \
+            "Record 3:  Type: NS  | Name: d   | Value: ns.${DOMAIN}" \
+            "Record 4:  Type: NS  | Name: s   | Value: ns.${DOMAIN}" \
+            "Record 5:  Type: NS  | Name: ds  | Value: ns.${DOMAIN}" \
+            "Record 6:  Type: NS  | Name: n   | Value: ns.${DOMAIN}" \
+            "Record 7:  Type: NS  | Name: z   | Value: ns.${DOMAIN}" \
+            "Record 8:  Type: NS  | Name: v   | Value: ns.${DOMAIN}" \
+            "Record 9:  Type: NS  | Name: vz  | Value: ns.${DOMAIN}"
+
+        echo ""
+        print_warn "IMPORTANT: The A record MUST be DNS Only (grey cloud, NOT orange)"
+        print_warn "IMPORTANT: The A record name must be \"ns\" (not \"tns\")"
+        echo ""
+        echo "  Subdomain purposes:"
+        echo "    t   = Slipstream + SOCKS tunnel"
+        echo "    d   = DNSTT + SOCKS tunnel"
+        echo "    n   = NoizDNS + SOCKS tunnel (DPI-resistant)"
+        echo "    s   = Slipstream + SSH tunnel"
+        echo "    ds  = DNSTT + SSH tunnel"
+        echo "    z   = NoizDNS + SSH tunnel (DPI-resistant)"
+        echo "    v   = VayDNS + SOCKS tunnel (optimized)"
+        echo "    vz  = VayDNS + SSH tunnel (optimized)"
+        echo ""
+
+        if ! prompt_yn "Have you created these DNS records in Cloudflare?" "n"; then
+            echo ""
+            print_info "Please create the DNS records and re-run this script."
+            exit 0
+        fi
+    fi
+
+    echo ""
+    print_ok "DNS records confirmed"
+}
+
+# ─── STEP 4: Free Port 53 ──────────────────────────────────────────────────────
+
+step_free_port53() {
+    print_step 4 "Free Port 53"
+
+    local port53_output
+    port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
+
+    if [[ -z "$port53_output" ]]; then
+        print_ok "Port 53 is free"
+        return
+    fi
+
+    # dnsgb already on port 53 is fine (re-run scenario)
+    if echo "$port53_output" | grep -q "dnsgb"; then
+        print_ok "Port 53 is in use by dnsgb (already set up)"
+        return
+    fi
+
+    print_info "Something is using port 53:"
+    echo -e "  ${DIM}${port53_output}${NC}"
+    echo ""
+
+    if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
+        print_warn "systemd-resolved is occupying port 53"
+        echo ""
+        if prompt_yn "Configure systemd-resolved to disable only DNSStubListener?" "y"; then
+            # Safer than masking resolved entirely: keep DNS management, only free :53.
+            configure_systemd_resolved_no_stub || true
+            sleep 1
+            port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
+
+            # Fallback if stub is still present.
+            if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
+                print_warn "systemd-resolved still occupies port 53; stopping + disabling as fallback"
+                systemctl stop systemd-resolved.socket 2>/dev/null || true
+                systemctl stop systemd-resolved.service 2>/dev/null || true
+                systemctl disable systemd-resolved.service 2>/dev/null || true
+                ensure_resolv_conf_fallback
+                sleep 1
+            fi
+        else
+            print_fail "Port 53 must be free for DNS tunnels to work."
+            exit 1
+        fi
+    else
+        print_fail "An unknown service is using port 53."
+        print_info "Please stop it manually and re-run this script."
+        exit 1
+    fi
+
+    # Verify port is now free
+    port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
+    if [[ -z "$port53_output" ]]; then
+        print_ok "Port 53 is now free"
+    else
+        print_fail "Port 53 is still in use. Please investigate manually."
+        exit 1
+    fi
+}
+
+# ─── STEP 5: Install dnsgb ─────────────────────────────────────────────────────
+
+step_install_dnsgb() {
+    print_step 5 "Install dnsgb"
+
+    # Check if already installed
+    if command -v dnsgb &>/dev/null; then
+        local ver
+        ver=$(dnsgb --version 2>/dev/null || echo "unknown")
+        print_info "dnsgb is already installed (${ver})"
+        echo ""
+        if ! prompt_yn "Re-install / update dnsgb?" "n"; then
+            # Ensure router is in multi mode even if we skip install
+            local current_mode
+            current_mode=$(dnsgb router mode 2>/dev/null | awk '/[Mm]ode/{for(i=1;i<=NF;i++) if($i=="multi"||$i=="single") print $i}' | head -1 || true)
+            if [[ "$current_mode" != "multi" ]]; then
+                print_warn "Router mode is '${current_mode:-unknown}', switching to multi..."
+                if dnsgb router mode multi 2>/dev/null; then
+                    print_ok "Router mode switched to multi"
+                else
+                    print_fail "Failed to switch router mode to multi"
+                    exit 1
+                fi
+            else
+                print_ok "Router mode: multi"
+            fi
+            print_ok "Skipping dnsgb installation"
+            return
+        fi
+    fi
+
+    # Stop and remove ALL tunnels so they get fresh configs after re-install
+    print_info "Stopping dnsgb services..."
+    dnsgb router stop 2>/dev/null || true
+    # Remove all existing tunnels (they'll be recreated in Step 7 with correct ports)
+    local old_tags
+    old_tags=$(dnsgb_get_tags)
+    for tag in $old_tags; do
+        dnsgb tunnel stop --tag "$tag" 2>/dev/null || true
+        dnsgb tunnel remove --tag "$tag" 2>/dev/null || true
+    done
+    # Stop all dnsgb systemd units
+    local unit
+    for unit in $(systemctl list-units --type=service --no-legend 'dnsgb-*' 2>/dev/null | awk '{print $1}' || true); do
+        systemctl stop "$unit" 2>/dev/null || true
+    done
+    systemctl stop dnsgb-dnsrouter 2>/dev/null || true
+    systemctl stop microsocks 2>/dev/null || true
+    # Kill tunnel/router processes by exact name (NOT -f, to avoid killing this script)
+    # slipstream-server comm name is truncated to 15 chars: "slipstream-serv"
+    pkill -9 slipstream-serv 2>/dev/null || true
+    pkill -9 dnstt-server 2>/dev/null || true
+    pkill -9 microsocks 2>/dev/null || true
+    # dnsgb-dnsrouter comm name is truncated to 15 chars: "dnsgb-dnsroute"
+    pkill -9 dnsgb-dnsroute 2>/dev/null || true
+    # Kill the dnsgb binary itself (comm name = "dnsgb", won't match "bash dnsgb-setup.sh")
+    pkill -9 -x dnsgb 2>/dev/null || true
+    sleep 1
+    # Reset systemd failed state before removing binary to prevent start-limit-hit
+    for unit in $(systemctl list-units --all --type=service --no-legend 'dnsgb-*' 2>/dev/null | awk '{print $1}' || true); do
+        systemctl reset-failed "$unit" 2>/dev/null || true
+    done
+    systemctl reset-failed dnsgb-dnsrouter 2>/dev/null || true
+    rm -f /usr/local/bin/dnsgb
+
+    # Download binary
+    print_info "Downloading dnsgb..."
+    local arch
+    arch=$(detect_architecture)
+    if curl -fsSL -o /usr/local/bin/dnsgb "https://github.com/net2share/dnstm/releases/latest/download/dnstm-linux-${arch}"; then
+        chmod +x /usr/local/bin/dnsgb
+        print_ok "Downloaded dnsgb binary for ${arch}"
+    else
+        print_fail "Failed to download dnsgb for ${arch} architecture"
+        exit 1
+    fi
+
+    # ── GLIBC compatibility check ──────────────────────────────────────────
+    # The dnsgb binary requires GLIBC >= 2.34.  Older distros (Debian 11,
+    # Ubuntu 20.04) ship GLIBC 2.31 and will fail with a cryptic loader
+    # error.  Detect this early and give an actionable error message.
+    if ldd /usr/local/bin/dnsgb 2>&1 | grep -qi "not found"; then
+        echo ""
+        local sys_glibc
+        sys_glibc=$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+$' || echo "unknown")
+        print_fail "dnsgb binary is incompatible with this system"
+        echo ""
+        echo -e "  ${BOLD}Problem:${NC}  dnsgb requires GLIBC >= 2.34, but this system has GLIBC ${sys_glibc}"
+        echo ""
+        echo -e "  ${BOLD}Supported distributions:${NC}"
+        echo "    - Ubuntu 22.04 (Jammy) or newer"
+        echo "    - Debian 12 (Bookworm) or newer"
+        echo ""
+        echo -e "  ${BOLD}How to fix:${NC}"
+        echo "    Option 1: Upgrade your OS to a supported version"
+        echo "    Option 2: Re-deploy on a VPS with Ubuntu 22.04+ or Debian 12+"
+        echo ""
+        echo -e "  ${DIM}Technical details:${NC}"
+        ldd /usr/local/bin/dnsgb 2>&1 | grep -i "not found" | while IFS= read -r line; do
+            echo -e "    ${DIM}${line}${NC}"
+        done
+        echo ""
+        rm -f /usr/local/bin/dnsgb
+        exit 1
+    fi
+
+    # Save iptables state before dnsgb install (it may reset firewall rules)
+    local iptables_backup="/tmp/iptables-backup-$$"
+    iptables-save > "$iptables_backup" 2>/dev/null || true
+
+    # Install in multi mode (use --force on re-install)
+    print_info "Running dnsgb install --mode multi ..."
+    echo ""
+    local install_ok=false
+    local install_stderr
+    install_stderr=$(mktemp /tmp/dnsgb-install-err-XXXXXX 2>/dev/null || echo "/tmp/dnsgb-install-err-$$")
+    if dnsgb install --mode multi --force 2> >(tee "$install_stderr" >&2); then
+        echo ""
+        install_ok=true
+        print_ok "dnsgb installed successfully"
+        TUNNELS_CHANGED=true
+    else
+        echo ""
+        print_fail "dnsgb install failed"
+        # Show captured stderr for diagnostics
+        if [[ -s "$install_stderr" ]]; then
+            echo ""
+            print_info "Error details:"
+            head -20 "$install_stderr" | while IFS= read -r line; do
+                echo -e "    ${DIM}${line}${NC}"
+            done
+        fi
+    fi
+    rm -f "$install_stderr"
+
+    # Restore original firewall rules (dnsgb install may have reset them)
+    if [[ -s "$iptables_backup" ]]; then
+        iptables-restore < "$iptables_backup" 2>/dev/null || true
+    else
+        # Do not force permissive policies if we don't have a valid snapshot.
+        print_warn "No iptables snapshot found; leaving existing firewall policy unchanged"
+    fi
+    rm -f "$iptables_backup"
+
+    if [[ "$install_ok" != "true" ]]; then
+        exit 1
+    fi
+
+    # Verify
+    local ver
+    ver=$(dnsgb --version 2>/dev/null || echo "unknown")
+    print_ok "dnsgb version: ${ver}"
+
+    echo ""
+    print_info "dnsgb install sets up:"
+    echo "    - Tunnel binaries (slipstream-server, dnstt-server, microsocks)"
+    echo "    - System user (dnsgb)"
+    echo "    - Firewall rules (port 53)"
+    echo "    - DNS Router service"
+    echo "    - microsocks SOCKS5 proxy"
+
+    # Proactive GLIBC check — compile microsocks from source now if needed,
+    # so it's ready by the time step 9 verifies the proxy.
+    if ! microsocks_binary_works; then
+        echo ""
+        print_warn "microsocks binary incompatible with this system — compiling from source..."
+        compile_microsocks_from_source || print_warn "microsocks compilation failed — will retry in step 9"
+    fi
+
+    # Download NoizDNS server binary (DPI-resistant DNSTT fork)
+    echo ""
+    ensure_noizdns_binary || true
+
+    # Skip downloading vaydns-server if dnsgb v0.7.0+ has native support
+    # (dnsgb downloads/manages its own binary in that case)
+    if ! dnsgb_supports_vaydns; then
+        echo ""
+        ensure_vaydns_binary || true
+    fi
+}
+
+# ─── STEP 6: Verify Port 53 ────────────────────────────────────────────────────
+
+step_verify_port53() {
+    print_step 6 "Verify Port 53"
+
+    local port53_output
+    port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
+
+    # If systemd-resolved crept back to :53, switch it to no-stub mode.
+    if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
+        print_warn "systemd-resolved came back on :53 — reconfiguring stub listener"
+        configure_systemd_resolved_no_stub || true
+        sleep 2
+        port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
+        if echo "$port53_output" | grep -q "systemd-resolve\|127\.0\.0\.53"; then
+            print_warn "systemd-resolved still occupies :53; stopping + disabling as fallback"
+            systemctl stop systemd-resolved.socket 2>/dev/null || true
+            systemctl stop systemd-resolved.service 2>/dev/null || true
+            systemctl disable systemd-resolved.service 2>/dev/null || true
+            ensure_resolv_conf_fallback
+        fi
+        sleep 2
+        port53_output=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
+    fi
+
+    if echo "$port53_output" | grep -q "dnsgb"; then
+        print_ok "dnsgb DNS Router is already on port 53"
+        print_info "Router will be restarted after tunnel creation to pick up any changes"
+    elif [[ -z "$port53_output" ]]; then
+        print_ok "Port 53 is free — ready for DNS Router"
+    else
+        print_warn "Port 53 is in use by an unknown process:"
+        echo "$port53_output"
+        print_fail "Cannot proceed — port 53 must be free for the DNS Router"
+        exit 1
+    fi
+
+    # Firewall
+    print_info "Ensuring firewall allows port 53..."
+
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow 53/tcp &>/dev/null || true
+        ufw allow 53/udp &>/dev/null || true
+        print_ok "ufw: port 53 TCP/UDP allowed"
+    elif command -v ufw &>/dev/null; then
+        print_info "ufw is installed but inactive; skipping ufw rule changes"
+    fi
+
+    if command -v iptables &>/dev/null; then
+        # Check if rules already exist before adding
+        if ! iptables -C INPUT -p tcp --dport 53 -j ACCEPT &>/dev/null; then
+            iptables -A INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+        fi
+        if ! iptables -C INPUT -p udp --dport 53 -j ACCEPT &>/dev/null; then
+            iptables -A INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+        fi
+        print_ok "iptables: port 53 TCP/UDP allowed"
+    fi
+
+    echo ""
+    print_warn "If your hosting provider has an external firewall (web panel),"
+    print_warn "make sure port 53 UDP and TCP are open there too."
+}
+
+# ─── STEP 7: Create Tunnels ────────────────────────────────────────────────────
+
+step_create_tunnels() {
+    print_step 7 "Create Tunnels"
+
+    local any_created=false
+    local _tunnel_count=4
+    [[ -x /usr/local/bin/noizdns-server ]] && _tunnel_count=6
+    if [[ -x /usr/local/bin/vaydns-server ]] || dnsgb_supports_vaydns; then
+        _tunnel_count=$((_tunnel_count + 2))
+    fi
+    print_info "Creating ${_tunnel_count} tunnels for domain: ${BOLD}${DOMAIN}${NC}"
+    echo ""
+
+    # Ask for DNSTT MTU (use CLI value as default if provided via --mtu)
+    local mtu_input
+    mtu_input=$(prompt_input "DNSTT MTU size (512-1400, affects packet size)" "$DNSTT_MTU")
+    if [[ "$mtu_input" =~ ^[0-9]+$ ]] && [[ "$mtu_input" -ge 512 ]] && [[ "$mtu_input" -le 1400 ]]; then
+        DNSTT_MTU="$mtu_input"
+    else
+        print_warn "Invalid MTU value; using default ${DNSTT_MTU}"
+    fi
+    print_ok "DNSTT MTU: ${DNSTT_MTU}"
+    echo ""
+
+    # Tunnel 1: Slipstream + SOCKS
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel 1: Slipstream + SOCKS${NC}"
+    echo ""
+    if dnsgb tunnel add --transport slipstream --backend socks --domain "t.${DOMAIN}" --tag slip1 2>&1; then
+        print_ok "Created: slip1 (Slipstream + SOCKS) on t.${DOMAIN}"
+        any_created=true
+    else
+        print_warn "Tunnel slip1 may already exist or creation failed"
+        print_info "If it already exists, this is OK"
+    fi
+    echo ""
+
+    # Tunnel 2: DNSTT + SOCKS
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel 2: DNSTT + SOCKS${NC}"
+    echo ""
+    local dnstt_output
+    dnstt_output=$(dnsgb tunnel add --transport dnstt --backend socks --domain "d.${DOMAIN}" --tag dnstt1 --mtu "$DNSTT_MTU" 2>&1) || true
+    echo "$dnstt_output"
+
+    # Try to extract DNSTT public key
+    DNSTT_PUBKEY=""
+    if [[ -f /etc/dnsgb/tunnels/dnstt1/server.pub ]]; then
+        DNSTT_PUBKEY=$(cat /etc/dnsgb/tunnels/dnstt1/server.pub 2>/dev/null || true)
+    fi
+
+    if [[ -n "$DNSTT_PUBKEY" ]]; then
+        print_ok "Created: dnstt1 (DNSTT + SOCKS) on d.${DOMAIN}"
+        any_created=true
+        echo ""
+        echo -e "  ${BOLD}${YELLOW}DNSTT Public Key (save this!):${NC}"
+        echo -e "  ${GREEN}${DNSTT_PUBKEY}${NC}"
+    else
+        print_warn "Tunnel dnstt1 may already exist or creation failed"
+        print_info "If it already exists, this is OK"
+    fi
+    echo ""
+
+    # Tunnel 3: Slipstream + SSH
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel 3: Slipstream + SSH${NC}"
+    echo ""
+    if dnsgb tunnel add --transport slipstream --backend ssh --domain "s.${DOMAIN}" --tag slip-ssh 2>&1; then
+        print_ok "Created: slip-ssh (Slipstream + SSH) on s.${DOMAIN}"
+        any_created=true
+    else
+        print_warn "Tunnel slip-ssh may already exist or creation failed"
+        print_info "If it already exists, this is OK"
+    fi
+    echo ""
+
+    # Tunnel 4: DNSTT + SSH
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel 4: DNSTT + SSH${NC}"
+    echo ""
+    if dnsgb tunnel add --transport dnstt --backend ssh --domain "ds.${DOMAIN}" --tag dnstt-ssh --mtu "$DNSTT_MTU" 2>&1; then
+        print_ok "Created: dnstt-ssh (DNSTT + SSH) on ds.${DOMAIN}"
+        any_created=true
+    else
+        print_warn "Tunnel dnstt-ssh may already exist or creation failed"
+        print_info "If it already exists, this is OK"
+    fi
+    echo ""
+
+    # Re-read DNSTT key if not captured
+    if [[ -z "$DNSTT_PUBKEY" && -f /etc/dnsgb/tunnels/dnstt1/server.pub ]]; then
+        DNSTT_PUBKEY=$(cat /etc/dnsgb/tunnels/dnstt1/server.pub 2>/dev/null || true)
+        if [[ -n "$DNSTT_PUBKEY" ]]; then
+            echo -e "  ${BOLD}${YELLOW}DNSTT Public Key:${NC}"
+            echo -e "  ${GREEN}${DNSTT_PUBKEY}${NC}"
+        fi
+    fi
+
+    # ─── NoizDNS tunnels (5 & 6) ───
+    if [[ -x /usr/local/bin/noizdns-server ]]; then
+        echo ""
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel 5: NoizDNS + SOCKS (DPI-resistant)${NC}"
+        echo ""
+        if dnsgb tunnel add --transport dnstt --backend socks --domain "n.${DOMAIN}" --tag noiz1 --mtu "$DNSTT_MTU" 2>&1; then
+            print_ok "Created: noiz1 (NoizDNS + SOCKS) on n.${DOMAIN}"
+            any_created=true
+        else
+            print_warn "Tunnel noiz1 may already exist or creation failed"
+        fi
+        # Override binary to use noizdns-server
+        create_noizdns_service_override "noiz1" || print_warn "Could not set NoizDNS binary for noiz1"
+        echo ""
+
+        # Extract NoizDNS pubkey
+        if [[ -f /etc/dnsgb/tunnels/noiz1/server.pub ]]; then
+            NOIZDNS_PUBKEY=$(cat /etc/dnsgb/tunnels/noiz1/server.pub 2>/dev/null || true)
+            if [[ -n "$NOIZDNS_PUBKEY" ]]; then
+                echo -e "  ${BOLD}${YELLOW}NoizDNS Public Key:${NC}"
+                echo -e "  ${GREEN}${NOIZDNS_PUBKEY}${NC}"
+            fi
+        fi
+
+        echo ""
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel 6: NoizDNS + SSH (DPI-resistant)${NC}"
+        echo ""
+        if dnsgb tunnel add --transport dnstt --backend ssh --domain "z.${DOMAIN}" --tag noiz-ssh --mtu "$DNSTT_MTU" 2>&1; then
+            print_ok "Created: noiz-ssh (NoizDNS + SSH) on z.${DOMAIN}"
+            any_created=true
+        else
+            print_warn "Tunnel noiz-ssh may already exist or creation failed"
+        fi
+        # Override binary to use noizdns-server
+        create_noizdns_service_override "noiz-ssh" || print_warn "Could not set NoizDNS binary for noiz-ssh"
+        echo ""
+
+        # Stop NoizDNS tunnels so step_start_services can start them fresh
+        # with the correct binary (dnsgb tunnel add auto-starts with dnstt-server,
+        # but we need them to run noizdns-server via the drop-in override)
+        systemctl stop "dnsgb-noiz1.service" 2>/dev/null || true
+        systemctl stop "dnsgb-noiz-ssh.service" 2>/dev/null || true
+
+        # Fix transport field if dnsgb rewrote it from "dnstt" to "noizdns"
+        fix_noizdns_transport
+    else
+        echo ""
+        print_warn "NoizDNS binary not available — skipping NoizDNS tunnels (n, z subdomains)"
+    fi
+
+    # Re-read NoizDNS key if not captured (e.g., tunnel already existed)
+    if [[ -z "$NOIZDNS_PUBKEY" && -f /etc/dnsgb/tunnels/noiz1/server.pub ]]; then
+        NOIZDNS_PUBKEY=$(cat /etc/dnsgb/tunnels/noiz1/server.pub 2>/dev/null || true)
+    fi
+
+    # ─── VayDNS tunnels (7 & 8) ───
+    # dnsgb v0.7.0+ has native VayDNS support — use --transport vaydns directly.
+    # Older dnsgb versions need the legacy DNSTT-with-binary-swap approach.
+    local _vay_native=false
+    if dnsgb_supports_vaydns; then
+        _vay_native=true
+    fi
+
+    if [[ "$_vay_native" == true ]] || [[ -x /usr/local/bin/vaydns-server ]]; then
+        echo ""
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel 7: VayDNS + SOCKS (optimized)${NC}"
+        echo ""
+        if [[ "$_vay_native" == true ]]; then
+            if dnsgb tunnel add --transport vaydns --backend socks --domain "v.${DOMAIN}" --tag vay1 --mtu "$DNSTT_MTU" --dnstt-compat 2>&1; then
+                print_ok "Created: vay1 (VayDNS + SOCKS) on v.${DOMAIN}"
+                any_created=true
+            else
+                print_warn "Tunnel vay1 may already exist or creation failed"
+            fi
+        else
+            if dnsgb tunnel add --transport dnstt --backend socks --domain "v.${DOMAIN}" --tag vay1 --mtu "$DNSTT_MTU" 2>&1; then
+                print_ok "Created: vay1 (VayDNS + SOCKS) on v.${DOMAIN}"
+                any_created=true
+            else
+                print_warn "Tunnel vay1 may already exist or creation failed"
+            fi
+            create_vaydns_service_override "vay1" || print_warn "Could not set VayDNS binary for vay1"
+        fi
+
+        if [[ -f /etc/dnsgb/tunnels/vay1/server.pub ]]; then
+            VAYDNS_PUBKEY=$(cat /etc/dnsgb/tunnels/vay1/server.pub 2>/dev/null || true)
+            if [[ -n "$VAYDNS_PUBKEY" ]]; then
+                echo -e "  ${BOLD}${YELLOW}VayDNS Public Key:${NC}"
+                echo -e "  ${GREEN}${VAYDNS_PUBKEY}${NC}"
+            fi
+        fi
+        echo ""
+
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel 8: VayDNS + SSH (optimized)${NC}"
+        echo ""
+        if [[ "$_vay_native" == true ]]; then
+            if dnsgb tunnel add --transport vaydns --backend ssh --domain "vz.${DOMAIN}" --tag vay-ssh --mtu "$DNSTT_MTU" --dnstt-compat 2>&1; then
+                print_ok "Created: vay-ssh (VayDNS + SSH) on vz.${DOMAIN}"
+                any_created=true
+            else
+                print_warn "Tunnel vay-ssh may already exist or creation failed"
+            fi
+        else
+            if dnsgb tunnel add --transport dnstt --backend ssh --domain "vz.${DOMAIN}" --tag vay-ssh --mtu "$DNSTT_MTU" 2>&1; then
+                print_ok "Created: vay-ssh (VayDNS + SSH) on vz.${DOMAIN}"
+                any_created=true
+            else
+                print_warn "Tunnel vay-ssh may already exist or creation failed"
+            fi
+            create_vaydns_service_override "vay-ssh" || print_warn "Could not set VayDNS binary for vay-ssh"
+        fi
+        echo ""
+
+        # Legacy path needs binary swap to take effect on next start.
+        # Native path: dnsgb already has the right ExecStart, no need to stop.
+        if [[ "$_vay_native" != true ]]; then
+            systemctl stop "dnsgb-vay1.service" 2>/dev/null || true
+            systemctl stop "dnsgb-vay-ssh.service" 2>/dev/null || true
+            fix_vaydns_transport
+        fi
+    else
+        echo ""
+        print_warn "VayDNS binary not available — skipping VayDNS tunnels (v, vz subdomains)"
+    fi
+
+    # Re-read VayDNS key if not captured
+    if [[ -z "$VAYDNS_PUBKEY" && -f /etc/dnsgb/tunnels/vay1/server.pub ]]; then
+        VAYDNS_PUBKEY=$(cat /etc/dnsgb/tunnels/vay1/server.pub 2>/dev/null || true)
+    fi
+
+    if [[ "$any_created" == true ]]; then
+        TUNNELS_CHANGED=true
+    fi
+    print_ok "All tunnels created"
+}
+
+# ─── STEP 8: Start Services ────────────────────────────────────────────────────
+
+step_start_services() {
+    print_step 8 "Start Services"
+
+    # Validate dnstt-server binary supports -udp (detect if NoizDNS binary overwrote it)
+    if [[ -x /usr/local/bin/dnstt-server ]]; then
+        if ! /usr/local/bin/dnstt-server -help 2>&1 | grep -q '\-udp'; then
+            print_warn "dnstt-server binary does not support -udp (may be NoizDNS fork) — re-downloading correct binary..."
+            local _dnstt_arch
+            _dnstt_arch=$(detect_architecture)
+            if curl -fsSL --connect-timeout 10 --max-time 30 -o /usr/local/bin/dnstt-server \
+                "https://github.com/net2share/dnstt/releases/download/latest/dnstt-server-linux-${_dnstt_arch}" 2>/dev/null; then
+                chmod +x /usr/local/bin/dnstt-server
+                print_ok "Re-downloaded correct dnstt-server binary"
+            else
+                print_warn "Could not re-download dnstt-server — DNSTT tunnels may fail"
+            fi
+        fi
+    fi
+
+    # Reload systemd to pick up any service overrides (e.g., NoizDNS binary swap)
+    systemctl daemon-reload 2>/dev/null || true
+
+    # ── 1. Start tunnels FIRST (before router) ──────────────────────────────────
+    # The DNS Router crash-loops if any configured backend tunnel isn't running.
+    # So we must start all tunnels and verify they're healthy BEFORE starting the router.
+
+    # Stop router while we start tunnels (it may be running from a previous install)
+    if [[ "$TUNNELS_CHANGED" == "true" ]]; then
+        print_info "Stopping DNS Router (to reload tunnel config)..."
+        dnsgb router stop 2>/dev/null || true
+        sleep 1
+    fi
+
+    echo ""
+
+    # Start all tunnels
+    local all_tags
+    all_tags=$(dnsgb_get_tags)
+    if [[ -z "$all_tags" ]]; then
+        all_tags="slip1 dnstt1 slip-ssh dnstt-ssh"
+        [[ -x /usr/local/bin/noizdns-server ]] && all_tags+=" noiz1 noiz-ssh"
+        if [[ -x /usr/local/bin/vaydns-server ]] || dnsgb_supports_vaydns; then
+            all_tags+=" vay1 vay-ssh"
+        fi
+    fi
+    for tag in $all_tags; do
+        print_info "Starting tunnel: ${tag}..."
+        if dnsgb tunnel start --tag "$tag" 2>/dev/null; then
+            print_ok "Started: ${tag}"
+        else
+            if dnsgb_tag_exists "$tag" && dnsgb tunnel list 2>/dev/null | grep -wF "$tag" | grep -qi "running"; then
+                print_ok "Already running: ${tag}"
+            else
+                print_warn "Could not start: ${tag}. Check: dnsgb tunnel logs --tag ${tag}"
+            fi
+        fi
+    done
+
+    # ── 2. Verify NoizDNS tunnels actually started ──────────────────────────────
+    # If NoizDNS services failed (wrong binary, bad config, etc.), remove them
+    # so the DNS Router doesn't crash-loop trying to connect to dead backends.
+    sleep 3
+    for noiz_tag in noiz1 noiz-ssh; do
+        if dnsgb tunnel list 2>/dev/null | grep -q "tag=${noiz_tag}"; then
+            if ! systemctl is-active --quiet "dnsgb-${noiz_tag}.service" 2>/dev/null; then
+                # Retry — give it more time before removing
+                print_info "Waiting for ${noiz_tag} to start..."
+                sleep 5
+                systemctl restart "dnsgb-${noiz_tag}.service" 2>/dev/null || true
+                sleep 3
+                if ! systemctl is-active --quiet "dnsgb-${noiz_tag}.service" 2>/dev/null; then
+                    print_warn "NoizDNS tunnel ${noiz_tag} failed to start — removing to protect DNS Router"
+                    local noiz_log
+                    noiz_log=$(journalctl -u "dnsgb-${noiz_tag}.service" -n 5 --no-pager 2>/dev/null || true)
+                    if [[ -n "$noiz_log" ]]; then
+                        echo -e "  ${DIM}Last log lines:${NC}"
+                        echo "$noiz_log" | while IFS= read -r l; do echo -e "  ${DIM}${l}${NC}"; done
+                    fi
+                    dnsgb tunnel stop --tag "$noiz_tag" 2>/dev/null || true
+                    dnsgb tunnel remove --tag "$noiz_tag" 2>/dev/null || true
+                    rm -f "/etc/systemd/system/dnsgb-${noiz_tag}.service.d/10-noizdns-binary.conf" 2>/dev/null || true
+                    rmdir "/etc/systemd/system/dnsgb-${noiz_tag}.service.d" 2>/dev/null || true
+                    systemctl daemon-reload 2>/dev/null || true
+                    print_info "Removed ${noiz_tag} — other tunnels will work normally"
+                else
+                    print_ok "NoizDNS tunnel ${noiz_tag} started successfully (after retry)"
+                fi
+            fi
+        fi
+    done
+
+    # Fix transport field if dnsgb rewrote it during start
+    fix_noizdns_transport
+
+    # ── 2b. Verify VayDNS tunnels actually started ──────────────────────────────
+    for vay_tag in vay1 vay-ssh; do
+        if dnsgb tunnel list 2>/dev/null | grep -q "tag=${vay_tag}"; then
+            if ! systemctl is-active --quiet "dnsgb-${vay_tag}.service" 2>/dev/null; then
+                print_info "Waiting for ${vay_tag} to start..."
+                sleep 5
+                systemctl restart "dnsgb-${vay_tag}.service" 2>/dev/null || true
+                sleep 3
+                if ! systemctl is-active --quiet "dnsgb-${vay_tag}.service" 2>/dev/null; then
+                    print_warn "VayDNS tunnel ${vay_tag} failed to start — removing to protect DNS Router"
+                    local vay_log
+                    vay_log=$(journalctl -u "dnsgb-${vay_tag}.service" -n 5 --no-pager 2>/dev/null || true)
+                    if [[ -n "$vay_log" ]]; then
+                        echo -e "  ${DIM}Last log lines:${NC}"
+                        echo "$vay_log" | while IFS= read -r l; do echo -e "  ${DIM}${l}${NC}"; done
+                    fi
+                    dnsgb tunnel stop --tag "$vay_tag" 2>/dev/null || true
+                    dnsgb tunnel remove --tag "$vay_tag" 2>/dev/null || true
+                    rm -f "/etc/systemd/system/dnsgb-${vay_tag}.service.d/10-vaydns-binary.conf" 2>/dev/null || true
+                    rmdir "/etc/systemd/system/dnsgb-${vay_tag}.service.d" 2>/dev/null || true
+                    systemctl daemon-reload 2>/dev/null || true
+                    print_info "Removed ${vay_tag} — other tunnels will work normally"
+                else
+                    print_ok "VayDNS tunnel ${vay_tag} started successfully (after retry)"
+                fi
+            fi
+        fi
+    done
+
+    fix_vaydns_transport
+
+    echo ""
+
+    # ── 3. Start DNS Router (now that all healthy tunnels are running) ───────────
+    if [[ "$TUNNELS_CHANGED" == "true" ]]; then
+        print_info "Starting DNS Router..."
+        if dnsgb router start 2>/dev/null; then
+            print_ok "DNS Router started"
+        else
+            print_warn "DNS Router start returned an error. Checking status..."
+            if dnsgb router status 2>/dev/null | grep -qi "running"; then
+                print_ok "DNS Router is running"
+            else
+                print_fail "DNS Router failed to start. Check: dnsgb router logs"
+                exit 1
+            fi
+        fi
+
+        # Wait for router to bind to port 53
+        local attempts=0
+        local max_attempts=10
+        while [[ $attempts -lt $max_attempts ]]; do
+            sleep 1
+            if ss -ulnp 2>/dev/null | grep -E ':53\b' | grep -q "dnsgb"; then
+                print_ok "DNS Router confirmed on port 53"
+                break
+            fi
+            attempts=$((attempts + 1))
+        done
+
+        if [[ $attempts -ge $max_attempts ]]; then
+            print_warn "DNS Router may not be on port 53 yet. Check: dnsgb router logs"
+        fi
+    else
+        # No changes — just verify router is running
+        if ss -ulnp 2>/dev/null | grep -E ':53\b' | grep -q "dnsgb"; then
+            print_ok "DNS Router already running on port 53 (no restart needed)"
+        else
+            print_warn "DNS Router not detected on port 53. Attempting start..."
+            dnsgb router start 2>/dev/null || true
+            sleep 2
+            if ss -ulnp 2>/dev/null | grep -E ':53\b' | grep -q "dnsgb"; then
+                print_ok "DNS Router started on port 53"
+            else
+                print_fail "DNS Router failed to start. Check: dnsgb router logs"
+                exit 1
+            fi
+        fi
+    fi
+
+    echo ""
+    print_info "Current tunnel status:"
+    echo ""
+    dnsgb tunnel list 2>/dev/null || print_warn "Could not get tunnel list"
+    echo ""
+
+    if apply_service_hardening; then
+        print_ok "Runtime hardening applied to dnsgb and microsocks services"
+    else
+        print_warn "Runtime hardening reported issues; review systemctl status for dnsgb units"
+    fi
+}
+
+# ─── STEP 9: Verify microsocks ─────────────────────────────────────────────────
+
+step_verify_microsocks() {
+    print_step 9 "Verify SOCKS Proxy (microsocks)"
+
+    # Ask about SOCKS authentication
+    echo ""
+    print_info "SOCKS tunnels (t/d) currently have no authentication."
+    print_info "Adding authentication makes the proxy secure — only clients with"
+    print_info "the correct username and password can connect."
+    echo ""
+    if prompt_yn "Enable SOCKS5 authentication for the proxy?" "y"; then
+        echo ""
+        SOCKS_USER=$(prompt_input "Enter SOCKS proxy username" "proxy")
+        SOCKS_USER=$(echo "$SOCKS_USER" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [[ -z "$SOCKS_USER" ]]; then
+            print_fail "Username cannot be empty"
+            SOCKS_USER="proxy"
+        fi
+        # Reject pipe and colon in username (breaks slipnet URL format and curl --proxy-user)
+        if [[ "$SOCKS_USER" == *"|"* || "$SOCKS_USER" == *":"* ]]; then
+            print_warn "Username cannot contain | or : characters — using default 'proxy'"
+            SOCKS_USER="proxy"
+        fi
+        SOCKS_PASS=$(prompt_input "Enter SOCKS proxy password")
+        SOCKS_PASS=$(echo "$SOCKS_PASS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [[ -z "$SOCKS_PASS" ]]; then
+            print_fail "Password cannot be empty — disabling SOCKS auth"
+            SOCKS_USER=""
+            SOCKS_PASS=""
+        # Reject pipe in password (breaks slipnet URL pipe-delimited format)
+        elif [[ "$SOCKS_PASS" == *"|"* ]]; then
+            print_fail "Password cannot contain the | character — disabling SOCKS auth"
+            SOCKS_USER=""
+            SOCKS_PASS=""
+        else
+            SOCKS_AUTH=true
+            print_ok "SOCKS authentication enabled (user: ${SOCKS_USER})"
+        fi
+    else
+        print_warn "SOCKS proxy will run without authentication (open to anyone who knows the domain)"
+    fi
+    echo ""
+
+    # Check if microsocks is running (dnsgb manages the binary and service)
+    local microsocks_running=false
+    if pgrep -x microsocks &>/dev/null || systemctl is-active --quiet microsocks 2>/dev/null; then
+        print_ok "microsocks is running"
+        microsocks_running=true
+    else
+        print_warn "microsocks is not running"
+        print_info "Starting microsocks..."
+
+        systemctl enable microsocks 2>/dev/null || true
+        if systemctl start microsocks 2>/dev/null; then
+            sleep 1
+            if pgrep -x microsocks &>/dev/null; then
+                print_ok "microsocks started"
+                microsocks_running=true
+            else
+                # May have crashed immediately — check for GLIBC issue
+                if ! microsocks_binary_works; then
+                    print_warn "microsocks crashed (GLIBC incompatibility detected)"
+                    if compile_microsocks_from_source; then
+                        microsocks_running=true
+                    fi
+                else
+                    print_fail "Failed to start microsocks"
+                    print_info "Check: systemctl status microsocks"
+                fi
+            fi
+        else
+            # systemctl start failed — check for GLIBC issue
+            if ! microsocks_binary_works; then
+                print_warn "microsocks binary incompatible — compiling from source..."
+                if compile_microsocks_from_source; then
+                    microsocks_running=true
+                fi
+            else
+                print_fail "Failed to start microsocks"
+                print_info "Check: systemctl status microsocks"
+            fi
+        fi
+    fi
+
+    # Apply SOCKS authentication via dnsgb (v0.6.8+) — only if microsocks is running
+    if [[ "$microsocks_running" == true && "$SOCKS_AUTH" == true && -n "$SOCKS_USER" && -n "$SOCKS_PASS" ]]; then
+        print_info "Configuring SOCKS5 authentication via dnsgb..."
+        if dnsgb backend auth -t socks -u "$SOCKS_USER" -p "$SOCKS_PASS"; then
+            print_ok "SOCKS5 authentication enabled (user: ${SOCKS_USER})"
+            # dnsgb backend auth rewrites ExecStart and restarts microsocks;
+            # give it a moment to come back up
+            sleep 2
+            if pgrep -x microsocks &>/dev/null || systemctl is-active --quiet microsocks 2>/dev/null; then
+                print_ok "microsocks restarted with authentication"
+            else
+                print_warn "microsocks may not have restarted — check: systemctl status microsocks"
+            fi
+        else
+            print_warn "Failed to configure SOCKS5 authentication via dnsgb"
+            print_info "Try manually: dnsgb backend auth -t socks -u ${SOCKS_USER} -p <password>"
+            SOCKS_AUTH=false
+        fi
+    fi
+
+    if [[ "$microsocks_running" != true ]]; then
+        print_warn "Skipping SOCKS proxy test — microsocks is not running"
+        return
+    fi
+
+    # Detect actual microsocks port (3 methods, most reliable first)
+    local socks_port=""
+    # Method 1: parse ss output — find the listen port on the microsocks line
+    socks_port=$(ss -tlnp 2>/dev/null | grep microsocks | awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/) {split($i,a,":"); print a[length(a)]; exit}}' || true)
+    # Method 2: parse the systemd unit file for -p flag
+    if [[ -z "$socks_port" ]]; then
+        socks_port=$(sed -n 's/.*-p[[:space:]]*\([0-9]*\).*/\1/p' /etc/systemd/system/microsocks.service 2>/dev/null | head -1 || true)
+    fi
+    # Method 3: fallback
+    if [[ -z "$socks_port" ]]; then
+        socks_port="19801"
+    fi
+
+    # Test SOCKS proxy
+    echo ""
+    print_info "Testing SOCKS proxy on 127.0.0.1:${socks_port}..."
+    local test_ip
+    if [[ "$SOCKS_AUTH" == true ]]; then
+        test_ip=$(curl -s --max-time 10 --socks5-basic --proxy "socks5://127.0.0.1:${socks_port}" --proxy-user "${SOCKS_USER}:${SOCKS_PASS}" https://api.ipify.org 2>/dev/null || true)
+    else
+        test_ip=$(curl -s --max-time 10 --socks5 "127.0.0.1:${socks_port}" https://api.ipify.org 2>/dev/null || true)
+    fi
+
+    if [[ -n "$test_ip" ]]; then
+        print_ok "SOCKS proxy works! Response: ${test_ip}"
+    else
+        print_warn "SOCKS proxy test failed (this may be OK if internet is restricted)"
+        print_info "The proxy may still work for DNS tunnel clients"
+    fi
+
+    # Negative test: verify unauthenticated access is rejected when auth is enabled
+    if [[ "$SOCKS_AUTH" == true && -n "$test_ip" ]]; then
+        local noauth_ip
+        noauth_ip=$(curl -s --max-time 5 --socks5 "127.0.0.1:${socks_port}" https://api.ipify.org 2>/dev/null || true)
+        if [[ -z "$noauth_ip" ]]; then
+            print_ok "Auth enforced: unauthenticated connections are rejected"
+        else
+            print_warn "Auth NOT enforced: proxy works without credentials!"
+            print_info "Try: dnsgb backend auth -t socks -u ${SOCKS_USER} -p <password>"
+        fi
+    fi
+}
+
+# ─── STEP 10: SSH User (Optional) ──────────────────────────────────────────────
+
+step_ssh_user() {
+    print_step 10 "SSH Tunnel User"
+
+    print_info "An SSH tunnel user allows clients to connect via Slipstream + SSH or DNSTT + SSH."
+    print_info "This user can only create tunnels and has no shell access."
+    print_warn "Without an SSH tunnel user, the SSH tunnels (s/ds) will NOT work."
+    echo ""
+
+    if ! prompt_yn "Create an SSH tunnel user? (required for SSH tunnels to work)" "y"; then
+        print_warn "Skipping SSH user setup — SSH tunnels (s.${DOMAIN}, ds.${DOMAIN}) will not work"
+        print_info "You can create one later with: sshtun-user create <username> --insecure-password <pass>"
+        return
+    fi
+
+    echo ""
+
+    # Install sshtun-user if not present
+    if ! command -v sshtun-user &>/dev/null; then
+        print_info "Downloading sshtun-user..."
+        local arch
+        arch=$(detect_architecture)
+        if curl -fsSL -o /usr/local/bin/sshtun-user "https://github.com/net2share/sshtun-user/releases/latest/download/sshtun-user-linux-${arch}"; then
+            chmod +x /usr/local/bin/sshtun-user
+            print_ok "Downloaded sshtun-user for ${arch}"
+        else
+            print_fail "Failed to download sshtun-user for ${arch} architecture"
+            return
+        fi
+    else
+        print_ok "sshtun-user already installed"
+    fi
+
+    # Configure SSH (only needed once)
+    print_info "Applying SSH security configuration..."
+    mkdir -p /run/sshd 2>/dev/null || true
+
+    # Back up sshd_config before any modification
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        cp -f /etc/ssh/sshd_config /etc/ssh/sshd_config.dnsgb-backup 2>/dev/null || true
+    fi
+
+    local configure_output
+    configure_output=$(timeout --kill-after=3 30 sshtun-user configure </dev/null 2>&1) || true
+    if echo "$configure_output" | grep -qi "already"; then
+        print_ok "SSH already configured"
+    elif echo "$configure_output" | grep -qi "error\|fail"; then
+        print_warn "sshtun-user configure had issues:"
+        echo -e "  ${DIM}${configure_output}${NC}"
+    else
+        print_ok "SSH configuration applied"
+    fi
+
+    # Validate sshd_config — rollback if broken
+    if command -v sshd &>/dev/null && ! sshd -t 2>/dev/null; then
+        print_warn "sshd_config validation failed — rolling back"
+        if [[ -f /etc/ssh/sshd_config.dnsgb-backup ]]; then
+            cp -f /etc/ssh/sshd_config.dnsgb-backup /etc/ssh/sshd_config
+            print_ok "Restored sshd_config from backup"
+        fi
+    fi
+
+    # Fix ETM-only MACs for client compatibility (Bitvise, older clients)
+    fix_ssh_macs
+
+    echo ""
+
+    # Get username
+    SSH_USER=$(prompt_input "Enter username for SSH tunnel user" "tunnel")
+    SSH_USER=$(echo "$SSH_USER" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [[ -z "$SSH_USER" ]]; then
+        print_fail "Username cannot be empty"
+        return
+    fi
+    if [[ "$SSH_USER" == *"|"* ]]; then
+        print_fail "Username cannot contain the | character"
+        return
+    fi
+
+    # Get password
+    SSH_PASS=$(prompt_input "Enter password for SSH tunnel user")
+    SSH_PASS=$(echo "$SSH_PASS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [[ -z "$SSH_PASS" ]]; then
+        print_fail "Password cannot be empty"
+        return
+    fi
+    if [[ "$SSH_PASS" == *"|"* ]]; then
+        print_fail "Password cannot contain the | character"
+        return
+    fi
+
+    echo ""
+
+    # Create user
+    print_info "Creating SSH tunnel user: ${SSH_USER}..."
+    if timeout --kill-after=3 30 sshtun-user create "$SSH_USER" --insecure-password "$SSH_PASS" </dev/null 2>&1; then
+        SSH_SETUP_DONE=true
+        print_ok "SSH tunnel user created: ${SSH_USER}"
+    else
+        print_warn "User creation may have failed or user already exists"
+        SSH_SETUP_DONE=true  # Still show in summary
+    fi
+    # Store credentials (root-only) for status page URL generation
+    mkdir -p /etc/dnsgb 2>/dev/null || true
+    echo "${SSH_USER}:${SSH_PASS}" > /etc/dnsgb/ssh-credentials
+    chmod 600 /etc/dnsgb/ssh-credentials
+
+    # Verify and auto-fix sshd reachability on localhost (required for SSH tunnels)
+    if ! timeout 3 bash -c 'echo | nc -w2 127.0.0.1 22' &>/dev/null; then
+        print_warn "sshd NOT reachable on 127.0.0.1:22 — attempting auto-fix..."
+        # Try restarting sshd first
+        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+        sleep 1
+        if ! timeout 3 bash -c 'echo | nc -w2 127.0.0.1 22' &>/dev/null; then
+            # Check if firewall is blocking localhost
+            if command -v iptables &>/dev/null; then
+                # Allow SSH on localhost
+                iptables -I INPUT -i lo -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+                print_info "Added firewall rule: allow SSH on localhost"
+            fi
+            if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+                ufw allow from 127.0.0.1 to any port 22 2>/dev/null || true
+                print_info "Added UFW rule: allow SSH from localhost"
+            fi
+            sleep 1
+            if timeout 3 bash -c 'echo | nc -w2 127.0.0.1 22' &>/dev/null; then
+                print_ok "sshd now reachable on 127.0.0.1:22"
+            else
+                print_warn "Could not auto-fix — SSH tunnels may not work"
+                print_info "Manually check: sudo iptables -L -n | grep 22"
+            fi
+        else
+            print_ok "sshd now reachable on 127.0.0.1:22 (after restart)"
+        fi
+    else
+        print_ok "sshd reachable on 127.0.0.1:22"
+    fi
+}
+
+# ─── STEP 11: Run Tests ────────────────────────────────────────────────────────
+
+step_tests() {
+    print_step 11 "Verification Tests"
+
+    local pass=0
+    local fail=0
+
+    # Test 1: SOCKS proxy — detect actual port
+    echo -e "  ${BOLD}Test 1: SOCKS Proxy${NC}"
+    local socks_port=""
+    socks_port=$(ss -tlnp 2>/dev/null | grep microsocks | awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/) {split($i,a,":"); print a[length(a)]; exit}}' || true)
+    if [[ -z "$socks_port" ]]; then
+        socks_port=$(sed -n 's/.*-p[[:space:]]*\([0-9]*\).*/\1/p' /etc/systemd/system/microsocks.service 2>/dev/null | head -1 || true)
+    fi
+    if [[ -z "$socks_port" ]]; then
+        socks_port="19801"
+    fi
+
+    local socks_result
+    if [[ "$SOCKS_AUTH" == true ]]; then
+        socks_result=$(curl -s --max-time 10 --socks5-basic --proxy "socks5://127.0.0.1:${socks_port}" --proxy-user "${SOCKS_USER}:${SOCKS_PASS}" https://api.ipify.org 2>/dev/null || true)
+    else
+        socks_result=$(curl -s --max-time 10 --socks5 "127.0.0.1:${socks_port}" https://api.ipify.org 2>/dev/null || true)
+    fi
+    if [[ -n "$socks_result" ]]; then
+        print_ok "SOCKS proxy: PASS (IP: ${socks_result}) on port ${socks_port}"
+        pass=$((pass + 1))
+        # Verify auth enforcement
+        if [[ "$SOCKS_AUTH" == true ]]; then
+            local noauth_result
+            noauth_result=$(curl -s --max-time 5 --socks5 "127.0.0.1:${socks_port}" https://api.ipify.org 2>/dev/null || true)
+            if [[ -z "$noauth_result" ]]; then
+                print_ok "SOCKS auth enforcement: PASS (unauthenticated rejected)"
+                pass=$((pass + 1))
+            else
+                print_fail "SOCKS auth enforcement: FAIL (works without credentials!)"
+                fail=$((fail + 1))
+            fi
+        fi
+    elif ss -tlnp 2>/dev/null | grep -q "microsocks"; then
+        print_warn "SOCKS proxy: LISTENING on port ${socks_port} but connectivity test failed"
+        print_info "microsocks is running but outbound may be blocked or tunnels not ready"
+        fail=$((fail + 1))
+    else
+        print_fail "SOCKS proxy: FAIL (microsocks not running)"
+        fail=$((fail + 1))
+    fi
+    echo ""
+
+    # Test 2: Tunnel list
+    echo -e "  ${BOLD}Test 2: Tunnel Status${NC}"
+    local tunnel_output
+    tunnel_output=$(dnsgb tunnel list 2>/dev/null || true)
+    if [[ -n "$tunnel_output" ]]; then
+        local running_count
+        running_count=$(echo "$tunnel_output" | grep -ci "running" || echo "0")
+        local expected_tunnels=4
+        [[ -x /usr/local/bin/noizdns-server ]] && expected_tunnels=6
+        if [[ -x /usr/local/bin/vaydns-server ]] || dnsgb_supports_vaydns; then
+            expected_tunnels=$((expected_tunnels + 2))
+        fi
+        if [[ "$running_count" -ge "$expected_tunnels" ]]; then
+            print_ok "All tunnels running: PASS (${running_count} running)"
+            pass=$((pass + 1))
+        elif [[ "$running_count" -ge 1 ]]; then
+            print_warn "Some tunnels running: ${running_count}/${expected_tunnels}"
+            pass=$((pass + 1))
+        else
+            print_fail "No tunnels running: FAIL"
+            fail=$((fail + 1))
+        fi
+    else
+        print_fail "Cannot get tunnel list: FAIL"
+        fail=$((fail + 1))
+    fi
+    echo ""
+
+    # Test 3: Router status
+    echo -e "  ${BOLD}Test 3: DNS Router${NC}"
+    if dnsgb router status 2>/dev/null | grep -qi "running"; then
+        print_ok "DNS Router: PASS (running)"
+        pass=$((pass + 1))
+    else
+        print_fail "DNS Router: FAIL (not running)"
+        fail=$((fail + 1))
+    fi
+    echo ""
+
+    # Test 4: Port 53
+    echo -e "  ${BOLD}Test 4: Port 53${NC}"
+    if ss -ulnp 2>/dev/null | grep -E ':53\b' | grep -q "dnsgb"; then
+        print_ok "Port 53: PASS (dnsgb listening)"
+        pass=$((pass + 1))
+    else
+        print_fail "Port 53: FAIL (dnsgb not listening)"
+        fail=$((fail + 1))
+    fi
+    echo ""
+
+    # Test 5: DNS delegation (end-to-end reachability)
+    echo -e "  ${BOLD}Test 5: DNS Delegation${NC}"
+    if command -v dig &>/dev/null; then
+        local dig_result
+        dig_result=$(dig +short +timeout=5 +tries=1 "dnsgb-test.t.${DOMAIN}" @8.8.8.8 2>/dev/null || true)
+        if [[ -n "$dig_result" ]]; then
+            print_ok "DNS delegation: PASS (query reached server via 8.8.8.8)"
+            pass=$((pass + 1))
+        else
+            # Try Cloudflare resolver as fallback
+            dig_result=$(dig +short +timeout=5 +tries=1 "dnsgb-test.t.${DOMAIN}" @1.1.1.1 2>/dev/null || true)
+            if [[ -n "$dig_result" ]]; then
+                print_ok "DNS delegation: PASS (query reached server via 1.1.1.1)"
+                pass=$((pass + 1))
+            else
+                print_warn "DNS delegation: No response from public resolvers"
+                print_info "This may mean DNS records are not set up correctly in Cloudflare,"
+                print_info "or it may take a few minutes for DNS to propagate."
+                print_info "Test manually: dig t.${DOMAIN} @8.8.8.8"
+                fail=$((fail + 1))
+            fi
+        fi
+    else
+        print_info "DNS delegation: SKIPPED (dig not installed — install with: apt install dnsutils)"
+        print_info "Test manually: nslookup t.${DOMAIN} 8.8.8.8"
+        pass=$((pass + 1))
+    fi
+    echo ""
+
+    # Test 6: SSH readiness
+    echo -e "  ${BOLD}Test 6: SSH Tunnel Readiness${NC}"
+    if ss -tlnp 2>/dev/null | grep -E ':22\b' | grep -q "sshd"; then
+        if [[ "$SSH_SETUP_DONE" == true ]]; then
+            print_ok "SSH: PASS (sshd running, tunnel user '${SSH_USER}' created)"
+            pass=$((pass + 1))
+        else
+            print_warn "SSH: sshd running but no tunnel user created — SSH tunnels (s/ds) will not work"
+            print_info "Create one with: sshtun-user create <username> --insecure-password <pass>"
+            fail=$((fail + 1))
+        fi
+    else
+        print_warn "SSH: sshd not detected on port 22 — SSH tunnels (s/ds) will not work"
+        print_info "Start sshd with: systemctl start sshd"
+        fail=$((fail + 1))
+    fi
+    echo ""
+
+    # Summary
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    if [[ $fail -eq 0 ]]; then
+        print_ok "${GREEN}All ${pass} tests passed!${NC}"
+    else
+        print_warn "${pass} passed, ${fail} failed"
+        print_info "Check logs with: dnsgb router logs / dnsgb tunnel logs --tag <tag>"
+    fi
+}
+
+# ─── STEP 12: Summary ──────────────────────────────────────────────────────────
+
+step_summary() {
+    print_step 12 "Setup Complete!"
+
+    local w=54
+    local border empty
+    border=$(printf '═%.0s' $(seq 1 $w))
+    empty=$(printf ' %.0s' $(seq 1 $w))
+    local msg="SETUP COMPLETE!"
+    local ml=$(( (w - ${#msg}) / 2 ))
+    local mr=$(( w - ${#msg} - ml ))
+
+    echo -e "${BOLD}${GREEN}"
+    printf "  ╔%s╗\n" "$border"
+    printf "  ║%s║\n" "$empty"
+    printf "  ║%${ml}s%s%${mr}s║\n" "" "$msg" ""
+    printf "  ║%s║\n" "$empty"
+    printf "  ╚%s╝\n" "$border"
+    echo -e "${NC}"
+
+    echo -e "  ${BOLD}Server Information${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Server IP:     ${GREEN}${SERVER_IP}${NC}"
+    echo -e "  Domain:        ${GREEN}${DOMAIN}${NC}"
+    echo ""
+
+    echo -e "  ${BOLD}Tunnel Endpoints${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Slipstream + SOCKS:  ${GREEN}t.${DOMAIN}${NC}"
+    echo -e "  DNSTT + SOCKS:       ${GREEN}d.${DOMAIN}${NC}"
+    if [[ -x /usr/local/bin/noizdns-server ]]; then
+        echo -e "  NoizDNS + SOCKS:     ${GREEN}n.${DOMAIN}${NC}  ${DIM}(DPI-resistant)${NC}"
+    fi
+    if [[ -x /usr/local/bin/vaydns-server ]]; then
+        echo -e "  VayDNS + SOCKS:      ${GREEN}v.${DOMAIN}${NC}  ${DIM}(optimized)${NC}"
+    fi
+    echo -e "  Slipstream + SSH:    ${GREEN}s.${DOMAIN}${NC}"
+    echo -e "  DNSTT + SSH:         ${GREEN}ds.${DOMAIN}${NC}"
+    if [[ -x /usr/local/bin/noizdns-server ]]; then
+        echo -e "  NoizDNS + SSH:       ${GREEN}z.${DOMAIN}${NC}  ${DIM}(DPI-resistant)${NC}"
+    fi
+    if [[ -x /usr/local/bin/vaydns-server ]]; then
+        echo -e "  VayDNS + SSH:        ${GREEN}vz.${DOMAIN}${NC}  ${DIM}(optimized)${NC}"
+    fi
+    echo ""
+
+    if [[ -n "$DNSTT_PUBKEY" ]]; then
+        echo -e "  ${BOLD}DNSTT Public Keys${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}dnstt1 (SOCKS):${NC}  ${DNSTT_PUBKEY}"
+        local _dnstt_ssh_pk=""
+        if [[ -f /etc/dnsgb/tunnels/dnstt-ssh/server.pub ]]; then
+            _dnstt_ssh_pk=$(cat /etc/dnsgb/tunnels/dnstt-ssh/server.pub 2>/dev/null || true)
+        fi
+        if [[ -n "$_dnstt_ssh_pk" ]]; then
+            echo -e "  ${GREEN}dnstt-ssh (SSH):${NC} ${_dnstt_ssh_pk}"
+        fi
+        echo ""
+    fi
+
+    if [[ -n "$NOIZDNS_PUBKEY" ]]; then
+        echo -e "  ${BOLD}NoizDNS Public Keys${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}noiz1 (SOCKS):${NC}   ${NOIZDNS_PUBKEY}"
+        local _noiz_ssh_pk=""
+        if [[ -f /etc/dnsgb/tunnels/noiz-ssh/server.pub ]]; then
+            _noiz_ssh_pk=$(cat /etc/dnsgb/tunnels/noiz-ssh/server.pub 2>/dev/null || true)
+        fi
+        if [[ -n "$_noiz_ssh_pk" ]]; then
+            echo -e "  ${GREEN}noiz-ssh (SSH):${NC}  ${_noiz_ssh_pk}"
+        fi
+        echo ""
+    fi
+
+    if [[ -n "$VAYDNS_PUBKEY" ]]; then
+        echo -e "  ${BOLD}VayDNS Public Keys${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}vay1 (SOCKS):${NC}    ${VAYDNS_PUBKEY}"
+        local _vay_ssh_pk=""
+        if [[ -f /etc/dnsgb/tunnels/vay-ssh/server.pub ]]; then
+            _vay_ssh_pk=$(cat /etc/dnsgb/tunnels/vay-ssh/server.pub 2>/dev/null || true)
+        fi
+        if [[ -n "$_vay_ssh_pk" ]]; then
+            echo -e "  ${GREEN}vay-ssh (SSH):${NC}   ${_vay_ssh_pk}"
+        fi
+        echo ""
+    fi
+
+    # Generate share URLs (dnst:// for dnstc CLI)
+    echo -e "  ${BOLD}Share URLs — dnst:// (for dnstc CLI)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    local share_url
+    for tag in slip1 dnstt1 noiz1 vay1; do
+        share_url=$(dnsgb tunnel share -t "$tag" 2>/dev/null || true)
+        if [[ -n "$share_url" ]]; then
+            echo -e "  ${GREEN}${tag}:${NC} ${share_url}"
+        fi
+    done
+    if [[ "$SSH_SETUP_DONE" == true && -n "$SSH_USER" && -n "$SSH_PASS" ]]; then
+        for tag in slip-ssh dnstt-ssh noiz-ssh vay-ssh; do
+            share_url=$(dnsgb tunnel share -t "$tag" --user "$SSH_USER" --password "$SSH_PASS" 2>/dev/null || true)
+            if [[ -n "$share_url" ]]; then
+                echo -e "  ${GREEN}${tag}:${NC} ${share_url}"
+            fi
+        done
+    fi
+    echo ""
+
+    # Generate SlipNet deep-link URLs (slipnet:// for SlipNet Android app)
+    echo -e "  ${BOLD}Share URLs — slipnet:// (for SlipNet app)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    local slipnet_url
+    local s_user="" s_pass=""
+    if [[ "$SOCKS_AUTH" == true ]]; then
+        s_user="$SOCKS_USER"
+        s_pass="$SOCKS_PASS"
+    fi
+    # Slipstream + SOCKS — SlipNet needs pubkey even for slipstream
+    local _slip_pk=""
+    _slip_pk=$(cat /etc/dnsgb/tunnels/*/server.pub 2>/dev/null | head -1 || true)
+    slipnet_url=$(generate_slipnet_url "ss" "t" "$_slip_pk" "" "" "$s_user" "$s_pass")
+    echo -e "  ${GREEN}slip1:${NC}    ${slipnet_url}"
+    # DNSTT + SOCKS
+    if [[ -n "$DNSTT_PUBKEY" ]]; then
+        slipnet_url=$(generate_slipnet_url "dnstt" "d" "$DNSTT_PUBKEY" "" "" "$s_user" "$s_pass")
+        echo -e "  ${GREEN}dnstt1:${NC}    ${slipnet_url}"
+    fi
+    # NoizDNS + SOCKS
+    if [[ -n "$NOIZDNS_PUBKEY" ]]; then
+        slipnet_url=$(generate_slipnet_url "sayedns" "n" "$NOIZDNS_PUBKEY" "" "" "$s_user" "$s_pass")
+        echo -e "  ${GREEN}noiz1:${NC}     ${slipnet_url}"
+    fi
+    # VayDNS + SOCKS
+    if [[ -n "$VAYDNS_PUBKEY" ]]; then
+        slipnet_url=$(generate_slipnet_url "dnstt" "v" "$VAYDNS_PUBKEY" "" "" "$s_user" "$s_pass")
+        echo -e "  ${GREEN}vay1:${NC}      ${slipnet_url}"
+    fi
+    # SSH tunnels
+    if [[ "$SSH_SETUP_DONE" == true && -n "$SSH_USER" && -n "$SSH_PASS" ]]; then
+        local _any_pk=""
+        _any_pk=$(cat /etc/dnsgb/tunnels/*/server.pub 2>/dev/null | head -1 || true)
+        slipnet_url=$(generate_slipnet_url "slipstream_ssh" "s" "$_any_pk" "$SSH_USER" "$SSH_PASS" "$s_user" "$s_pass")
+        echo -e "  ${GREEN}slip-ssh:${NC}  ${slipnet_url}"
+        # dnstt-ssh has its own keypair
+        local dnstt_ssh_pubkey=""
+        if [[ -f /etc/dnsgb/tunnels/dnstt-ssh/server.pub ]]; then
+            dnstt_ssh_pubkey=$(cat /etc/dnsgb/tunnels/dnstt-ssh/server.pub 2>/dev/null || true)
+        fi
+        if [[ -n "$dnstt_ssh_pubkey" ]]; then
+            slipnet_url=$(generate_slipnet_url "dnstt_ssh" "ds" "$dnstt_ssh_pubkey" "$SSH_USER" "$SSH_PASS" "$s_user" "$s_pass")
+            echo -e "  ${GREEN}dnstt-ssh:${NC} ${slipnet_url}"
+        fi
+        # NoizDNS + SSH
+        local noiz_ssh_pubkey=""
+        if [[ -f /etc/dnsgb/tunnels/noiz-ssh/server.pub ]]; then
+            noiz_ssh_pubkey=$(cat /etc/dnsgb/tunnels/noiz-ssh/server.pub 2>/dev/null || true)
+        fi
+        if [[ -n "$noiz_ssh_pubkey" ]]; then
+            slipnet_url=$(generate_slipnet_url "sayedns_ssh" "z" "$noiz_ssh_pubkey" "$SSH_USER" "$SSH_PASS" "$s_user" "$s_pass")
+            echo -e "  ${GREEN}noiz-ssh:${NC}  ${slipnet_url}"
+        fi
+        # VayDNS + SSH
+        local vay_ssh_pubkey=""
+        if [[ -f /etc/dnsgb/tunnels/vay-ssh/server.pub ]]; then
+            vay_ssh_pubkey=$(cat /etc/dnsgb/tunnels/vay-ssh/server.pub 2>/dev/null || true)
+        fi
+        if [[ -n "$vay_ssh_pubkey" ]]; then
+            slipnet_url=$(generate_slipnet_url "dnstt_ssh" "vz" "$vay_ssh_pubkey" "$SSH_USER" "$SSH_PASS" "$s_user" "$s_pass")
+            echo -e "  ${GREEN}vay-ssh:${NC}   ${slipnet_url}"
+        fi
+    fi
+    echo ""
+
+    if [[ "$SOCKS_AUTH" == true ]]; then
+        echo -e "  ${BOLD}SOCKS Proxy Authentication${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  Username:  ${GREEN}${SOCKS_USER}${NC}"
+        echo -e "  Password:  ${GREEN}${SOCKS_PASS}${NC}"
+        echo ""
+    else
+        echo -e "  ${BOLD}SOCKS Proxy Authentication${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${YELLOW}⚠ No authentication — SOCKS tunnels (t/d) are open${NC}"
+        echo ""
+    fi
+
+    if [[ "$SSH_SETUP_DONE" == true ]]; then
+        echo -e "  ${BOLD}SSH Tunnel User${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  Username:  ${GREEN}${SSH_USER}${NC}"
+        echo -e "  Password:  ${GREEN}${SSH_PASS}${NC}"
+        echo -e "  Port:      ${GREEN}22${NC}"
+        echo ""
+    else
+        echo -e "  ${BOLD}SSH Tunnel User${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${YELLOW}⚠ Not configured — SSH tunnels (s/ds) will not work${NC}"
+        echo -e "  Create one with: ${BOLD}sshtun-user create <username> --insecure-password <pass>${NC}"
+        echo ""
+    fi
+
+    echo -e "  ${BOLD}DNS Resolvers (use in SlipNet)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo "  8.8.8.8:53        (Google)"
+    echo "  1.1.1.1:53        (Cloudflare)"
+    echo "  9.9.9.9:53        (Quad9)"
+    echo "  208.67.222.222:53 (OpenDNS)"
+    echo "  94.140.14.14:53   (AdGuard)"
+    echo "  185.228.168.9:53  (CleanBrowsing)"
+    echo ""
+
+    echo -e "  ${BOLD}Client App${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo "  SlipNet (Android): https://github.com/anonvector/SlipNet/releases"
+    echo ""
+
+    echo -e "  ${BOLD}Useful Commands${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo "  dnsgb tunnel list               Show all tunnels"
+    echo "  dnsgb tunnel share -t <tag>     Generate share URL"
+    echo "  dnsgb router status             Show router status"
+    echo "  dnsgb router logs               View router logs"
+    echo "  dnsgb tunnel logs --tag slip1   View tunnel logs"
+    echo ""
+
+    echo -e "  ${BOLD}Management TUI${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Run ${GREEN}dnsgb-setup --manage${NC} to open the full management menu."
+    echo "  From there you can:"
+    echo "    - Add/remove tunnels and domains"
+    echo "    - Add Xray backend (VLESS/VMess/Trojan)"
+    echo "    - Manage SSH tunnel users"
+    echo "    - Change DNSTT MTU"
+    echo "    - View status, logs, and share URLs"
+    echo "    - Update to latest version"
+    echo "    - Harden or uninstall"
+    echo ""
+
+    echo -e "  ${DIM}Setup by dnsgb-setup v${VERSION} — SamNet Technologies${NC}"
+    echo -e "  ${DIM}https://github.com/SamNet-dev/dnstm-setup${NC}"
+    echo ""
+}
+
+# ─── Install to PATH ─────────────────────────────────────────────────────────────
+
+install_to_path() {
+    local script_path
+    script_path=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+    local target="/usr/local/bin/dnsgb-setup"
+
+    # Skip if already installed there
+    [[ "$script_path" == "$target" ]] && return 0
+
+    cp -f "$script_path" "$target" 2>/dev/null || return 0
+    chmod +x "$target"
+    print_ok "Installed dnsgb-setup to PATH (run 'dnsgb-setup --manage' from anywhere)"
+}
+
+# ─── Add Domain ──────────────────────────────────────────────────────────────────
+
+# Detect next available tunnel number by scanning existing tags
+detect_next_tunnel_num() {
+    local max=1
+    local tags
+    tags=$(dnsgb_get_tags)
+    for tag in $tags; do
+        local num
+        num=$(echo "$tag" | grep -oE '[0-9]+$' || true)
+        if [[ -n "$num" && "$num" -ge "$max" ]]; then
+            max=$((num + 1))
+        fi
+    done
+    echo "$max"
+}
+
+do_add_domain() {
+    banner
+    print_header "Add Backup Domain"
+
+    # Check root
+    if [[ $EUID -ne 0 ]]; then
+        print_fail "Not running as root. Please run with: sudo bash $0 --add-domain"
+        exit 1
+    fi
+
+    # Check dnsgb is installed
+    if ! command -v dnsgb &>/dev/null; then
+        print_fail "dnsgb is not installed. Run the full setup first: sudo bash $0"
+        exit 1
+    fi
+
+    # Check router is running
+    if ! dnsgb router status 2>/dev/null | grep -qi "running"; then
+        print_warn "DNS Router is not running. Starting it..."
+        dnsgb router start 2>/dev/null || true
+    fi
+
+    # Ensure router is in multi mode (required for multiple domains)
+    local current_mode
+    current_mode=$(dnsgb router mode 2>/dev/null | awk '/[Mm]ode/{for(i=1;i<=NF;i++) if($i=="multi"||$i=="single") print $i}' | head -1 || true)
+    if [[ "$current_mode" != "multi" ]]; then
+        print_warn "Router mode is '${current_mode:-unknown}', switching to multi..."
+        if dnsgb router mode multi 2>/dev/null; then
+            print_ok "Router mode switched to multi"
+        else
+            print_fail "Failed to switch router mode to multi. Multiple domains require multi mode."
+            exit 1
+        fi
+    else
+        print_ok "Router mode: multi"
+    fi
+
+    # Detect server IP
+    SERVER_IP=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || curl -4 -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
+    if [[ -z "$SERVER_IP" ]]; then
+        SERVER_IP=$(prompt_input "Enter your server's public IP")
+        if [[ -z "$SERVER_IP" ]]; then
+            print_fail "Server IP is required."
+            exit 1
+        fi
+    fi
+    print_ok "Server IP: ${SERVER_IP}"
+
+    # Show existing tunnels
+    echo ""
+    print_info "Current tunnels:"
+    echo ""
+    dnsgb tunnel list 2>/dev/null || true
+    echo ""
+
+    # Detect next tunnel number
+    local num
+    num=$(detect_next_tunnel_num)
+    print_info "Next tunnel set number: ${num}"
+    echo ""
+
+    # Get existing tunnel domains for duplicate check
+    local existing_domains
+    existing_domains=$(dnsgb tunnel list 2>/dev/null | grep -o 'domain=[^ ]*' | sed 's/domain=//;s/^[a-z0-9]*\.//' | sort -u || true)
+
+    # Use domain from argument if provided, otherwise prompt
+    if [[ -n "$ADD_DOMAIN_ARG" ]]; then
+        DOMAIN="$ADD_DOMAIN_ARG"
+        DOMAIN=$(echo "$DOMAIN" | sed 's|^[[:space:]]*||;s|[[:space:]]*$||;s|^https\?://||;s|/.*$||')
+        if [[ -z "$DOMAIN" ]] || [[ ! "$DOMAIN" =~ \. ]]; then
+            print_fail "Invalid domain: ${ADD_DOMAIN_ARG}"
+            exit 1
+        fi
+        if [[ -n "$existing_domains" ]] && echo "$existing_domains" | grep -qx "$DOMAIN"; then
+            print_fail "Domain '${DOMAIN}' is already in use by an existing tunnel."
+            exit 1
+        fi
+    else
+        # Interactive prompt — reopen /dev/tty in case stdin is a pipe
+        while true; do
+            echo -ne "  ${BOLD}Enter the new backup domain (e.g. backup.com)${NC} ${DIM}(h=help)${NC}: " >&2
+            read -r DOMAIN </dev/tty || { print_fail "Cannot read input (stdin is a pipe). Pass domain as argument: --add-domain example.com"; exit 1; }
+            DOMAIN=$(echo "$DOMAIN" | sed 's|^[[:space:]]*||;s|[[:space:]]*$||;s|^https\?://||;s|/.*$||')
+            if [[ -z "$DOMAIN" ]]; then
+                print_fail "Domain cannot be empty. Please try again."
+            elif [[ ! "$DOMAIN" =~ \. ]]; then
+                print_fail "Invalid domain (must contain a dot). Please try again."
+            elif [[ "$DOMAIN" =~ \.\. ]]; then
+                print_fail "Invalid domain (consecutive dots not allowed). Please try again."
+            elif [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+                print_fail "Invalid domain (use only letters, numbers, dots, hyphens). Please try again."
+            elif [[ -n "$existing_domains" ]] && echo "$existing_domains" | grep -qx "$DOMAIN"; then
+                print_fail "Domain '${DOMAIN}' is already in use by an existing tunnel. Please enter a different domain."
+            else
+                break
+            fi
+        done
+    fi
+
+    echo ""
+    print_ok "Domain: ${DOMAIN}"
+    echo ""
+
+    # DNS record setup
+    print_header "DNS Records for ${DOMAIN}"
+
+    echo ""
+    echo -e "  ${BOLD}How do you want to set up DNS records?${NC}"
+    echo ""
+    echo -e "  ${BOLD}1)${NC}  Automatic (Cloudflare API)"
+    echo -e "  ${BOLD}2)${NC}  Manual (create in dashboard)"
+    echo ""
+    local dns_choice
+    dns_choice=$(prompt_input "Select (1-2)" "2")
+
+    if [[ "$dns_choice" == "1" ]]; then
+        local cf_token
+        cf_token=$(prompt_input "Cloudflare API Token")
+        cf_token=$(echo "$cf_token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [[ -n "$cf_token" ]]; then
+            cloudflare_create_dns_records "$cf_token" "$DOMAIN" "$SERVER_IP" || true
+        else
+            print_fail "API token cannot be empty"
+            exit 1
+        fi
+    else
+        print_info "Create these records in Cloudflare for ${BOLD}${DOMAIN}${NC}:"
+        echo ""
+        print_box \
+            "Record 1:  Type: A   | Name: ns  | Value: ${SERVER_IP}" \
+            "           Proxy: OFF (DNS Only - grey cloud)" \
+            "" \
+            "Record 2:  Type: NS  | Name: t   | Value: ns.${DOMAIN}" \
+            "Record 3:  Type: NS  | Name: d   | Value: ns.${DOMAIN}" \
+            "Record 4:  Type: NS  | Name: s   | Value: ns.${DOMAIN}" \
+            "Record 5:  Type: NS  | Name: ds  | Value: ns.${DOMAIN}" \
+            "Record 6:  Type: NS  | Name: n   | Value: ns.${DOMAIN}" \
+            "Record 7:  Type: NS  | Name: z   | Value: ns.${DOMAIN}" \
+            "Record 8:  Type: NS  | Name: v   | Value: ns.${DOMAIN}" \
+            "Record 9:  Type: NS  | Name: vz  | Value: ns.${DOMAIN}"
+
+        echo ""
+        print_warn "IMPORTANT: The A record MUST be DNS Only (grey cloud, NOT orange)"
+        echo ""
+
+        if ! prompt_yn "Have you created these DNS records in Cloudflare?" "n"; then
+            echo ""
+            print_info "Please create the DNS records and re-run: sudo bash $0 --add-domain"
+            exit 0
+        fi
+    fi
+
+    echo ""
+
+    # Create tunnels with numbered tags
+    local slip_tag="slip${num}"
+    local dnstt_tag="dnstt${num}"
+    local slip_ssh_tag="slip-ssh${num}"
+    local dnstt_ssh_tag="dnstt-ssh${num}"
+
+    print_header "Creating Tunnels for ${DOMAIN}"
+
+    print_info "Creating 4 tunnels (set #${num}) for domain: ${BOLD}${DOMAIN}${NC}"
+    echo ""
+
+    # Detect existing SOCKS authentication via dnsgb
+    if detect_socks_auth; then
+        print_ok "Detected existing SOCKS authentication (user: ${SOCKS_USER})"
+    else
+        print_info "SOCKS proxy has no authentication configured"
+    fi
+    echo ""
+
+    # Ask for DNSTT MTU (use CLI value as default if provided via --mtu)
+    local mtu_input
+    mtu_input=$(prompt_input "DNSTT MTU size (512-1400, affects packet size)" "$DNSTT_MTU")
+    if [[ "$mtu_input" =~ ^[0-9]+$ ]] && [[ "$mtu_input" -ge 512 ]] && [[ "$mtu_input" -le 1400 ]]; then
+        DNSTT_MTU="$mtu_input"
+    else
+        print_warn "Invalid MTU value; using default ${DNSTT_MTU}"
+    fi
+    print_ok "DNSTT MTU: ${DNSTT_MTU}"
+    echo ""
+
+    # Tunnel 1: Slipstream + SOCKS
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel: Slipstream + SOCKS${NC}"
+    echo ""
+    if dnsgb tunnel add --transport slipstream --backend socks --domain "t.${DOMAIN}" --tag "$slip_tag" 2>&1; then
+        print_ok "Created: ${slip_tag} (Slipstream + SOCKS) on t.${DOMAIN}"
+    else
+        print_warn "Tunnel ${slip_tag} may already exist or creation failed"
+    fi
+    echo ""
+
+    # Tunnel 2: DNSTT + SOCKS
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel: DNSTT + SOCKS${NC}"
+    echo ""
+    local dnstt_output
+    dnstt_output=$(dnsgb tunnel add --transport dnstt --backend socks --domain "d.${DOMAIN}" --tag "$dnstt_tag" --mtu "$DNSTT_MTU" 2>&1) || true
+    echo "$dnstt_output"
+
+    DNSTT_PUBKEY=""
+    if [[ -f "/etc/dnsgb/tunnels/${dnstt_tag}/server.pub" ]]; then
+        DNSTT_PUBKEY=$(cat "/etc/dnsgb/tunnels/${dnstt_tag}/server.pub" 2>/dev/null || true)
+    fi
+
+    if [[ -n "$DNSTT_PUBKEY" ]]; then
+        print_ok "Created: ${dnstt_tag} (DNSTT + SOCKS) on d.${DOMAIN}"
+        echo ""
+        echo -e "  ${BOLD}${YELLOW}DNSTT Public Key (save this!):${NC}"
+        echo -e "  ${GREEN}${DNSTT_PUBKEY}${NC}"
+    else
+        print_warn "Tunnel ${dnstt_tag} may already exist or creation failed"
+    fi
+    echo ""
+
+    # Tunnel 3: Slipstream + SSH
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel: Slipstream + SSH${NC}"
+    echo ""
+    if dnsgb tunnel add --transport slipstream --backend ssh --domain "s.${DOMAIN}" --tag "$slip_ssh_tag" 2>&1; then
+        print_ok "Created: ${slip_ssh_tag} (Slipstream + SSH) on s.${DOMAIN}"
+    else
+        print_warn "Tunnel ${slip_ssh_tag} may already exist or creation failed"
+    fi
+    echo ""
+
+    # Tunnel 4: DNSTT + SSH
+    echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+    echo -e "  ${BOLD}Tunnel: DNSTT + SSH${NC}"
+    echo ""
+    if dnsgb tunnel add --transport dnstt --backend ssh --domain "ds.${DOMAIN}" --tag "$dnstt_ssh_tag" --mtu "$DNSTT_MTU" 2>&1; then
+        print_ok "Created: ${dnstt_ssh_tag} (DNSTT + SSH) on ds.${DOMAIN}"
+    else
+        print_warn "Tunnel ${dnstt_ssh_tag} may already exist or creation failed"
+    fi
+    echo ""
+
+    # Re-read DNSTT key if not captured
+    if [[ -z "$DNSTT_PUBKEY" && -f "/etc/dnsgb/tunnels/${dnstt_tag}/server.pub" ]]; then
+        DNSTT_PUBKEY=$(cat "/etc/dnsgb/tunnels/${dnstt_tag}/server.pub" 2>/dev/null || true)
+    fi
+
+    # NoizDNS tunnels — download binary if not available, then create tunnels
+    ensure_noizdns_binary || true
+    if [[ -x /usr/local/bin/noizdns-server ]]; then
+        local noiz_tag="noiz${num}"
+        local noiz_ssh_tag="noiz-ssh${num}"
+
+        echo ""
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel: NoizDNS + SOCKS (DPI-resistant)${NC}"
+        echo ""
+        if dnsgb tunnel add --transport dnstt --backend socks --domain "n.${DOMAIN}" --tag "$noiz_tag" --mtu "$DNSTT_MTU" 2>&1; then
+            print_ok "Created: ${noiz_tag} (NoizDNS + SOCKS) on n.${DOMAIN}"
+        else
+            print_warn "Tunnel ${noiz_tag} may already exist or creation failed"
+        fi
+        create_noizdns_service_override "$noiz_tag" || print_warn "Could not set NoizDNS binary for ${noiz_tag}"
+
+        # Extract NoizDNS pubkey
+        if [[ -f "/etc/dnsgb/tunnels/${noiz_tag}/server.pub" ]]; then
+            NOIZDNS_PUBKEY=$(cat "/etc/dnsgb/tunnels/${noiz_tag}/server.pub" 2>/dev/null || true)
+        fi
+        echo ""
+
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel: NoizDNS + SSH (DPI-resistant)${NC}"
+        echo ""
+        if dnsgb tunnel add --transport dnstt --backend ssh --domain "z.${DOMAIN}" --tag "$noiz_ssh_tag" --mtu "$DNSTT_MTU" 2>&1; then
+            print_ok "Created: ${noiz_ssh_tag} (NoizDNS + SSH) on z.${DOMAIN}"
+        else
+            print_warn "Tunnel ${noiz_ssh_tag} may already exist or creation failed"
+        fi
+        create_noizdns_service_override "$noiz_ssh_tag" || print_warn "Could not set NoizDNS binary for ${noiz_ssh_tag}"
+        echo ""
+
+        # Stop NoizDNS tunnels so they restart with the correct binary
+        # (dnsgb tunnel add auto-starts with dnstt-server, not noizdns-server)
+        systemctl stop "dnsgb-${noiz_tag}.service" 2>/dev/null || true
+        systemctl stop "dnsgb-${noiz_ssh_tag}.service" 2>/dev/null || true
+
+        # Fix transport field if dnsgb rewrote it from "dnstt" to "noizdns"
+        fix_noizdns_transport
+    fi
+
+    # VayDNS tunnels — native (dnsgb v0.7.0+) or legacy (binary swap)
+    local _vay_native=false
+    if dnsgb_supports_vaydns; then
+        _vay_native=true
+    else
+        ensure_vaydns_binary || true
+    fi
+
+    if [[ "$_vay_native" == true ]] || [[ -x /usr/local/bin/vaydns-server ]]; then
+        local vay_tag="vay${num}"
+        local vay_ssh_tag="vay-ssh${num}"
+
+        echo ""
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel: VayDNS + SOCKS (optimized)${NC}"
+        echo ""
+        if [[ "$_vay_native" == true ]]; then
+            if dnsgb tunnel add --transport vaydns --backend socks --domain "v.${DOMAIN}" --tag "$vay_tag" --mtu "$DNSTT_MTU" --dnstt-compat 2>&1; then
+                print_ok "Created: ${vay_tag} (VayDNS + SOCKS) on v.${DOMAIN}"
+            else
+                print_warn "Tunnel ${vay_tag} may already exist or creation failed"
+            fi
+        else
+            if dnsgb tunnel add --transport dnstt --backend socks --domain "v.${DOMAIN}" --tag "$vay_tag" --mtu "$DNSTT_MTU" 2>&1; then
+                print_ok "Created: ${vay_tag} (VayDNS + SOCKS) on v.${DOMAIN}"
+            else
+                print_warn "Tunnel ${vay_tag} may already exist or creation failed"
+            fi
+            create_vaydns_service_override "$vay_tag" || print_warn "Could not set VayDNS binary for ${vay_tag}"
+        fi
+
+        if [[ -f "/etc/dnsgb/tunnels/${vay_tag}/server.pub" ]]; then
+            VAYDNS_PUBKEY=$(cat "/etc/dnsgb/tunnels/${vay_tag}/server.pub" 2>/dev/null || true)
+        fi
+        echo ""
+
+        echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
+        echo -e "  ${BOLD}Tunnel: VayDNS + SSH (optimized)${NC}"
+        echo ""
+        if [[ "$_vay_native" == true ]]; then
+            if dnsgb tunnel add --transport vaydns --backend ssh --domain "vz.${DOMAIN}" --tag "$vay_ssh_tag" --mtu "$DNSTT_MTU" --dnstt-compat 2>&1; then
+                print_ok "Created: ${vay_ssh_tag} (VayDNS + SSH) on vz.${DOMAIN}"
+            else
+                print_warn "Tunnel ${vay_ssh_tag} may already exist or creation failed"
+            fi
+        else
+            if dnsgb tunnel add --transport dnstt --backend ssh --domain "vz.${DOMAIN}" --tag "$vay_ssh_tag" --mtu "$DNSTT_MTU" 2>&1; then
+                print_ok "Created: ${vay_ssh_tag} (VayDNS + SSH) on vz.${DOMAIN}"
+            else
+                print_warn "Tunnel ${vay_ssh_tag} may already exist or creation failed"
+            fi
+            create_vaydns_service_override "$vay_ssh_tag" || print_warn "Could not set VayDNS binary for ${vay_ssh_tag}"
+        fi
+        echo ""
+
+        # Legacy: stop services so they restart with the new binary
+        if [[ "$_vay_native" != true ]]; then
+            systemctl stop "dnsgb-${vay_tag}.service" 2>/dev/null || true
+            systemctl stop "dnsgb-${vay_ssh_tag}.service" 2>/dev/null || true
+            fix_vaydns_transport
+        fi
+    fi
+
+    print_ok "All tunnels created"
+    echo ""
+
+    # Reload systemd to pick up any service overrides (NoizDNS binary swap)
+    systemctl daemon-reload 2>/dev/null || true
+
+    # Stop router while we start tunnels (router crash-loops if backends are dead)
+    print_info "Stopping DNS Router..."
+    dnsgb router stop 2>/dev/null || true
+    sleep 1
+
+    # Start new tunnels FIRST (before router)
+    local _start_tags="$slip_tag $dnstt_tag $slip_ssh_tag $dnstt_ssh_tag"
+    if [[ -x /usr/local/bin/noizdns-server ]]; then
+        _start_tags+=" ${noiz_tag:-} ${noiz_ssh_tag:-}"
+    fi
+    if [[ -n "${vay_tag:-}" ]]; then
+        _start_tags+=" ${vay_tag} ${vay_ssh_tag:-}"
+    fi
+    print_info "Starting new tunnels..."
+    for tag in $_start_tags; do
+        [[ -z "$tag" ]] && continue
+        if dnsgb tunnel start --tag "$tag" 2>/dev/null; then
+            print_ok "Started: ${tag}"
+        else
+            if dnsgb_tag_exists "$tag" && dnsgb tunnel list 2>/dev/null | grep -wF "$tag" | grep -qi "running"; then
+                print_ok "Already running: ${tag}"
+            else
+                print_warn "Could not start: ${tag}. Check: dnsgb tunnel logs --tag ${tag}"
+            fi
+        fi
+    done
+
+    # Verify NoizDNS tunnels started — remove dead ones to protect router
+    sleep 3
+    for _ntag in ${noiz_tag:-} ${noiz_ssh_tag:-}; do
+        [[ -z "$_ntag" ]] && continue
+        if dnsgb_tag_exists "$_ntag"; then
+            if ! systemctl is-active --quiet "dnsgb-${_ntag}.service" 2>/dev/null; then
+                # Retry — give it more time before removing
+                print_info "Waiting for ${_ntag} to start..."
+                sleep 5
+                systemctl restart "dnsgb-${_ntag}.service" 2>/dev/null || true
+                sleep 3
+                if systemctl is-active --quiet "dnsgb-${_ntag}.service" 2>/dev/null; then
+                    print_ok "NoizDNS tunnel ${_ntag} started successfully (after retry)"
+                    continue
+                fi
+                print_warn "NoizDNS tunnel ${_ntag} failed to start — removing to protect DNS Router"
+                dnsgb tunnel stop --tag "$_ntag" 2>/dev/null || true
+                dnsgb tunnel remove --tag "$_ntag" 2>/dev/null || true
+                rm -f "/etc/systemd/system/dnsgb-${_ntag}.service.d/10-noizdns-binary.conf" 2>/dev/null || true
+                rmdir "/etc/systemd/system/dnsgb-${_ntag}.service.d" 2>/dev/null || true
+                systemctl daemon-reload 2>/dev/null || true
+                print_info "Removed ${_ntag} — other tunnels will work normally"
+            fi
+        fi
+    done
+
+    # Fix transport field if dnsgb rewrote it during start
+    fix_noizdns_transport
+
+    # Verify VayDNS tunnels started
+    for _vtag in ${vay_tag:-} ${vay_ssh_tag:-}; do
+        [[ -z "$_vtag" ]] && continue
+        if dnsgb_tag_exists "$_vtag"; then
+            if ! systemctl is-active --quiet "dnsgb-${_vtag}.service" 2>/dev/null; then
+                print_info "Waiting for ${_vtag} to start..."
+                sleep 5
+                systemctl restart "dnsgb-${_vtag}.service" 2>/dev/null || true
+                sleep 3
+                if systemctl is-active --quiet "dnsgb-${_vtag}.service" 2>/dev/null; then
+                    print_ok "VayDNS tunnel ${_vtag} started successfully (after retry)"
+                else
+                    print_warn "VayDNS tunnel ${_vtag} failed to start — removing to protect DNS Router"
+                    dnsgb tunnel stop --tag "$_vtag" 2>/dev/null || true
+                    dnsgb tunnel remove --tag "$_vtag" 2>/dev/null || true
+                    rm -f "/etc/systemd/system/dnsgb-${_vtag}.service.d/10-vaydns-binary.conf" 2>/dev/null || true
+                    rmdir "/etc/systemd/system/dnsgb-${_vtag}.service.d" 2>/dev/null || true
+                fi
+            fi
+        fi
+    done
+    fix_vaydns_transport
+
+    # NOW start the router (all backends are healthy)
+    echo ""
+    print_info "Starting DNS Router..."
+    if dnsgb router start 2>/dev/null; then
+        print_ok "DNS Router restarted"
+    else
+        print_warn "DNS Router restart may have issues. Check: dnsgb router logs"
+    fi
+
+    echo ""
+    print_info "All tunnels:"
+    echo ""
+    dnsgb tunnel list 2>/dev/null || true
+    echo ""
+
+    if apply_service_hardening; then
+        print_ok "Runtime hardening applied to dnsgb and microsocks services"
+    else
+        print_warn "Runtime hardening reported issues; review systemctl status for dnsgb units"
+    fi
+
+    # Summary
+    local w=54
+    local border empty
+    border=$(printf '═%.0s' $(seq 1 $w))
+    empty=$(printf ' %.0s' $(seq 1 $w))
+    local msg="DOMAIN ADDED!"
+    local ml=$(( (w - ${#msg}) / 2 ))
+    local mr=$(( w - ${#msg} - ml ))
+
+    echo -e "${BOLD}${GREEN}"
+    printf "  ╔%s╗\n" "$border"
+    printf "  ║%s║\n" "$empty"
+    printf "  ║%${ml}s%s%${mr}s║\n" "" "$msg" ""
+    printf "  ║%s║\n" "$empty"
+    printf "  ╚%s╝\n" "$border"
+    echo -e "${NC}"
+
+    echo -e "  ${BOLD}Server Information${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Server IP:     ${GREEN}${SERVER_IP}${NC}"
+    echo -e "  Domain:        ${GREEN}${DOMAIN}${NC}"
+    echo ""
+
+    echo -e "  ${BOLD}Tunnel Endpoints${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo -e "  Slipstream + SOCKS:  ${GREEN}t.${DOMAIN}${NC}  (${slip_tag})"
+    echo -e "  DNSTT + SOCKS:       ${GREEN}d.${DOMAIN}${NC}  (${dnstt_tag})"
+    if [[ -n "${noiz_tag:-}" ]]; then
+        echo -e "  NoizDNS + SOCKS:     ${GREEN}n.${DOMAIN}${NC}  (${noiz_tag})  ${DIM}(DPI-resistant)${NC}"
+    fi
+    if [[ -n "${vay_tag:-}" ]]; then
+        echo -e "  VayDNS + SOCKS:      ${GREEN}v.${DOMAIN}${NC}  (${vay_tag})  ${DIM}(optimized)${NC}"
+    fi
+    echo -e "  Slipstream + SSH:    ${GREEN}s.${DOMAIN}${NC}  (${slip_ssh_tag})"
+    echo -e "  DNSTT + SSH:         ${GREEN}ds.${DOMAIN}${NC}  (${dnstt_ssh_tag})"
+    if [[ -n "${noiz_ssh_tag:-}" ]]; then
+        echo -e "  NoizDNS + SSH:       ${GREEN}z.${DOMAIN}${NC}  (${noiz_ssh_tag})  ${DIM}(DPI-resistant)${NC}"
+    fi
+    if [[ -n "${vay_ssh_tag:-}" ]]; then
+        echo -e "  VayDNS + SSH:        ${GREEN}vz.${DOMAIN}${NC}  (${vay_ssh_tag})  ${DIM}(optimized)${NC}"
+    fi
+    echo ""
+
+    if [[ -n "$DNSTT_PUBKEY" ]]; then
+        echo -e "  ${BOLD}DNSTT Public Keys${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}${dnstt_tag} (SOCKS):${NC}  ${DNSTT_PUBKEY}"
+        local _dnstt_ssh_pk=""
+        if [[ -f "/etc/dnsgb/tunnels/${dnstt_ssh_tag}/server.pub" ]]; then
+            _dnstt_ssh_pk=$(cat "/etc/dnsgb/tunnels/${dnstt_ssh_tag}/server.pub" 2>/dev/null || true)
+        fi
+        if [[ -n "$_dnstt_ssh_pk" ]]; then
+            echo -e "  ${GREEN}${dnstt_ssh_tag} (SSH):${NC} ${_dnstt_ssh_pk}"
+        fi
+        echo ""
+    fi
+
+    if [[ -n "${NOIZDNS_PUBKEY:-}" ]]; then
+        echo -e "  ${BOLD}NoizDNS Public Keys${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}${noiz_tag} (SOCKS):${NC}   ${NOIZDNS_PUBKEY}"
+        local _noiz_ssh_pk=""
+        if [[ -n "${noiz_ssh_tag:-}" && -f "/etc/dnsgb/tunnels/${noiz_ssh_tag}/server.pub" ]]; then
+            _noiz_ssh_pk=$(cat "/etc/dnsgb/tunnels/${noiz_ssh_tag}/server.pub" 2>/dev/null || true)
+        fi
+        if [[ -n "$_noiz_ssh_pk" ]]; then
+            echo -e "  ${GREEN}${noiz_ssh_tag} (SSH):${NC}  ${_noiz_ssh_pk}"
+        fi
+        echo ""
+    fi
+
+    if [[ -n "${VAYDNS_PUBKEY:-}" ]]; then
+        echo -e "  ${BOLD}VayDNS Public Keys${NC}"
+        echo -e "  ${DIM}────────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}${vay_tag} (SOCKS):${NC}    ${VAYDNS_PUBKEY}"
+        local _vay_ssh_pk=""
+        if [[ -n "${vay_ssh_tag:-}" && -f "/etc/dnsgb/tunnels/${vay_ssh_tag}/server.pub" ]]; then
+            _vay_ssh_pk=$(cat "/etc/dnsgb/tunnels/${vay_ssh_tag}/server.pub" 2>/dev/null || true)
+        fi
+        if [[ -n "$_vay_ssh_pk" ]]; then
+            echo -e "  ${GREEN}${vay_ssh_tag} (SSH):${NC}   ${_vay_ssh_pk}"
+        fi
+        echo ""
+    fi
+
+    # Generate share URLs for new tunnels (dnst:// for dnstc CLI)
+    echo -e "  ${BOLD}Share URLs — dnst:// (for dnstc CLI)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    local share_url
+    local _socks_tags="$slip_tag $dnstt_tag"
+    [[ -n "${noiz_tag:-}" ]] && _socks_tags+=" $noiz_tag"
+    [[ -n "${vay_tag:-}" ]] && _socks_tags+=" $vay_tag"
+    for tag in $_socks_tags; do
+        share_url=$(dnsgb tunnel share -t "$tag" 2>/dev/null || true)
+        if [[ -n "$share_url" ]]; then
+            echo -e "  ${GREEN}${tag}:${NC} ${share_url}"
+        fi
+    done
+    echo ""
+    echo -e "  ${DIM}Note: SSH tunnel share URLs require credentials. Generate them with:${NC}"
+    echo -e "  ${DIM}  dnsgb tunnel share -t ${slip_ssh_tag} --user <username> --password <pass>${NC}"
+    echo -e "  ${DIM}  dnsgb tunnel share -t ${dnstt_ssh_tag} --user <username> --password <pass>${NC}"
+    if [[ -n "${noiz_ssh_tag:-}" ]]; then
+        echo -e "  ${DIM}  dnsgb tunnel share -t ${noiz_ssh_tag} --user <username> --password <pass>${NC}"
+    fi
+    if [[ -n "${vay_ssh_tag:-}" ]]; then
+        echo -e "  ${DIM}  dnsgb tunnel share -t ${vay_ssh_tag} --user <username> --password <pass>${NC}"
+    fi
+    echo ""
+
+    # Generate SlipNet deep-link URLs for new tunnels (slipnet:// for SlipNet app)
+    echo -e "  ${BOLD}Share URLs — slipnet:// (for SlipNet app)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    local slipnet_url
+    local s_user="" s_pass=""
+    if [[ "$SOCKS_AUTH" == true ]]; then
+        s_user="$SOCKS_USER"
+        s_pass="$SOCKS_PASS"
+    fi
+    local _slip_pk2=""
+    _slip_pk2=$(cat /etc/dnsgb/tunnels/*/server.pub 2>/dev/null | head -1 || true)
+    slipnet_url=$(generate_slipnet_url "ss" "t" "$_slip_pk2" "" "" "$s_user" "$s_pass")
+    echo -e "  ${GREEN}${slip_tag}:${NC}      ${slipnet_url}"
+    if [[ -n "$DNSTT_PUBKEY" ]]; then
+        slipnet_url=$(generate_slipnet_url "dnstt" "d" "$DNSTT_PUBKEY" "" "" "$s_user" "$s_pass")
+        echo -e "  ${GREEN}${dnstt_tag}:${NC}     ${slipnet_url}"
+    fi
+    if [[ -n "${NOIZDNS_PUBKEY:-}" ]]; then
+        slipnet_url=$(generate_slipnet_url "sayedns" "n" "$NOIZDNS_PUBKEY" "" "" "$s_user" "$s_pass")
+        echo -e "  ${GREEN}${noiz_tag}:${NC}      ${slipnet_url}"
+    fi
+    if [[ -n "${VAYDNS_PUBKEY:-}" ]]; then
+        slipnet_url=$(generate_slipnet_url "dnstt" "v" "$VAYDNS_PUBKEY" "" "" "$s_user" "$s_pass")
+        echo -e "  ${GREEN}${vay_tag}:${NC}       ${slipnet_url}"
+    fi
+
+    # Ask user for SSH credentials to generate SSH tunnel URLs
+    echo ""
+    if prompt_yn "Generate SSH tunnel slipnet:// URLs?" "y"; then
+        local ssh_tun_user ssh_tun_pass
+        ssh_tun_user=$(prompt_input "SSH tunnel username")
+        ssh_tun_pass=$(prompt_input "SSH tunnel password")
+        if [[ "$ssh_tun_user" == *"|"* || "$ssh_tun_pass" == *"|"* ]]; then
+            print_fail "Username/password cannot contain the | character"
+        elif [[ -n "$ssh_tun_user" && -n "$ssh_tun_pass" ]]; then
+            local _any_pk2=""
+            _any_pk2=$(cat /etc/dnsgb/tunnels/*/server.pub 2>/dev/null | head -1 || true)
+            slipnet_url=$(generate_slipnet_url "slipstream_ssh" "s" "$_any_pk2" "$ssh_tun_user" "$ssh_tun_pass" "$s_user" "$s_pass")
+            echo -e "  ${GREEN}${slip_ssh_tag}:${NC}  ${slipnet_url}"
+            # dnstt-ssh has its own keypair — read from its own tunnel dir
+            local _dnstt_ssh_pk=""
+            if [[ -f "/etc/dnsgb/tunnels/${dnstt_ssh_tag}/server.pub" ]]; then
+                _dnstt_ssh_pk=$(cat "/etc/dnsgb/tunnels/${dnstt_ssh_tag}/server.pub" 2>/dev/null || true)
+            fi
+            if [[ -n "$_dnstt_ssh_pk" ]]; then
+                slipnet_url=$(generate_slipnet_url "dnstt_ssh" "ds" "$_dnstt_ssh_pk" "$ssh_tun_user" "$ssh_tun_pass" "$s_user" "$s_pass")
+                echo -e "  ${GREEN}${dnstt_ssh_tag}:${NC} ${slipnet_url}"
+            fi
+            if [[ -n "${NOIZDNS_PUBKEY:-}" && -n "${noiz_ssh_tag:-}" ]]; then
+                local _noiz_ssh_pk2=""
+                if [[ -f "/etc/dnsgb/tunnels/${noiz_ssh_tag}/server.pub" ]]; then
+                    _noiz_ssh_pk2=$(cat "/etc/dnsgb/tunnels/${noiz_ssh_tag}/server.pub" 2>/dev/null || true)
+                fi
+                if [[ -n "$_noiz_ssh_pk2" ]]; then
+                    slipnet_url=$(generate_slipnet_url "sayedns_ssh" "z" "$_noiz_ssh_pk2" "$ssh_tun_user" "$ssh_tun_pass" "$s_user" "$s_pass")
+                    echo -e "  ${GREEN}${noiz_ssh_tag}:${NC} ${slipnet_url}"
+                fi
+            fi
+            if [[ -n "${VAYDNS_PUBKEY:-}" && -n "${vay_ssh_tag:-}" ]]; then
+                local _vay_ssh_pk2=""
+                if [[ -f "/etc/dnsgb/tunnels/${vay_ssh_tag}/server.pub" ]]; then
+                    _vay_ssh_pk2=$(cat "/etc/dnsgb/tunnels/${vay_ssh_tag}/server.pub" 2>/dev/null || true)
+                fi
+                if [[ -n "$_vay_ssh_pk2" ]]; then
+                    slipnet_url=$(generate_slipnet_url "dnstt_ssh" "vz" "$_vay_ssh_pk2" "$ssh_tun_user" "$ssh_tun_pass" "$s_user" "$s_pass")
+                    echo -e "  ${GREEN}${vay_ssh_tag}:${NC} ${slipnet_url}"
+                fi
+            fi
+        else
+            echo -e "  ${DIM}Skipped — username or password was empty.${NC}"
+        fi
+    fi
+    echo ""
+
+    echo -e "  ${DIM}To add more domains, run again: sudo bash $0 --add-domain${NC}"
+    echo ""
+}
+
+# ─── Parse Arguments ────────────────────────────────────────────────────────────
+
+ADD_DOMAIN_MODE=false
+ADD_DOMAIN_ARG=""
+ADD_XRAY_MODE=false
+HARDEN_ONLY_MODE=false
+CLEANUP_MODE=false
+UPDATE_MODE=false
+MANAGE_USERS_MODE=false
+DNSTT_MTU=1232
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        --about)
+            show_about
+            exit 0
+            ;;
+        --status)
+            do_status
+            exit 0
+            ;;
+        --monitor)
+            do_monitor
+            exit 0
+            ;;
+        --diag)
+            do_diag
+            exit 0
+            ;;
+        --manage)
+            do_manage
+            exit 0
+            ;;
+        --uninstall)
+            do_uninstall
+            exit 0
+            ;;
+        --remove-tunnel)
+            # If $2 looks like another flag (starts with --), treat as no tag given
+            if [[ -n "${2:-}" ]] && [[ "${2:0:2}" != "--" ]]; then
+                do_remove_tunnel "$2"
+            else
+                do_remove_tunnel ""
+            fi
+            exit 0
+            ;;
+        --add-tunnel)
+            do_add_tunnel
+            exit 0
+            ;;
+        --add-xray)
+            ADD_XRAY_MODE=true
+            shift
+            ;;
+        --add-domain)
+            ADD_DOMAIN_MODE=true
+            # Accept optional domain argument: --add-domain example.com
+            if [[ -n "${2:-}" ]] && [[ ! "$2" =~ ^-- ]]; then
+                ADD_DOMAIN_ARG="$2"
+                shift 2
+            else
+                shift
+            fi
+            ;;
+        --users)
+            MANAGE_USERS_MODE=true
+            shift
+            ;;
+        --harden)
+            HARDEN_ONLY_MODE=true
+            shift
+            ;;
+        --cleanup)
+            CLEANUP_MODE=true
+            shift
+            ;;
+        --update)
+            UPDATE_MODE=true
+            shift
+            ;;
+        --mtu)
+            if [[ -n "${2:-}" ]] && [[ "$2" =~ ^[0-9]+$ ]] && [[ "$2" -ge 512 ]] && [[ "$2" -le 1400 ]]; then
+                DNSTT_MTU="$2"
+                shift 2
+            else
+                echo "Error: --mtu requires a value between 512 and 1400"
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information."
+            exit 1
+            ;;
+    esac
+done
+
+# ─── Validate conflicting flags ──────────────────────────────────────────────────
+
+mode_count=0
+[[ "$ADD_DOMAIN_MODE" == true ]] && ((mode_count++)) || true
+[[ "$ADD_XRAY_MODE" == true ]] && ((mode_count++)) || true
+[[ "$HARDEN_ONLY_MODE" == true ]] && ((mode_count++)) || true
+[[ "$CLEANUP_MODE" == true ]] && ((mode_count++)) || true
+[[ "$UPDATE_MODE" == true ]] && ((mode_count++)) || true
+[[ "$MANAGE_USERS_MODE" == true ]] && ((mode_count++)) || true
+if [[ $mode_count -gt 1 ]]; then
+    echo "Error: --add-domain, --add-xray, --harden, --cleanup, --update, and --users cannot be combined."
+    exit 1
+fi
+
+# ─── Main ───────────────────────────────────────────────────────────────────────
+
+main() {
+    banner
+    echo -e "  ${DIM}Tip: Press 'h' at any prompt for help${NC}"
+
+    step_preflight
+    step_ask_domain
+    step_dns_records
+    step_free_port53
+    step_install_dnsgb
+    step_verify_port53
+    step_create_tunnels
+    step_start_services
+    step_verify_microsocks
+    step_ssh_user
+    step_tests
+    install_to_path
+    step_summary
+    unset SSH_PASS 2>/dev/null || true
+}
+
+if [[ "$HARDEN_ONLY_MODE" == true ]]; then
+    do_harden
+elif [[ "$CLEANUP_MODE" == true ]]; then
+    do_cleanup
+elif [[ "$UPDATE_MODE" == true ]]; then
+    do_update
+elif [[ "$ADD_DOMAIN_MODE" == true ]]; then
+    do_add_domain
+elif [[ "$ADD_XRAY_MODE" == true ]]; then
+    do_add_xray
+elif [[ "$MANAGE_USERS_MODE" == true ]]; then
+    do_manage_users
+else
+    main
+fi

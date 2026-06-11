@@ -232,6 +232,23 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
+
+  echo "==> Kuunda service /etc/systemd/system/badvpn-udpgw-ipv6.service (IPv6)..."
+  cat >/etc/systemd/system/badvpn-udpgw-ipv6.service <<EOF
+[Unit]
+Description=BadVPN UDPGW Service IPv6
+After=network.target
+
+[Service]
+Type=simple
+LimitNOFILE=1048576
+LimitNPROC=1048576
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr [::1]:7300 --max-clients 1000 --max-connections-for-client 10
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
 fi
 
 echo "==> Kupakua dnstt-server binary (Linux x64)..."
@@ -541,6 +558,7 @@ show_status() {
     echo ""
     echo "--- BadVPN UDPGW Status ---"
     systemctl status badvpn-udpgw.service --no-pager 2>/dev/null || true
+    systemctl status badvpn-udpgw-ipv6.service --no-pager 2>/dev/null || true
     echo ""
     echo "--- Xray Core Status ---"
     systemctl status xray.service --no-pager 2>/dev/null || true
@@ -569,8 +587,8 @@ view_logs() {
 restart_services() {
     header
     echo "[+] Enabling and restarting services..."
-    systemctl enable --now dnstt-unida.service dnstt-unida-proxy.service badvpn-udpgw.service xray.service 2>/dev/null || true
-    systemctl restart dnstt-unida.service dnstt-unida-proxy.service badvpn-udpgw.service xray.service 2>/dev/null || true
+    systemctl enable --now dnstt-unida.service dnstt-unida-proxy.service badvpn-udpgw.service badvpn-udpgw-ipv6.service xray.service 2>/dev/null || true
+    systemctl restart dnstt-unida.service dnstt-unida-proxy.service badvpn-udpgw.service badvpn-udpgw-ipv6.service xray.service 2>/dev/null || true
     
     # Dissolve: ensure SSH does not die when we are restarting services
     echo "[+] Verifying SSH / SSHD services stay active..."
@@ -658,7 +676,7 @@ uninstall_unida() {
     read -rp "Are you sure? (y/n): " confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         echo "[+] Stopping services..."
-        systemctl disable --now dnstt-unida.service dnstt-unida-proxy.service badvpn-udpgw.service 2>/dev/null || true
+        systemctl disable --now dnstt-unida.service dnstt-unida-proxy.service badvpn-udpgw.service badvpn-udpgw-ipv6.service 2>/dev/null || true
         echo "[+] Removing files..."
         rm -f /usr/local/bin/dnstt-server
         rm -f /usr/local/bin/dnstt-edns-proxy.py
@@ -668,6 +686,7 @@ uninstall_unida() {
         rm -f /etc/systemd/system/dnstt-unida.service
         rm -f /etc/systemd/system/dnstt-unida-proxy.service
         rm -f /etc/systemd/system/badvpn-udpgw.service
+        rm -f /etc/systemd/system/badvpn-udpgw-ipv6.service
         systemctl daemon-reload
         echo "[+] Removing users..."
         for user in $(awk -F':' '/\/bin\/false/{print $1}' /etc/passwd); do
@@ -1649,6 +1668,7 @@ systemctl enable --now dnstt-unida.service
 systemctl enable --now dnstt-unida-proxy.service
 if [ -f /etc/systemd/system/badvpn-udpgw.service ]; then
   systemctl enable --now badvpn-udpgw.service
+  systemctl enable --now badvpn-udpgw-ipv6.service 2>/dev/null || true
 fi
 
 if command -v ufw >/dev/null 2>&1; then
@@ -1725,6 +1745,7 @@ sync; echo 3 > /proc/sys/vm/drop_caches
 
 echo "🔄 Restarting Tunneling Services to clear stalled connections..."
 systemctl restart badvpn-udpgw 2>/dev/null || true
+systemctl restart badvpn-udpgw-ipv6 2>/dev/null || true
 systemctl restart sshd 2>/dev/null || true
 systemctl restart stunnel4 2>/dev/null || true
 systemctl restart xray 2>/dev/null || true
