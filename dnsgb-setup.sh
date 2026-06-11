@@ -811,9 +811,25 @@ do_configure_socks_auth() {
 # ─── DNS Router Troubleshooter ───────────────────────────────────────────────
 
 troubleshoot_and_start_dns_router() {
-    print_info "Starting DNS Router (using dnsgb router start)..."
+    print_info "Starting DNS Router service directly via systemd..."
+    
+    # Enable and start the systemd service directly to avoid dnsgb CLI's strict localhost probing
+    systemctl unmask dnsgb-dnsrouter 2>/dev/null || true
+    systemctl enable dnsgb-dnsrouter 2>/dev/null || true
+    systemctl reset-failed dnsgb-dnsrouter 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl start dnsgb-dnsrouter 2>/dev/null || systemctl start dnsgb-dnsrouter.service 2>/dev/null || true
+    sleep 3
+
+    if systemctl is-active --quiet dnsgb-dnsrouter 2>/dev/null || systemctl is-active --quiet dnsgb-dnsrouter.service 2>/dev/null; then
+        print_ok "DNS Router service started and verified running"
+        return 0
+    fi
+
+    # Fallback to CLI-based starting if systemctl start wasn't active
+    print_warn "Direct service start failed. Trying dnsgb router start..."
     if dnsgb router start 2>/dev/null; then
-        print_ok "DNS Router started successfully"
+        print_ok "DNS Router started successfully via CLI"
         return 0
     fi
 
@@ -855,10 +871,18 @@ troubleshoot_and_start_dns_router() {
     systemctl reset-failed dnsgb-dnsrouter 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
 
-    # Retry starting router
-    print_info "Retrying DNS Router start after cleanup..."
-    if dnsgb router start 2>/dev/null; then
+    # Retry starting router via systemctl first after cleanup
+    print_info "Retrying systemd start after cleanup..."
+    systemctl start dnsgb-dnsrouter 2>/dev/null || systemctl start dnsgb-dnsrouter.service 2>/dev/null || true
+    sleep 3
+    if systemctl is-active --quiet dnsgb-dnsrouter 2>/dev/null || systemctl is-active --quiet dnsgb-dnsrouter.service 2>/dev/null; then
         print_ok "DNS Router started successfully after cleanup (Retry 1)"
+        return 0
+    fi
+
+    # Try CLI fallback as Retry 1b
+    if dnsgb router start 2>/dev/null; then
+        print_ok "DNS Router started successfully after cleanup via CLI (Retry 1b)"
         return 0
     fi
 
@@ -880,8 +904,16 @@ EOF
         systemctl daemon-reload 2>/dev/null || true
         
         print_info "Retrying with root/capability fallback (Retry 2)..."
-        if dnsgb router start 2>/dev/null; then
+        systemctl start dnsgb-dnsrouter 2>/dev/null || systemctl start dnsgb-dnsrouter.service 2>/dev/null || true
+        sleep 3
+        if systemctl is-active --quiet dnsgb-dnsrouter 2>/dev/null || systemctl is-active --quiet dnsgb-dnsrouter.service 2>/dev/null; then
             print_ok "DNS Router started successfully under fallback environment"
+            return 0
+        fi
+
+        # Try CLI with fallback as Retry 2b
+        if dnsgb router start 2>/dev/null; then
+            print_ok "DNS Router started successfully under fallback environment via CLI"
             return 0
         fi
     fi
