@@ -21,9 +21,9 @@ export default function App() {
 
   const copyToClipboard = (text: string, id: string) => {
     navigator.clipboard.writeText(text);
-    setCopied({ ...copied, id: true });
+    setCopied({ ...copied, [id]: true });
     setTimeout(() => {
-      setCopied({ ...copied, id: false });
+      setCopied({ ...copied, [id]: false });
     }, 2000);
   };
 
