@@ -808,6 +808,102 @@ do_configure_socks_auth() {
     fi
 }
 
+# ─── DNS Router Troubleshooter ───────────────────────────────────────────────
+
+troubleshoot_and_start_dns_router() {
+    print_info "Starting DNS Router (using dnsgb router start)..."
+    if dnsgb router start 2>/dev/null; then
+        print_ok "DNS Router started successfully"
+        return 0
+    fi
+
+    print_warn "DNS Router failed to start. Running live diagnostics..."
+
+    # Check for port 53 conflict
+    local port53_occupant
+    port53_occupant=$(ss -ulnp 2>/dev/null | grep -E ':53\b' || true)
+    if [[ -n "$port53_occupant" && ! "$port53_occupant" =~ "dnsgb" ]]; then
+        print_warn "Port 53 is occupied by another process:"
+        echo -e "  ${DIM}${port53_occupant}${NC}"
+        print_info "Attempting to release port 53 and recover..."
+        
+        # Stop potential services
+        systemctl stop systemd-resolved.socket 2>/dev/null || true
+        systemctl stop systemd-resolved 2>/dev/null || true
+        systemctl stop dnsmasq 2>/dev/null || true
+        systemctl stop unbound 2>/dev/null || true
+        systemctl stop named 2>/dev/null || true
+        systemctl stop bind9 2>/dev/null || true
+        
+        # Release systemd-resolved stub listener if running
+        if [[ -f /etc/systemd/resolved.conf ]]; then
+            configure_systemd_resolved_no_stub || true
+        fi
+        
+        # Kill any stray processes listening on Port 53
+        local pid
+        pid=$(echo "$port53_occupant" | grep -oE "pid=[0-9]+" | head -1 | cut -d= -f2 || true)
+        if [[ -n "$pid" ]]; then
+            print_info "Killing conflicting process with PID ${pid} on port 53..."
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        
+        sleep 1
+    fi
+
+    # Reset any failed systemd counters
+    systemctl reset-failed dnsgb-dnsrouter 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+
+    # Retry starting router
+    print_info "Retrying DNS Router start after cleanup..."
+    if dnsgb router start 2>/dev/null; then
+        print_ok "DNS Router started successfully after cleanup (Retry 1)"
+        return 0
+    fi
+
+    # Check/Fix common capability/hardening issues on restricted VPS systems (e.g. OpenVZ, LXC, old micro kernels)
+    local override_dir="/etc/systemd/system/dnsgb-dnsrouter.service.d"
+    local override_file="${override_dir}/30-fallback-root.conf"
+    if [[ ! -f "$override_file" ]]; then
+        print_warn "Applying permission and capability fallback overrides..."
+        mkdir -p "$override_dir" 2>/dev/null || true
+        cat > "$override_file" <<EOF
+[Service]
+User=root
+Group=root
+NoNewPrivileges=no
+PrivateTmp=no
+ProtectSystem=no
+EOF
+        systemctl reset-failed dnsgb-dnsrouter 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        
+        print_info "Retrying with root/capability fallback (Retry 2)..."
+        if dnsgb router start 2>/dev/null; then
+            print_ok "DNS Router started successfully under fallback environment"
+            return 0
+        fi
+    fi
+
+    # Get status and journalctl logs to assist the user
+    print_fail "DNS Router failed to start completely. Generating Audit logs:"
+    echo ""
+    echo -e "${BOLD}=== Systemd Service Status ===${NC}"
+    systemctl status dnsgb-dnsrouter 2>/dev/null || true
+    echo ""
+    echo -e "${BOLD}=== Recent DNS Router Logs (Journalctl) ===${NC}"
+    journalctl -u dnsgb-dnsrouter.service -n 25 --no-pager --no-hostname 2>/dev/null || journalctl -u dnsgb-dnsrouter -n 25 --no-pager --no-hostname 2>/dev/null || true
+    echo ""
+    echo -e "${BOLD}=== Port 53 usage ===${NC}"
+    ss -ulnp 2>/dev/null | grep -E ':53\b' || echo "Port 53 is free"
+    echo ""
+    
+    print_info "Please check the log output above for the specific error."
+    print_info "You can view complete logs with: journalctl -u dnsgb-dnsrouter.service -f"
+    exit 1
+}
+
 # ─── --status ───────────────────────────────────────────────────────────────────
 
 do_status() {
@@ -6715,18 +6811,7 @@ step_start_services() {
 
     # ── 3. Start DNS Router (now that all healthy tunnels are running) ───────────
     if [[ "$TUNNELS_CHANGED" == "true" ]]; then
-        print_info "Starting DNS Router..."
-        if dnsgb router start 2>/dev/null; then
-            print_ok "DNS Router started"
-        else
-            print_warn "DNS Router start returned an error. Checking status..."
-            if dnsgb router status 2>/dev/null | grep -qi "running"; then
-                print_ok "DNS Router is running"
-            else
-                print_fail "DNS Router failed to start. Check: dnsgb router logs"
-                exit 1
-            fi
-        fi
+        troubleshoot_and_start_dns_router
 
         # Wait for router to bind to port 53
         local attempts=0
@@ -6749,14 +6834,7 @@ step_start_services() {
             print_ok "DNS Router already running on port 53 (no restart needed)"
         else
             print_warn "DNS Router not detected on port 53. Attempting start..."
-            dnsgb router start 2>/dev/null || true
-            sleep 2
-            if ss -ulnp 2>/dev/null | grep -E ':53\b' | grep -q "dnsgb"; then
-                print_ok "DNS Router started on port 53"
-            else
-                print_fail "DNS Router failed to start. Check: dnsgb router logs"
-                exit 1
-            fi
+            troubleshoot_and_start_dns_router
         fi
     fi
 
