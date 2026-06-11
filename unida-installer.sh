@@ -209,6 +209,7 @@ systemctl restart danted >/dev/null 2>&1 || true
 systemctl enable danted >/dev/null 2>&1 || true
 
 echo "==> Downloading and Installing High-Performance BadVPN UDPGW..."
+systemctl stop badvpn-udpgw.service badvpn-udpgw-ipv6.service 2>/dev/null || true
 rm -f /usr/local/bin/badvpn-udpgw
 if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
   wget -q -O /usr/local/bin/badvpn-udpgw https://raw.githubusercontent.com/daybreakersx/premscript/master/badvpn-udpgw64

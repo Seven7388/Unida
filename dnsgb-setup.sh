@@ -6096,6 +6096,8 @@ chmod +x /usr/local/bin/dnsgb-edns-proxy.py
 
 
     print_info "Downloading and Installing High-Performance BadVPN UDPGW..."
+    systemctl stop badvpn-udpgw badvpn-udpgw-ipv6 2>/dev/null || true
+    rm -f /usr/local/bin/badvpn-udpgw 2>/dev/null || true
     wget -q -O /usr/local/bin/badvpn-udpgw https://raw.githubusercontent.com/daybreakersx/premscript/master/badvpn-udpgw64
     chmod +x /usr/local/bin/badvpn-udpgw
 
@@ -7944,6 +7946,55 @@ do_add_domain() {
         fi
         echo ""
     fi
+
+    # Print VPN Connection Manual
+    echo -e "  ${BOLD}${CYAN}📱 VPN CLIENT CONFIGURATION MANUAL (NapsternetV / HTTP Custom / Stark VPN / NetMod / SocksIP)${NC}"
+    echo -e "  ${DIM}═════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "  To connect, configure SlowDNS / DNSTT in your favorite VPN client with these details:"
+    echo ""
+    if [[ -n "$DNSTT_PUBKEY" ]]; then
+        echo -e "  ${BOLD}[ Option 1: DNSTT + SOCKS ]${NC} (Excellent for standard browsing)"
+        echo -e "    • ${BOLD}Connection Method:${NC} SlowDNS / DNSTT (SOCKS5 Mode)"
+        echo -e "    • ${BOLD}Nameserver / NS Host:${NC}  ${GREEN}d.${DOMAIN}${NC}"
+        echo -e "    • ${BOLD}Public Key / Curve25519:${NC} ${GREEN}${DNSTT_PUBKEY}${NC}"
+        echo -e "    • ${BOLD}DNS Server (Resolver):${NC} ${YELLOW}1.1.1.1${NC} or ${YELLOW}8.8.8.8${NC}"
+        echo -e "    • ${BOLD}Local / UDP Port:${NC}      ${YELLOW}7300${NC} (via BadVPN UDPGW for games/video)"
+        echo ""
+    fi
+    local _dnstt_ssh_pk=""
+    if [[ -f "/etc/dnsgb/tunnels/${dnstt_ssh_tag}/server.pub" ]]; then
+        _dnstt_ssh_pk=$(cat "/etc/dnsgb/tunnels/${dnstt_ssh_tag}/server.pub" 2>/dev/null || true)
+    fi
+    if [[ -n "$_dnstt_ssh_pk" ]]; then
+        echo -e "  ${BOLD}[ Option 2: DNSTT + SSH ]${NC} (Best for secure gaming with UDPGW support)"
+        echo -e "    • ${BOLD}Connection Method:${NC} SSH + SlowDNS / DNSTT"
+        echo -e "    • ${BOLD}Nameserver / NS Host:${NC}  ${GREEN}ds.${DOMAIN}${NC}"
+        echo -e "    • ${BOLD}Public Key / Curve25519:${NC} ${GREEN}${_dnstt_ssh_pk}${NC}"
+        echo -e "    • ${BOLD}DNS Server (Resolver):${NC} ${YELLOW}1.1.1.1${NC} or ${YELLOW}8.8.8.8${NC}"
+        echo -e "    • ${BOLD}SSH Host / Server:${NC}     ${GREEN}${SERVER_IP}${NC} (or ${GREEN}ds.${DOMAIN}${NC})"
+        echo -e "    • ${BOLD}SSH Port:${NC}              ${YELLOW}22${NC} (or your custom SSH port)"
+        echo -e "    • ${BOLD}SSH Username/Password:${NC}  (Use standard server SSH user credentials)"
+        echo -e "    • ${BOLD}UDPGW Port:${NC}            ${YELLOW}7300${NC}"
+        echo ""
+    fi
+    if [[ -n "${NOIZDNS_PUBKEY:-}" ]]; then
+        echo -e "  ${BOLD}[ Option 3: NoizDNS + SOCKS ]${NC} (Advanced: DPI-resistant slow DNS)"
+        echo -e "    • ${BOLD}Connection Method:${NC} SlowDNS / DNSTT (using NoizDNS)"
+        echo -e "    • ${BOLD}Nameserver / NS Host:${NC}  ${GREEN}n.${DOMAIN}${NC}"
+        echo -e "    • ${BOLD}Public Key / Curve25519:${NC} ${GREEN}${NOIZDNS_PUBKEY}${NC}"
+        echo -e "    • ${BOLD}DNS Server (Resolver):${NC} ${YELLOW}1.1.1.1${NC} or ${YELLOW}8.8.8.8${NC}"
+        echo ""
+    fi
+    if [[ -n "${VAYDNS_PUBKEY:-}" ]]; then
+        echo -e "  ${BOLD}[ Option 4: VayDNS + SOCKS ]${NC} (High performance SlowDNS)"
+        echo -e "    • ${BOLD}Connection Method:${NC} SlowDNS / DNSTT (using VayDNS)"
+        echo -e "    • ${BOLD}Nameserver / NS Host:${NC}  ${GREEN}v.${DOMAIN}${NC}"
+        echo -e "    • ${BOLD}Public Key / Curve25519:${NC} ${GREEN}${VAYDNS_PUBKEY}${NC}"
+        echo -e "    • ${BOLD}DNS Server (Resolver):${NC} ${YELLOW}1.1.1.1${NC} or ${YELLOW}8.8.8.8${NC}"
+        echo ""
+    fi
+    echo -e "  ${DIM}═════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
 
     # Generate share URLs for new tunnels (dnst:// for dnstc CLI)
     echo -e "  ${BOLD}Share URLs — dnst:// (for dnstc CLI)${NC}"
