@@ -3062,6 +3062,11 @@ do_uninstall() {
         print_ok "Removed /usr/local/bin/dnsgb-setup"
     fi
 
+    if [[ -f /usr/bin/dnsgb-setup ]]; then
+        rm -f /usr/bin/dnsgb-setup
+        print_ok "Removed /usr/bin/dnsgb-setup"
+    fi
+
     # Stop microsocks
     if systemctl is-active --quiet microsocks 2>/dev/null; then
         systemctl stop microsocks 2>/dev/null || true
@@ -7468,13 +7473,19 @@ install_to_path() {
     local script_path
     script_path=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
     local target="/usr/local/bin/dnsgb-setup"
+    local fallback_target="/usr/bin/dnsgb-setup"
 
-    # Skip if already installed there
-    [[ "$script_path" == "$target" ]] && return 0
+    # Copy to both locations to ensure accessibility under all sudo secure_path profiles
+    if [[ "$script_path" != "$target" ]]; then
+        cp -f "$script_path" "$target" 2>/dev/null && chmod +x "$target" 2>/dev/null || true
+    fi
+    if [[ "$script_path" != "$fallback_target" ]]; then
+        cp -f "$script_path" "$fallback_target" 2>/dev/null && chmod +x "$fallback_target" 2>/dev/null || true
+    fi
 
-    cp -f "$script_path" "$target" 2>/dev/null || return 0
-    chmod +x "$target"
-    print_ok "Installed dnsgb-setup to PATH (run 'dnsgb-setup --manage' from anywhere)"
+    if [[ -f "$target" || -f "$fallback_target" ]]; then
+        print_ok "Installed dnsgb-setup to PATH (run 'dnsgb-setup --manage' from anywhere)"
+    fi
 }
 
 # ─── Add Domain ──────────────────────────────────────────────────────────────────
