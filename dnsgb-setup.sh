@@ -2929,6 +2929,13 @@ do_add_tunnel() {
         systemctl daemon-reload 2>/dev/null || true
     fi
 
+    # Apply EDNS Proxy override for classic DNSTT tunnels
+    if [[ "$transport" == "dnstt" && "$use_noizdns" != true && "$use_vaydns" != true ]]; then
+        create_edns_service_override "$tag" || print_warn "Could not apply EDNS proxy for ${tag}"
+        systemctl stop "dnsgb-${tag}.service" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
     # Show DNSTT pubkey if applicable
     if [[ "$transport" == "dnstt" && -f "/etc/dnsgb/tunnels/${tag}/server.pub" ]]; then
         local pubkey
@@ -6267,7 +6274,7 @@ def extract_and_patch_edns(data: bytes, new_size: int):
 def handle_request(server_sock, data, client_addr):
     upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        upstream_sock.settimeout(2.0)
+        upstream_sock.settimeout(10.0)
         upstream_data, orig_size = extract_and_patch_edns(data, INTERNAL_EDNS_SIZE)
         upstream_sock.sendto(upstream_data, (UPSTREAM_HOST, UPSTREAM_PORT))
         resp, _ = upstream_sock.recvfrom(4096)
@@ -6275,13 +6282,20 @@ def handle_request(server_sock, data, client_addr):
         final_size = max(orig_size if orig_size else 0, EXTERNAL_EDNS_SIZE)
         resp_patched, _ = extract_and_patch_edns(resp, final_size)
         server_sock.sendto(resp_patched, client_addr)
-    except Exception:
-        pass
+    except Exception as e:
+        sys.stderr.write(f"Proxy handler error: {e}\n")
+        sys.stderr.flush()
     finally:
         upstream_sock.close()
 
 def main():
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    except: pass
+    try:
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except: pass
     try:
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8388608)
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8388608)
@@ -6293,8 +6307,9 @@ def main():
             try:
                 data, client_addr = server_sock.recvfrom(4096)
                 executor.submit(handle_request, server_sock, data, client_addr)
-            except Exception:
-                pass
+            except Exception as e:
+                sys.stderr.write(f"Proxy receive error: {e}\n")
+                sys.stderr.flush()
 
 if __name__ == "__main__":
     main()
@@ -6573,6 +6588,8 @@ step_create_tunnels() {
     if dnsgb tunnel add --transport dnstt --backend ssh --domain "ds.${DOMAIN}" --tag dnstt-ssh --mtu "$DNSTT_MTU" 2>&1; then
         print_ok "Created: dnstt-ssh (DNSTT + SSH) on ds.${DOMAIN}"
         any_created=true
+        create_edns_service_override "dnstt-ssh"
+        systemctl restart dnsgb-dnstt-ssh.service 2>/dev/null || true
     else
         print_warn "Tunnel dnstt-ssh may already exist or creation failed"
         print_info "If it already exists, this is OK"
@@ -7847,6 +7864,8 @@ do_add_domain() {
     else
         print_warn "Tunnel ${dnstt_tag} may already exist or creation failed"
     fi
+    create_edns_service_override "$dnstt_tag"
+    systemctl restart dnsgb-${dnstt_tag}.service 2>/dev/null || true
     echo ""
 
     # Tunnel 3: Slipstream + SSH
@@ -7866,12 +7885,11 @@ do_add_domain() {
     echo ""
     if dnsgb tunnel add --transport dnstt --backend ssh --domain "ds.${DOMAIN}" --tag "$dnstt_ssh_tag" --mtu "$DNSTT_MTU" 2>&1; then
         print_ok "Created: ${dnstt_ssh_tag} (DNSTT + SSH) on ds.${DOMAIN}"
-
-        create_edns_service_override "$dnstt_ssh_tag"
-        systemctl restart dnsgb-${dnstt_ssh_tag}.service 2>/dev/null || true
     else
         print_warn "Tunnel ${dnstt_ssh_tag} may already exist or creation failed"
     fi
+    create_edns_service_override "$dnstt_ssh_tag"
+    systemctl restart dnsgb-${dnstt_ssh_tag}.service 2>/dev/null || true
     echo ""
 
     # Re-read DNSTT key if not captured
