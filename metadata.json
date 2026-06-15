@@ -1,6 +1,6 @@
 {
-  "name": "",
-  "description": "",
+  "name": "Unida DNSTT Repository",
+  "description": "Installer repository and configuration scripts for Unida, DNSTT, and SlipNet DNS tunnels.",
   "requestFramePermissions": [],
-  "majorCapabilities": []
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

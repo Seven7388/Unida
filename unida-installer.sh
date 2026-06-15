@@ -355,7 +355,7 @@ fi
 echo "==> Kuunda EDNS proxy (512 <-> 1800)..."
 cat >/usr/local/bin/dnstt-edns-proxy.py <<EOF_PY
 #!/usr/bin/env python3
-import socket, struct, concurrent.futures
+import socket, struct, concurrent.futures, sys
 
 LISTEN_HOST="0.0.0.0"
 LISTEN_PORT=${PROXY_PORT}
@@ -419,7 +419,7 @@ def extract_and_patch_edns(data: bytes, new_size: int):
 
 def handle_request(server_sock, data, client_addr):
     upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    upstream_sock.settimeout(2.0)
+    upstream_sock.settimeout(10.0)
     try:
         upstream_data, orig_size = extract_and_patch_edns(data, INTERNAL_EDNS_SIZE)
         upstream_sock.sendto(upstream_data, (UPSTREAM_HOST, UPSTREAM_PORT))
@@ -430,17 +430,25 @@ def handle_request(server_sock, data, client_addr):
         
         resp_patched, _ = extract_and_patch_edns(resp, final_size)
         server_sock.sendto(resp_patched, client_addr)
-    except Exception:
-        pass
+    except Exception as e:
+        sys.stderr.write(f"Proxy handler error: {e}\\n")
+        sys.stderr.flush()
     finally:
         upstream_sock.close()
 
 def main():
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    except: pass
+    try:
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except: pass
+    try:
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8388608)
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8388608)
     except: pass
+    
     server_sock.bind((LISTEN_HOST, LISTEN_PORT))
     print(f"[Unida EDNS proxy] Listening on {LISTEN_HOST}:{LISTEN_PORT}, upstream {UPSTREAM_HOST}:{UPSTREAM_PORT}")
     
@@ -449,8 +457,9 @@ def main():
             try:
                 data, client_addr = server_sock.recvfrom(4096)
                 executor.submit(handle_request, server_sock, data, client_addr)
-            except Exception:
-                pass
+            except Exception as e:
+                sys.stderr.write(f"Proxy receive error: {e}\\n")
+                sys.stderr.flush()
 
 if __name__ == "__main__":
     main()

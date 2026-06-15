@@ -232,21 +232,22 @@ EOF
 echo "==> Kuunda EDNS proxy (512 <-> 1800)..."
 cat >/usr/local/bin/dnstt-edns-proxy.py <<EOF_PY
 #!/usr/bin/env python3
-import socket, threading, struct
+import socket, struct, concurrent.futures, sys
 
 LISTEN_HOST="0.0.0.0"
 LISTEN_PORT=${PROXY_PORT}
 UPSTREAM_HOST="127.0.0.1"
 UPSTREAM_PORT=${DNSTT_PORT}
-EXTERNAL_EDNS_SIZE=512
+EXTERNAL_EDNS_SIZE=1800
 INTERNAL_EDNS_SIZE=${MTU}
 
-def patch_edns_udp_size(data: bytes, new_size: int) -> bytes:
-    if len(data) < 12: return data
+def extract_and_patch_edns(data: bytes, new_size: int):
+    """Returns (patched_data, original_edns_size_from_client)."""
+    if len(data) < 12: return data, None
     try:
         qdcount, ancount, nscount, arcount = struct.unpack("!HHHH", data[4:12])
     except struct.error:
-        return data
+        return data, None
 
     offset = 12
 
@@ -264,7 +265,7 @@ def patch_edns_udp_size(data: bytes, new_size: int) -> bytes:
 
     for _ in range(qdcount):
         offset = skip_name(data, offset)
-        if offset + 4 > len(data): return data
+        if offset + 4 > len(data): return data, None
         offset += 4
 
     def skip_rrs(count, buf, off):
@@ -283,36 +284,59 @@ def patch_edns_udp_size(data: bytes, new_size: int) -> bytes:
     new_data = bytearray(data)
     for _ in range(arcount):
         offset = skip_name(data, offset)
-        if offset + 10 > len(data): return data
+        if offset + 10 > len(data): return data, None
         rtype = struct.unpack("!H", data[offset:offset+2])[0]
         if rtype == 41:
+            orig_size = struct.unpack("!H", data[offset+2:offset+4])[0]
             new_data[offset+2:offset+4] = struct.pack("!H", new_size)
-            return bytes(new_data)
+            return bytes(new_data), orig_size
         rdlen = struct.unpack("!H", data[offset+8:offset+10])[0]
         offset += 10 + rdlen
-    return data
+    return data, None
 
 def handle_request(server_sock, data, client_addr):
     upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    upstream_sock.settimeout(5.0)
+    upstream_sock.settimeout(10.0)
     try:
-        upstream_data = patch_edns_udp_size(data, INTERNAL_EDNS_SIZE)
+        upstream_data, orig_size = extract_and_patch_edns(data, INTERNAL_EDNS_SIZE)
         upstream_sock.sendto(upstream_data, (UPSTREAM_HOST, UPSTREAM_PORT))
         resp, _ = upstream_sock.recvfrom(4096)
-        resp_patched = patch_edns_udp_size(resp, EXTERNAL_EDNS_SIZE)
+        
+        # Optimize by providing the maximum supported EDNS size (at least 1800).
+        final_size = max(orig_size if orig_size else 0, EXTERNAL_EDNS_SIZE)
+        
+        resp_patched, _ = extract_and_patch_edns(resp, final_size)
         server_sock.sendto(resp_patched, client_addr)
-    except Exception:
-        pass
+    except Exception as e:
+        sys.stderr.write(f"Proxy handler error: {e}\\n")
+        sys.stderr.flush()
     finally:
         upstream_sock.close()
 
 def main():
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    except: pass
+    try:
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except: pass
+    try:
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8388608)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8388608)
+    except: pass
+    
     server_sock.bind((LISTEN_HOST, LISTEN_PORT))
     print(f"[Unida EDNS proxy] Listening on {LISTEN_HOST}:{LISTEN_PORT}, upstream {UPSTREAM_HOST}:{UPSTREAM_PORT}")
-    while True:
-        data, client_addr = server_sock.recvfrom(4096)
-        threading.Thread(target=handle_request, args=(server_sock, data, client_addr), daemon=True).start()
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2048) as executor:
+        while True:
+            try:
+                data, client_addr = server_sock.recvfrom(4096)
+                executor.submit(handle_request, server_sock, data, client_addr)
+            except Exception as e:
+                sys.stderr.write(f"Proxy receive error: {e}\\n")
+                sys.stderr.flush()
 
 if __name__ == "__main__":
     main()
