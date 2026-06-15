@@ -1625,14 +1625,36 @@ fi
 
 # Enable required SSH forwarding features
 cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak 2>/dev/null || true
+
+# 1. Clean up lingering dnsgb and sshtun-user blocks from sshd_config that cause lockouts and connection drops
+sed -i '/### SSHTUN-USER START ###/,/### SSHTUN-USER END ###/d' /etc/ssh/sshd_config
+sed -i '/### SSHTUN-USER/d' /etc/ssh/sshd_config
+sed -i '/sshtun/d' /etc/ssh/sshd_config
+sed -i '/dnsgb/d' /etc/ssh/sshd_config
+
+# 2. Register /bin/false and /usr/sbin/nologin as valid shells to prevent pam_shells.so rejections
+if [ -f /etc/shells ]; then
+  for sh in /bin/false /usr/sbin/nologin /sbin/nologin; do
+    if ! grep -q "^$sh" /etc/shells; then
+      echo "$sh" >> /etc/shells
+    fi
+  done
+fi
+
+# 3. Apply standard robust SSH configurations
+sed -i 's/^#ListenAddress.*/ListenAddress 0.0.0.0/g' /etc/ssh/sshd_config
+if ! grep -q "^ListenAddress" /etc/ssh/sshd_config; then echo "ListenAddress 0.0.0.0" >> /etc/ssh/sshd_config; fi
+
 sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
 sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
 if ! grep -q "^PasswordAuthentication yes" /etc/ssh/sshd_config; then echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config; fi
+
 sed -i 's/^#AllowTcpForwarding.*/AllowTcpForwarding yes/g' /etc/ssh/sshd_config
 sed -i 's/^#GatewayPorts.*/GatewayPorts yes/g' /etc/ssh/sshd_config
 if ! grep -q "^AllowTcpForwarding yes" /etc/ssh/sshd_config; then echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config; fi
 if ! grep -q "^GatewayPorts yes" /etc/ssh/sshd_config; then echo "GatewayPorts yes" >> /etc/ssh/sshd_config; fi
 if ! grep -q "^TCPKeepAlive yes" /etc/ssh/sshd_config; then echo "TCPKeepAlive yes" >> /etc/ssh/sshd_config; fi
+
 sed -i 's/^#ClientAliveInterval.*/ClientAliveInterval 300/g' /etc/ssh/sshd_config
 if ! grep -q "^ClientAliveInterval" /etc/ssh/sshd_config; then echo "ClientAliveInterval 300" >> /etc/ssh/sshd_config; else sed -i 's/^ClientAliveInterval.*/ClientAliveInterval 300/g' /etc/ssh/sshd_config; fi
 sed -i 's/^#ClientAliveCountMax.*/ClientAliveCountMax 5/g' /etc/ssh/sshd_config
