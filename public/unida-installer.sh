@@ -162,15 +162,15 @@ if [ -f /etc/systemd/resolved.conf ]; then
   sed -i 's/^DNSStubListener=yes/DNSStubListener=no/' /etc/systemd/resolved.conf
 
   if grep -q '^#DNS=' /etc/systemd/resolved.conf || grep -q '^DNS=' /etc/systemd/resolved.conf; then
-    sed -i 's/^#DNS=.*/DNS=8.8.8.8 1.1.1.1/' /etc/systemd/resolved.conf
-    sed -i 's/^DNS=.*/DNS=8.8.8.8 1.1.1.1/' /etc/systemd/resolved.conf
+    sed -i 's/^#DNS=.*/DNS=9.9.9.9 149.112.112.112/' /etc/systemd/resolved.conf
+    sed -i 's/^DNS=.*/DNS=9.9.9.9 149.112.112.112/' /etc/systemd/resolved.conf
   else
-    echo "DNS=8.8.8.8 1.1.1.1" >> /etc/systemd/resolved.conf
+    echo "DNS=9.9.9.9 149.112.112.112" >> /etc/systemd/resolved.conf
   fi
 
   systemctl restart systemd-resolved >/dev/null 2>&1 || true
   rm -f /etc/resolv.conf
-  ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null || echo "nameserver 8.8.8.8" > /etc/resolv.conf
+  ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null || echo "nameserver 9.9.9.9" > /etc/resolv.conf
 fi
 
 echo "==> Installing packages..."
@@ -1667,6 +1667,29 @@ if ! grep -q "^KexAlgorithms" /etc/ssh/sshd_config; then echo "KexAlgorithms +di
 if ! grep -q "^Ciphers" /etc/ssh/sshd_config; then echo "Ciphers +aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc" >> /etc/ssh/sshd_config; fi
 if ! grep -q "^HostKeyAlgorithms" /etc/ssh/sshd_config; then echo "HostKeyAlgorithms +ssh-rsa,ssh-dss" >> /etc/ssh/sshd_config; fi
 if ! grep -q "^PubkeyAcceptedKeyTypes" /etc/ssh/sshd_config; then echo "PubkeyAcceptedKeyTypes +ssh-rsa,ssh-dss" >> /etc/ssh/sshd_config; fi
+
+# 4. Enforce overrides in sshd_config.d drop-ins to prevent Cloud-Init/OS locking out passwords and forwarding
+if [ -d /etc/ssh/sshd_config.d ]; then
+  find /etc/ssh/sshd_config.d/ -type f -name "*.conf" -exec sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/g' {} + 2>/dev/null || true
+  find /etc/ssh/sshd_config.d/ -type f -name "*.conf" -exec sed -i 's/^KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/g' {} + 2>/dev/null || true
+  cat > /etc/ssh/sshd_config.d/99-unida.conf << 'EOF'
+PasswordAuthentication yes
+PubkeyAuthentication yes
+AllowTcpForwarding yes
+GatewayPorts yes
+TCPKeepAlive yes
+ClientAliveInterval 300
+ClientAliveCountMax 5
+UseDNS no
+MaxSessions 10000
+MaxStartups 1000:30:10000
+KexAlgorithms +diffie-hellman-group1-sha1,diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1,diffie-hellman-group-exchange-sha256
+Ciphers +aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc
+HostKeyAlgorithms +ssh-rsa,ssh-dss
+PubkeyAcceptedKeyTypes +ssh-rsa,ssh-dss
+EOF
+  chmod 644 /etc/ssh/sshd_config.d/99-unida.conf 2>/dev/null || true
+fi
 
 cat > /etc/issue.net << 'EOF_BANNER'
 <br>
