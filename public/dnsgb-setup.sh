@@ -1962,7 +1962,7 @@ generate_slipnet_url() {
     local socks_pass="${7:-}"
     local name="${subdomain}.${DOMAIN}"
     local ns_domain="${subdomain}.${DOMAIN}"
-    local resolver="8.8.8.8:53:0"
+    local resolver="9.9.9.9:53:0,1.1.1.1:53:0"
     local ssh_enabled="0" ssh_port="22" ssh_host="127.0.0.1"
     local auth_mode="0"
 
@@ -6482,9 +6482,6 @@ step_verify_port53() {
             iptables -P FORWARD ACCEPT 2>/dev/null || true
             iptables -I FORWARD 1 -o "$eth_if" -j ACCEPT 2>/dev/null || true
             iptables -I FORWARD 1 -i "$eth_if" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-            
-            iptables -A OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
-            iptables -I FORWARD 1 -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
         fi
 
         # Save the rules to be persistent across restarts on Debian/Ubuntu

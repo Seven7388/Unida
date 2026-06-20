@@ -1612,11 +1612,6 @@ if [ -n "$ETH" ]; then
   iptables -I INPUT -p tcp --dport 1080 -j ACCEPT
   iptables -I INPUT -p tcp --dport 7300 -j ACCEPT
   
-  # Block outgoing QUIC (UDP 443) to force Instagram/YouTube to use TCP
-  # This makes DNSTT much faster by avoiding UDP fragmentation.
-  iptables -A OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
-  iptables -I FORWARD -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
-
   iptables-save > /etc/iptables.up.rules
 
   # Ensure it restores on boot
