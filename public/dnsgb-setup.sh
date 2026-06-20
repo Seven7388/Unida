@@ -1962,7 +1962,7 @@ generate_slipnet_url() {
     local socks_pass="${7:-}"
     local name="${subdomain}.${DOMAIN}"
     local ns_domain="${subdomain}.${DOMAIN}"
-    local resolver="9.9.9.9:53:0,1.1.1.1:53:0"
+    local resolver="8.8.8.8:53:0"
     local ssh_enabled="0" ssh_port="22" ssh_host="127.0.0.1"
     local auth_mode="0"
 
