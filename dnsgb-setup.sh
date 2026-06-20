@@ -30,8 +30,8 @@ _dnsgb_cleanup_dns() {
         chattr -i /etc/resolv.conf 2>/dev/null || true
         rm -f /etc/resolv.conf 2>/dev/null || true
         cat > /etc/resolv.conf 2>/dev/null <<'DNSEOF' || true
-nameserver 208.67.222.222
-nameserver 208.67.220.220
+nameserver 9.9.9.9
+nameserver 1.1.1.1
 DNSEOF
     fi
 }
@@ -1962,7 +1962,7 @@ generate_slipnet_url() {
     local socks_pass="${7:-}"
     local name="${subdomain}.${DOMAIN}"
     local ns_domain="${subdomain}.${DOMAIN}"
-    local resolver="208.67.222.222:53:0"
+    local resolver="9.9.9.9:53:0"
     local ssh_enabled="0" ssh_port="22" ssh_host="127.0.0.1"
     local auth_mode="0"
 
@@ -2135,12 +2135,12 @@ ensure_resolv_conf_fallback() {
         chattr -i /etc/resolv.conf 2>/dev/null || true
         rm -f /etc/resolv.conf 2>/dev/null || true
         cat > /etc/resolv.conf <<'RESOLVEOF'
-nameserver 208.67.222.222
-nameserver 208.67.220.220
+nameserver 9.9.9.9
+nameserver 1.1.1.1
 RESOLVEOF
         # Verify the write succeeded
-        if ! grep -q '208\.67\.222\.222' /etc/resolv.conf 2>/dev/null; then
-            echo "nameserver 208.67.222.222" > /etc/resolv.conf 2>/dev/null || true
+        if ! grep -q '9\.9\.9\.9' /etc/resolv.conf 2>/dev/null; then
+            echo "nameserver 9.9.9.9" > /etc/resolv.conf 2>/dev/null || true
         fi
         # Lock so systemd-resolved or package manager can't overwrite
         chattr +i /etc/resolv.conf 2>/dev/null || true
@@ -2163,7 +2163,7 @@ configure_systemd_resolved_no_stub() {
     cat > /etc/systemd/resolved.conf.d/10-dnsgb-no-stub.conf <<'EOF'
 [Resolve]
 DNSStubListener=no
-DNS=208.67.222.222 208.67.220.220
+DNS=9.9.9.9 1.1.1.1
 EOF
 
     # Unlock resolv.conf, write direct nameservers (NOT a symlink to resolved),
@@ -2171,8 +2171,8 @@ EOF
     chattr -i /etc/resolv.conf 2>/dev/null || true
     rm -f /etc/resolv.conf 2>/dev/null || true
     cat > /etc/resolv.conf <<'DNSEOF'
-nameserver 208.67.222.222
-nameserver 208.67.220.220
+nameserver 9.9.9.9
+nameserver 1.1.1.1
 DNSEOF
     chattr +i /etc/resolv.conf 2>/dev/null || true
 
@@ -3261,8 +3261,8 @@ do_uninstall() {
         print_warn "DNS not working after restore — writing fallback nameservers"
         chattr -i /etc/resolv.conf 2>/dev/null || true
         cat > /etc/resolv.conf <<'DNSEOF'
-nameserver 208.67.222.222
-nameserver 208.67.220.220
+nameserver 9.9.9.9
+nameserver 1.1.1.1
 DNSEOF
     fi
     print_ok "Restored systemd-resolved defaults (best effort)"
@@ -5653,8 +5653,8 @@ step_preflight() {
             print_warn "DNS broken (stub listener dead) — fixing resolv.conf"
             chattr -i /etc/resolv.conf 2>/dev/null || true
             cat > /etc/resolv.conf <<'DNSEOF'
-nameserver 208.67.222.222
-nameserver 208.67.220.220
+nameserver 9.9.9.9
+nameserver 1.1.1.1
 DNSEOF
         fi
     fi
