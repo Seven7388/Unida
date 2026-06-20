@@ -149,15 +149,20 @@ if [ -f /etc/systemd/resolved.conf ]; then
   sed -i 's/^DNSStubListener=yes/DNSStubListener=no/' /etc/systemd/resolved.conf
 
   if grep -q '^#DNS=' /etc/systemd/resolved.conf || grep -q '^DNS=' /etc/systemd/resolved.conf; then
-    sed -i 's/^#DNS=.*/DNS=9.9.9.9 149.112.112.112/' /etc/systemd/resolved.conf
-    sed -i 's/^DNS=.*/DNS=9.9.9.9 149.112.112.112/' /etc/systemd/resolved.conf
+    sed -i 's/^#DNS=.*/DNS=9.9.9.9 1.1.1.1/' /etc/systemd/resolved.conf
+    sed -i 's/^DNS=.*/DNS=9.9.9.9 1.1.1.1/' /etc/systemd/resolved.conf
   else
-    echo "DNS=9.9.9.9 149.112.112.112" >> /etc/systemd/resolved.conf
+    echo "DNS=9.9.9.9 1.1.1.1" >> /etc/systemd/resolved.conf
   fi
 
   systemctl restart systemd-resolved >/dev/null 2>&1 || true
+  chattr -i /etc/resolv.conf 2>/dev/null || true
   rm -f /etc/resolv.conf
-  ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null || echo "nameserver 9.9.9.9" > /etc/resolv.conf
+  ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null || {
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    echo "nameserver 9.9.9.9" > /etc/resolv.conf
+    echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+  }
 fi
 
 echo "==> Installing packages..."
