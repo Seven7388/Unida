@@ -225,7 +225,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/dnstt-server -udp 127.0.0.1:${DNSTT_PORT} -tcp :53 -mtu ${MTU} -privkey-file /etc/dnstt/server.key ${TDOMAIN} 127.0.0.1:22
+ExecStart=/usr/local/bin/dnstt-server -udp 127.0.0.1:${DNSTT_PORT} -mtu ${MTU} -privkey-file /etc/dnstt/server.key ${TDOMAIN} 127.0.0.1:22
 Restart=always
 RestartSec=3
 
@@ -479,7 +479,7 @@ show_key() {
 change_mtu() {
     header
     echo "--- Change MTU Size ---"
-    current_mtu=$(grep -o '-mtu [0-9]*' /etc/systemd/system/dnstt-unida.service | awk '{print $2}')
+    current_mtu=$(grep -o '\-mtu [0-9]*' /etc/systemd/system/dnstt-unida.service | awk '{print $2}')
     echo "Current MTU: ${current_mtu:-Unknown}"
     read -rp "Enter new MTU size (e.g., 1800, 1200): " NEW_MTU
     if [ -z "$NEW_MTU" ] || ! [[ "$NEW_MTU" =~ ^[0-9]+$ ]]; then
@@ -685,7 +685,7 @@ echo "==============================================="
 echo "Server IP        : ${IPV4}"
 echo "Tunnel Domain    : ${TDOMAIN}"
 echo "MTU              : ${MTU}"
-echo "dnstt-server     : UDP 127.0.0.1:${DNSTT_PORT}, TCP :53"
+echo "dnstt-server     : 127.0.0.1:${DNSTT_PORT}"
 echo "proxy public     : UDP :${PROXY_PORT}"
 echo "badvpn-udpgw     : 127.0.0.1:7300"
 echo ""
