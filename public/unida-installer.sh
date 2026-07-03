@@ -61,9 +61,8 @@ if [ -z "$TDOMAIN" ]; then
       # Disable pipefail temporarily because `head -c 4` and `grep | head` can trigger SIGPIPE and kill the script under `set -e`
       set +euo pipefail
       
-      RANDOM_STR=$(tr -dc a-z0-9 </dev/urandom | head -c 4)
-      NS_PREFIX="ns-${RANDOM_STR}"
-      TUN_PREFIX="tun-${RANDOM_STR}"
+      NS_PREFIX=$(tr -dc a-m </dev/urandom | head -c 1 2>/dev/null || echo "n")
+      TUN_PREFIX=$(tr -dc n-z </dev/urandom | head -c 1 2>/dev/null || echo "t")
       
       echo "[*] Automatically generated Name Server prefix: ${NS_PREFIX}"
       echo "[*] Automatically generated Tunnel prefix: ${TUN_PREFIX}"
