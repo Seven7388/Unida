@@ -629,7 +629,6 @@ iptables -I FORWARD -j ACCEPT 2>/dev/null || true
 iptables-restore < /etc/iptables.up.rules
 EOF
   chmod +x /etc/network/if-pre-up.d/iptables
-fi
 
 # Enable required SSH forwarding features
 cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak 2>/dev/null || true
