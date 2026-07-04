@@ -166,7 +166,7 @@ fi
 
 echo "==> Installing packages..."
 apt-get update -y >/dev/null 2>&1
-DEBIAN_FRONTEND=noninteractive apt-get install -y curl python3 wget git cmake make gcc g++ build-essential >/dev/null 2>&1 || true
+DEBIAN_FRONTEND=noninteractive apt-get install -y curl python3 wget git cmake make gcc g++ build-essential openssh-server iptables net-tools lsof cron >/dev/null 2>&1 || true
 
 echo "==> Kupakua and Compiling BadVPN UDPGW (UDP via TCP)..."
 if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
@@ -592,6 +592,7 @@ if [ -n "$ETH" ]; then
   iptables -A OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
   iptables -I FORWARD -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
 
+iptables -I FORWARD -j ACCEPT 2>/dev/null || true
   iptables-save > /etc/iptables.up.rules
 
   # Ensure it restores on boot
@@ -629,8 +630,10 @@ sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd
 sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
 if ! grep -q "^PasswordAuthentication yes" /etc/ssh/sshd_config; then echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config; fi
 
+sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
 sed -i 's/^#AllowTcpForwarding.*/AllowTcpForwarding yes/g' /etc/ssh/sshd_config
 sed -i 's/^#GatewayPorts.*/GatewayPorts yes/g' /etc/ssh/sshd_config
+if ! grep -q "^PermitRootLogin yes" /etc/ssh/sshd_config; then echo "PermitRootLogin yes" >> /etc/ssh/sshd_config; fi
 if ! grep -q "^AllowTcpForwarding yes" /etc/ssh/sshd_config; then echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config; fi
 if ! grep -q "^GatewayPorts yes" /etc/ssh/sshd_config; then echo "GatewayPorts yes" >> /etc/ssh/sshd_config; fi
 if ! grep -q "^TCPKeepAlive yes" /etc/ssh/sshd_config; then echo "TCPKeepAlive yes" >> /etc/ssh/sshd_config; fi
@@ -640,6 +643,7 @@ if [ -d /etc/ssh/sshd_config.d ]; then
   find /etc/ssh/sshd_config.d/ -type f -name "*.conf" -exec sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/g' {} + 2>/dev/null || true
   find /etc/ssh/sshd_config.d/ -type f -name "*.conf" -exec sed -i 's/^KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/g' {} + 2>/dev/null || true
   cat > /etc/ssh/sshd_config.d/99-unida.conf << 'EOF'
+PermitRootLogin yes
 PasswordAuthentication yes
 PubkeyAuthentication yes
 AllowTcpForwarding yes
@@ -681,6 +685,7 @@ iptables -I INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
 iptables -I INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
 iptables -I INPUT -p udp --dport ${PROXY_PORT} -j ACCEPT 2>/dev/null || true
 iptables -I INPUT -p tcp --dport 7300 -j ACCEPT 2>/dev/null || true
+iptables -I FORWARD -j ACCEPT 2>/dev/null || true
 iptables-save > /etc/iptables.up.rules 2>/dev/null || true
 
 # Firewalld support (CentOS/AlmaLinux/Oracle)
