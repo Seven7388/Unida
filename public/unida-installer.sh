@@ -676,6 +676,22 @@ if command -v ufw >/dev/null 2>&1; then
   ufw reload >/dev/null 2>&1 || true
 fi
 
+# General IPTables rules for Oracle Cloud / strict firewalls
+iptables -I INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p udp --dport ${PROXY_PORT} -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p tcp --dport 7300 -j ACCEPT 2>/dev/null || true
+iptables-save > /etc/iptables.up.rules 2>/dev/null || true
+
+# Firewalld support (CentOS/AlmaLinux/Oracle)
+if command -v firewall-cmd >/dev/null 2>&1; then
+  firewall-cmd --add-port=53/udp --permanent 2>/dev/null || true
+  firewall-cmd --add-port=53/tcp --permanent 2>/dev/null || true
+  firewall-cmd --add-port=${PROXY_PORT}/udp --permanent 2>/dev/null || true
+  firewall-cmd --add-port=7300/tcp --permanent 2>/dev/null || true
+  firewall-cmd --reload 2>/dev/null || true
+fi
+
 IPV4=$(curl -s4 icanhazip.com || hostname -I | awk '{print $1}')
 
 echo ""
