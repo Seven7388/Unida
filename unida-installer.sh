@@ -243,7 +243,7 @@ LISTEN_PORT=${PROXY_PORT}
 UPSTREAM_HOST="127.0.0.1"
 UPSTREAM_PORT=${DNSTT_PORT}
 EXTERNAL_EDNS_SIZE=1232
-INTERNAL_EDNS_SIZE=${MTU}
+INTERNAL_EDNS_SIZE=1800
 
 def extract_and_patch_edns(data: bytes, new_size: int):
     """Returns (patched_data, original_edns_size_from_client)."""
@@ -498,6 +498,21 @@ change_mtu() {
     pause
 }
 
+update_script() {
+    header
+    echo "--- Update Unida Script ---"
+    echo "Downloading latest version..."
+    wget -qO /tmp/unida-installer.sh https://raw.githubusercontent.com/Seven7388/Unida/main/public/unida-installer.sh
+    if [ -s /tmp/unida-installer.sh ]; then
+        mv /tmp/unida-installer.sh /usr/local/bin/unida
+        chmod +x /usr/local/bin/unida
+        echo "[+] Script updated successfully!"
+    else
+        echo "[-] Failed to download update."
+    fi
+    pause
+}
+
 uninstall_unida() {
     header
     echo "--- Uninstall Unida Server ---"
@@ -539,10 +554,11 @@ main_menu() {
         echo "  6) Restart DNSTT Services"
         echo "  7) Show Server Public Key"
         echo "  8) Change MTU Size"
-        echo "  9) Uninstall Unida Server"
+        echo "  9) Update Unida Script"
+        echo "  10) Uninstall Unida Server"
         echo "  0) Exit"
         echo "==============================================="
-        read -rp "Select an option [0-9]: " choice
+        read -rp "Select an option [0-10]: " choice
         case $choice in
             1) create_user ;;
             2) delete_user ;;
@@ -552,7 +568,8 @@ main_menu() {
             6) restart_services ;;
             7) show_key ;;
             8) change_mtu ;;
-            9) uninstall_unida ;;
+            9) update_script ;;
+            10) uninstall_unida ;;
             0) exit 0 ;;
             *) echo "Invalid option"; sleep 1 ;;
         esac
@@ -581,11 +598,21 @@ sysctl -p >/dev/null 2>&1
 
 # Setup IPTables Masquerade for internet access through the VPN/SSH Tunnel
 ETH=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
+if [ -z "$ETH" ]; then
+    ETH=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+fi
+
 if [ -n "$ETH" ]; then
   iptables -t nat -A POSTROUTING -o "$ETH" -j MASQUERADE
   if [ "${PROXY_PORT}" != "53" ]; then
     iptables -t nat -A PREROUTING -i "$ETH" -p udp --dport 53 -j REDIRECT --to-ports "${PROXY_PORT}"
   fi
+else
+  iptables -t nat -A POSTROUTING -j MASQUERADE
+  if [ "${PROXY_PORT}" != "53" ]; then
+    iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports "${PROXY_PORT}"
+  fi
+fi
 
   # Block outgoing QUIC (UDP 443) to force Instagram/YouTube to use TCP
   # This makes DNSTT much faster by avoiding UDP fragmentation.
@@ -662,7 +689,8 @@ EOF
   chmod 644 /etc/ssh/sshd_config.d/99-unida.conf 2>/dev/null || true
 fi
 
-systemctl restart sshd || systemctl restart ssh || true
+systemctl restart ssh.socket 2>/dev/null || true
+systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
 
 echo "==> Starting services..."
 systemctl daemon-reload
