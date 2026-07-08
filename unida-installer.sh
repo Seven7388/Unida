@@ -502,11 +502,18 @@ update_script() {
     header
     echo "--- Update Unida Script ---"
     echo "Downloading latest version..."
-    wget -qO /tmp/unida-installer.sh https://raw.githubusercontent.com/Seven7388/Unida/main/public/unida-installer.sh
+    wget -qO /tmp/unida-installer.sh "https://raw.githubusercontent.com/Seven7388/Unida/main/public/unida-installer.sh?t=$(date +%s)"
     if [ -s /tmp/unida-installer.sh ]; then
         mv /tmp/unida-installer.sh /usr/local/bin/unida
         chmod +x /usr/local/bin/unida
         echo "[+] Script updated successfully!"
+        echo ""
+        echo "=== CHANGELOG ==="
+        echo "- Fixed Instagram/YouTube slow loading (added TCPMSS clamping)"
+        echo "- Optimized MTU configurations (Internal EDNS to 1800)"
+        echo "- Fixed SSH PermitRootLogin missing issue"
+        echo "- Improved masquerade logic for better internet routing"
+        echo "================="
     else
         echo "[-] Failed to download update."
     fi
@@ -620,6 +627,7 @@ fi
   iptables -I FORWARD -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
 
 iptables -I FORWARD -j ACCEPT 2>/dev/null || true
+  iptables -I FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
   iptables-save > /etc/iptables.up.rules
 
   # Ensure it restores on boot
@@ -713,6 +721,7 @@ iptables -I INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
 iptables -I INPUT -p udp --dport ${PROXY_PORT} -j ACCEPT 2>/dev/null || true
 iptables -I INPUT -p tcp --dport 7300 -j ACCEPT 2>/dev/null || true
 iptables -I FORWARD -j ACCEPT 2>/dev/null || true
+iptables -I FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 iptables-save > /etc/iptables.up.rules 2>/dev/null || true
 
 # Firewalld support (CentOS/AlmaLinux/Oracle)
