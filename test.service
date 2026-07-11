@@ -1,0 +1,1 @@
+ExecStart=/usr/local/bin/dnstt-server -udp 127.0.0.1:5300 -mtu 1800 -privkey-file /etc/dnstt/server.key example.com 127.0.0.1:22

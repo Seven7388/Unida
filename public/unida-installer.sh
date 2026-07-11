@@ -504,18 +504,23 @@ update_script() {
     echo "Downloading latest version..."
     wget -qO /tmp/unida-installer.sh "https://raw.githubusercontent.com/Seven7388/Unida/main/public/unida-installer.sh?t=$(date +%s)"
     if [ -s /tmp/unida-installer.sh ]; then
-        sed -n '/^cat >\/usr\/local\/bin\/unida <<'"'EOF_MANAGER'"'/,/^EOF_MANAGER/p' /tmp/unida-installer.sh | sed '1d;$d' > /usr/local/bin/unida
-        chmod +x /usr/local/bin/unida
+        sed -n '/^cat >\/usr\/local\/bin\/unida <<'"'EOF_MANAGER'"'/,/^EOF_MANAGER/p' /tmp/unida-installer.sh | sed '1d;$d' > /tmp/unida_new
+        chmod +x /tmp/unida_new
+        mv /tmp/unida_new /usr/local/bin/unida
         echo "[+] Script updated successfully!"
         echo ""
         echo "=== CHANGELOG ==="
         echo "Fetching latest changes..."
         curl -s "https://api.github.com/repos/Seven7388/Unida/commits?per_page=3" | grep '"message":' | cut -d '"' -f 4 | sed 's/\\n.*//' | sed 's/^/- /'
         echo "================="
+        echo ""
+        echo "[!] Restarting CLI to apply updates..."
+        sleep 2
+        exec unida
     else
         echo "[-] Failed to download update."
+        pause
     fi
-    pause
 }
 
 switch_tunnel_mode() {
