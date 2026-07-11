@@ -510,7 +510,7 @@ update_script() {
         echo ""
         echo "=== CHANGELOG ==="
         echo "Fetching latest changes..."
-        curl -s "https://api.github.com/repos/Seven7388/Unida/commits/main" | grep -m 1 "\"message\":" | cut -d "\"" -f 4
+        curl -s "https://api.github.com/repos/Seven7388/Unida/commits?per_page=3" | grep '"message":' | cut -d '"' -f 4 | sed 's/\\n.*//' | sed 's/^/- /'
         echo "================="
     else
         echo "[-] Failed to download update."
