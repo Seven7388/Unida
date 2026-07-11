@@ -509,10 +509,8 @@ update_script() {
         echo "[+] Script updated successfully!"
         echo ""
         echo "=== CHANGELOG ==="
-        echo "- Fixed Instagram/YouTube slow loading (added TCPMSS clamping)"
-        echo "- Optimized MTU configurations (Internal EDNS to 1800)"
-        echo "- Fixed SSH PermitRootLogin missing issue"
-        echo "- Improved masquerade logic for better internet routing"
+        echo "Fetching latest changes..."
+        curl -s "https://api.github.com/repos/Seven7388/Unida/commits/main" | grep -m 1 "\"message\":" | cut -d "\"" -f 4
         echo "================="
     else
         echo "[-] Failed to download update."
