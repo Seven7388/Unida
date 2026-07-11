@@ -538,7 +538,7 @@ switch_tunnel_mode() {
 
     case $mode_choice in
         1)
-            sed -i "s/127.0.0.1:[0-9]\+/127.0.0.1:22/g" /etc/systemd/system/dnstt-unida.service
+            sed -i 's/ 127\.0\.0\.1:[0-9]* *$/ 127.0.0.1:22/' /etc/systemd/system/dnstt-unida.service
             systemctl daemon-reload
             systemctl restart dnstt-unida.service 2>/dev/null || true
             echo "[+] Switched to SSH Mode."
@@ -554,14 +554,14 @@ user.privileged: root
 user.unprivileged: nobody
 internal: 127.0.0.1 port = 1080
 external: $ETH
-socksmethod: username
+socksmethod: none
 clientmethod: none
 client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
 socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp udp }
 EOF_DANTE
             systemctl restart danted 2>/dev/null || true
             systemctl enable danted 2>/dev/null || true
-            sed -i "s/127.0.0.1:[0-9]\+/127.0.0.1:1080/g" /etc/systemd/system/dnstt-unida.service
+            sed -i 's/ 127\.0\.0\.1:[0-9]* *$/ 127.0.0.1:1080/' /etc/systemd/system/dnstt-unida.service
             systemctl daemon-reload
             systemctl restart dnstt-unida.service 2>/dev/null || true
             echo "[+] Switched to SOCKS5 Mode. (Your SSH users/passwords will work for SOCKS5!)"
