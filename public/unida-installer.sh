@@ -520,6 +520,60 @@ update_script() {
     pause
 }
 
+switch_tunnel_mode() {
+    header
+    echo "--- Switch Tunnel Mode (SSH / SOCKS5) ---"
+    echo "Currently, your DNSTT tunnel connects clients to:"
+    if grep -q "127.0.0.1:22" /etc/systemd/system/dnstt-unida.service 2>/dev/null; then
+        echo "  --> SSH (Port 22)"
+    elif grep -q "127.0.0.1:1080" /etc/systemd/system/dnstt-unida.service 2>/dev/null; then
+        echo "  --> SOCKS5 (Port 1080)"
+    else
+        echo "  --> Unknown Port"
+    fi
+    echo ""
+    echo "Options:"
+    echo "  1) Use SSH (Port 22)"
+    echo "  2) Use SOCKS5 (Port 1080) - Installs Dante Proxy"
+    echo "  0) Cancel"
+    read -rp "Select mode: " mode_choice
+
+    case $mode_choice in
+        1)
+            sed -i "s/127.0.0.1:[0-9]\+/127.0.0.1:22/g" /etc/systemd/system/dnstt-unida.service
+            systemctl daemon-reload
+            systemctl restart dnstt-unida.service 2>/dev/null || true
+            echo "[+] Switched to SSH Mode."
+            pause
+            ;;
+        2)
+            echo "[+] Installing and configuring SOCKS5 (dante-server)..."
+            DEBIAN_FRONTEND=noninteractive apt-get install -y dante-server >/dev/null 2>&1
+            ETH=$(ip -4 route ls | grep default | grep -Po "(?<=dev )(\S+)" | head -1)
+            cat > /etc/danted.conf <<EOF_DANTE
+logoutput: syslog
+user.privileged: root
+user.unprivileged: nobody
+internal: 127.0.0.1 port = 1080
+external: $ETH
+socksmethod: username
+clientmethod: none
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp udp }
+EOF_DANTE
+            systemctl restart danted 2>/dev/null || true
+            systemctl enable danted 2>/dev/null || true
+            sed -i "s/127.0.0.1:[0-9]\+/127.0.0.1:1080/g" /etc/systemd/system/dnstt-unida.service
+            systemctl daemon-reload
+            systemctl restart dnstt-unida.service 2>/dev/null || true
+            echo "[+] Switched to SOCKS5 Mode. (Your SSH users/passwords will work for SOCKS5!)"
+            pause
+            ;;
+        0) return ;;
+        *) echo "[-] Invalid option."; pause ;;
+    esac
+}
+
 uninstall_unida() {
     header
     echo "--- Uninstall Unida Server ---"
@@ -561,11 +615,12 @@ main_menu() {
         echo "  6) Restart DNSTT Services"
         echo "  7) Show Server Public Key"
         echo "  8) Change MTU Size"
-        echo "  9) Update Unida Script"
-        echo "  10) Uninstall Unida Server"
+        echo "  9) Switch Tunnel Mode (SSH/SOCKS5)"
+        echo "  10) Update Unida Script"
+        echo "  11) Uninstall Unida Server"
         echo "  0) Exit"
         echo "==============================================="
-        read -rp "Select an option [0-10]: " choice
+        read -rp "Select an option [0-11]: " choice
         case $choice in
             1) create_user ;;
             2) delete_user ;;
@@ -575,8 +630,9 @@ main_menu() {
             6) restart_services ;;
             7) show_key ;;
             8) change_mtu ;;
-            9) update_script ;;
-            10) uninstall_unida ;;
+            9) switch_tunnel_mode ;;
+            10) update_script ;;
+            11) uninstall_unida ;;
             0) exit 0 ;;
             *) echo "Invalid option"; sleep 1 ;;
         esac
