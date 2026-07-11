@@ -564,7 +564,7 @@ EOF_DANTE
             sed -i 's/ 127\.0\.0\.1:[0-9]* *$/ 127.0.0.1:1080/' /etc/systemd/system/dnstt-unida.service
             systemctl daemon-reload
             systemctl restart dnstt-unida.service 2>/dev/null || true
-            echo "[+] Switched to SOCKS5 Mode. (Your SSH users/passwords will work for SOCKS5!)"
+            echo "[+] Switched to SOCKS5 Mode. "
             pause
             ;;
         0) return ;;
