@@ -538,6 +538,13 @@ switch_tunnel_mode() {
 
     case $mode_choice in
         1)
+            # Fix corrupted -udp port from previous bug by reading from proxy
+            if [ -f /usr/local/bin/dnstt-edns-proxy.py ]; then
+                PROXY_TARGET=$(grep "^UPSTREAM_PORT=" /usr/local/bin/dnstt-edns-proxy.py | cut -d '=' -f 2)
+                if [ -n "$PROXY_TARGET" ]; then
+                    sed -i "s/-udp 127\.0\.0\.1:[0-9]*/-udp 127.0.0.1:$PROXY_TARGET/" /etc/systemd/system/dnstt-unida.service
+                fi
+            fi
             sed -i 's/ 127\.0\.0\.1:[0-9]* *$/ 127.0.0.1:22/' /etc/systemd/system/dnstt-unida.service
             systemctl daemon-reload
             systemctl restart dnstt-unida.service 2>/dev/null || true
@@ -561,6 +568,13 @@ socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp udp }
 EOF_DANTE
             systemctl restart danted 2>/dev/null || true
             systemctl enable danted 2>/dev/null || true
+            # Fix corrupted -udp port from previous bug by reading from proxy
+            if [ -f /usr/local/bin/dnstt-edns-proxy.py ]; then
+                PROXY_TARGET=$(grep "^UPSTREAM_PORT=" /usr/local/bin/dnstt-edns-proxy.py | cut -d '=' -f 2)
+                if [ -n "$PROXY_TARGET" ]; then
+                    sed -i "s/-udp 127\.0\.0\.1:[0-9]*/-udp 127.0.0.1:$PROXY_TARGET/" /etc/systemd/system/dnstt-unida.service
+                fi
+            fi
             sed -i 's/ 127\.0\.0\.1:[0-9]* *$/ 127.0.0.1:1080/' /etc/systemd/system/dnstt-unida.service
             systemctl daemon-reload
             systemctl restart dnstt-unida.service 2>/dev/null || true
