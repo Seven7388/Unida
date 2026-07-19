@@ -137,9 +137,10 @@ if command -v fuser >/dev/null 2>&1; then
   fuser -k 7300/tcp >/dev/null 2>&1 || true
 fi
 if command -v lsof >/dev/null 2>&1; then
-  kill -9 $(lsof -t -i:53 -sUDP:LISTEN) 2>/dev/null || true
-  kill -9 $(lsof -t -i:5300 -sUDP:LISTEN) 2>/dev/null || true
-  kill -9 $(lsof -t -i:7300 -sTCP:LISTEN) 2>/dev/null || true
+  kill -9 $(lsof -t -i udp:53) 2>/dev/null || true
+  kill -9 $(lsof -t -i tcp:53) 2>/dev/null || true
+  kill -9 $(lsof -t -i udp:5300) 2>/dev/null || true
+  kill -9 $(lsof -t -i tcp:7300) 2>/dev/null || true
 fi
 
 # Free port 53 from systemd-resolved
@@ -338,7 +339,13 @@ def main():
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8388608)
     except: pass
     
-    server_sock.bind((LISTEN_HOST, LISTEN_PORT))
+    try:
+        server_sock.bind((LISTEN_HOST, LISTEN_PORT))
+    except Exception as e:
+        sys.stderr.write(f"[-] Error binding to {LISTEN_HOST}:{LISTEN_PORT}: {e}\\n")
+        sys.stderr.write(f"[-] Ensure port {LISTEN_PORT} is not already in use by systemd-resolved, dnsmasq, or bind9.\\n")
+        sys.stderr.flush()
+        sys.exit(1)
     print(f"[Unida EDNS proxy] Listening on {LISTEN_HOST}:{LISTEN_PORT}, upstream {UPSTREAM_HOST}:{UPSTREAM_PORT}")
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=2048) as executor:
