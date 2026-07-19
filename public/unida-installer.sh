@@ -203,8 +203,15 @@ fi
 
 echo "==> Kupakua dnstt-server binary (Linux x64)..."
 mkdir -p /usr/local/bin
-curl -fsSL "https://dnstt.network/dnstt-server-linux-amd64" -o /usr/local/bin/dnstt-server
-chmod +x /usr/local/bin/dnstt-server
+rm -f /tmp/dnstt-server
+if curl -fsSL "https://dnstt.network/dnstt-server-linux-amd64" -o /tmp/dnstt-server; then
+  rm -f /usr/local/bin/dnstt-server
+  mv /tmp/dnstt-server /usr/local/bin/dnstt-server
+  chmod +x /usr/local/bin/dnstt-server
+else
+  echo "[-] Failed to download dnstt-server binary."
+  exit 1
+fi
 
 echo "==> Ku-generate server keys (ikiwa bado hazipo)..."
 mkdir -p /etc/dnstt
