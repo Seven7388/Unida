@@ -6,13 +6,13 @@ A robust, automated installer for setting up a DNSTT (SlowDNS) tunnel server on 
 
 - **Instant Setup:** Downloads the core DNSTT server binary, creates systemd background services, and generates keys automatically.
 - **Advanced Networking:** Automatically configures IPv4 forwarding (`ip_forward`), `iptables` NAT Masquerading, and SSH port forwarding (`AllowTcpForwarding`, `GatewayPorts`) so that clients instantly have internet access without extra manual configuration.
-- **Flexible TCP Proxy / SOCKS5 Support:** Unlike standard DNSTT setups restricted to SSH, Unida installs a lightweight **Dante SOCKS5 Proxy** and provides a CLI backend switcher so you can route the tunnel to SOCKS5 (lower overhead) or any custom TCP proxy (VLESS, VMess, Shadowsocks) seamlessly.
+- **Ultra-Fast HEV SOCKS5 (TCP + Native UDP):** Replaces legacy BadVPN with the ultra-lightweight, high-performance `hev-socks5-server` (compiled in C with coroutines). Provides full TCP and native UDP support for gaming and VoIP at fraction of the CPU and memory footprint, with zero compilation overhead.
+- **Flexible Tunnel Modes:** Easily switch between SSH Mode (Port 22) for standard SSH account setups or HEV SOCKS5 Mode (Port 7300) for high-speed direct SOCKS5 tunneling without SSH encryption overhead.
 - **Port Collision Prevention:** Automatically stops conflicting services (like `bind9`, `dnsmasq`) and proactively kills any zombie processes blocking required ports (`53`, `5300`, `7300`) ensuring a clean setup.
 - **Smart Port Routing:** If you choose to run the EDNS proxy on a custom port, `iptables` rules will automatically route default port 53 traffic incoming from apps like HTTP Injector directly to your custom port, guaranteeing client compatibility.
-- **BadVPN UDPGW:** Compiles and runs a dedicated UDP over TCP Gateway for handling VoIP calls (WhatsApp) and online gaming across the DNS tunnel seamlessly (runs on port 7300).
 - **EDNS Proxy:** Includes an intelligent Python-based EDNS UDP size proxy (`512` <-> `1800`) to ensure DNS requests pass through strict firewalls and routers smoothly.
 - **Single-File Installer:** The installer script seamlessly embeds the management terminal tool, meaning you only need one script to install everything perfectly.
-- **Management CLI:** A global `unida` command is installed on your server to easily manage your SSH users, tunnel status, change backends, and view logs.
+- **Management CLI:** A global `unida` command is installed on your server to easily manage your SSH users, tunnel status, switch between SSH & HEV SOCKS5 modes, and view logs.
 
 ---
 
@@ -55,12 +55,13 @@ When you run `unida`, an interactive menu will appear with the following options
 1. **Create new SSH User**: Interactively create a new user and password for your SSH tunnel.
 2. **Delete SSH User**: Remove an existing user from the system.
 3. **List all SSH Users**: View a list of all currently configured SSH tunnel users.
-4. **Show DNSTT Tunnel Status**: Check if the main tunnel, proxy, and BadVPN UDPGW are actively running.
-5. **View Live Logs**: View the live traffic/error logs for the DNSTT server, EDNS proxy, or BadVPN UDPGW.
+4. **Show DNSTT Tunnel Status**: Check if the main tunnel, proxy, and HEV SOCKS5 are actively running.
+5. **View Live Logs**: View the live traffic/error logs for the DNSTT server, EDNS proxy, or HEV SOCKS5 server.
 6. **Restart DNSTT Services**: Instantly restart all background tunnel services.
 7. **Show Server Public Key**: Display the Server's Public Key (needed for your VPN client apps).
 8. **Change MTU Size**: Dynamically update the MTU size for both the tunnel and the proxy, and auto-restart services seamlessly.
-9. **Uninstall Unida Server**: Completely remove Unida DNSTT, the proxy, BadVPN, and all configurations from your server.
+9. **Switch Tunnel Mode (SSH / HEV SOCKS5)**: Switch your DNS tunnel backend between SSH (Port 22) and HEV SOCKS5 (Port 7300).
+10. **Uninstall Unida Server**: Completely remove Unida DNSTT, the proxy, HEV SOCKS5, and all configurations from your server.
 0. **Exit**: Close the manager.
 
 ---

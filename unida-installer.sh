@@ -124,7 +124,7 @@ echo "==> MTU   : ${MTU}"
 sleep 1
 
 echo "==> Kuzima old dnstt/slowdns services kama zipo..."
-for svc in dnstt-smart dnstt dnstt-server dnstt-b dnstt-proxy dnsttloc slowdns dnstt-unida dnstt-unida-proxy badvpn-udpgw bind9 dnsmasq; do
+for svc in dnstt-smart dnstt dnstt-server dnstt-b dnstt-proxy dnsttloc slowdns dnstt-unida dnstt-unida-proxy hev-socks5 badvpn-udpgw danted bind9 dnsmasq; do
   systemctl disable --now "${svc}.service" >/dev/null 2>&1 || true
 done
 
@@ -134,12 +134,14 @@ if command -v fuser >/dev/null 2>&1; then
   fuser -k 53/tcp >/dev/null 2>&1 || true
   fuser -k 5300/udp >/dev/null 2>&1 || true
   fuser -k 7300/tcp >/dev/null 2>&1 || true
+  fuser -k 7300/udp >/dev/null 2>&1 || true
 fi
 if command -v lsof >/dev/null 2>&1; then
   kill -9 $(lsof -t -i udp:53) 2>/dev/null || true
   kill -9 $(lsof -t -i tcp:53) 2>/dev/null || true
   kill -9 $(lsof -t -i udp:5300) 2>/dev/null || true
   kill -9 $(lsof -t -i tcp:7300) 2>/dev/null || true
+  kill -9 $(lsof -t -i udp:7300) 2>/dev/null || true
 fi
 
 # Free port 53 from systemd-resolved
@@ -167,35 +169,55 @@ fi
 
 echo "==> Installing packages..."
 apt-get update -y >/dev/null 2>&1
-DEBIAN_FRONTEND=noninteractive apt-get install -y curl python3 wget git cmake make gcc g++ build-essential openssh-server iptables net-tools lsof cron >/dev/null 2>&1 || true
+DEBIAN_FRONTEND=noninteractive apt-get install -y curl python3 wget git openssh-server iptables net-tools lsof cron >/dev/null 2>&1 || true
 
-echo "==> Kupakua and Compiling BadVPN UDPGW (UDP via TCP)..."
-if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
-  cd /tmp
-  git clone https://github.com/ambrop72/badvpn.git >/dev/null 2>&1 || true
-  if [ -d /tmp/badvpn ]; then
-    cd badvpn
-    cmake -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null 2>&1
-    make >/dev/null 2>&1
-    cp udpgw/badvpn-udpgw /usr/local/bin/
-    cd /tmp
-    rm -rf badvpn
-  else
-    echo "[-] BadVPN download failed, continuing without it..."
-  fi
+echo "==> Kupakua and Setting up HEV SOCKS5 Server (Ultra-low latency, TCP+UDP)..."
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64|amd64) HEV_ARCH="x86_64" ;;
+  aarch64|arm64) HEV_ARCH="arm64" ;;
+  armv7l|armhf) HEV_ARCH="arm32v7" ;;
+  i386|i686) HEV_ARCH="i686" ;;
+  *) HEV_ARCH="x86_64" ;;
+esac
+
+mkdir -p /usr/local/bin /etc/hev
+rm -f /tmp/hev-socks5-server
+if curl -fsSL "https://github.com/heiher/hev-socks5-server/releases/download/2.13.1/hev-socks5-server-linux-${HEV_ARCH}" -o /tmp/hev-socks5-server; then
+  mv /tmp/hev-socks5-server /usr/local/bin/hev-socks5-server
+  chmod +x /usr/local/bin/hev-socks5-server
+else
+  echo "[-] Failed to download HEV SOCKS5 binary directly."
 fi
 
-if [ -f /usr/local/bin/badvpn-udpgw ]; then
-  echo "==> Kuunda service /etc/systemd/system/badvpn-udpgw.service..."
-  cat >/etc/systemd/system/badvpn-udpgw.service <<EOF
+# Clean up obsolete badvpn-udpgw or danted if present
+systemctl disable --now badvpn-udpgw.service danted.service 2>/dev/null || true
+rm -f /etc/systemd/system/badvpn-udpgw.service /usr/local/bin/badvpn-udpgw 2>/dev/null || true
+
+if [ -f /usr/local/bin/hev-socks5-server ]; then
+  echo "==> Kuunda config /etc/hev/socks5.yml..."
+  cat >/etc/hev/socks5.yml <<EOF
+main:
+  workers: 4
+  port: 7300
+  listen-address: '127.0.0.1'
+  udp-port: 7300
+  udp-listen-address: '127.0.0.1'
+  listen-ipv6-only: false
+EOF
+
+  echo "==> Kuunda service /etc/systemd/system/hev-socks5.service..."
+  cat >/etc/systemd/system/hev-socks5.service <<EOF
 [Unit]
-Description=BadVPN UDPGW Service
+Description=HEV SOCKS5 High-Performance Server (TCP & UDP)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 1000 --max-connections-for-client 10
+ExecStart=/usr/local/bin/hev-socks5-server /etc/hev/socks5.yml
 Restart=always
+RestartSec=3
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -447,14 +469,14 @@ list_users() {
 
 show_status() {
     header
-    echo "--- Tunnel Status ---"
+    echo "--- DNSTT Tunnel Status ---"
     systemctl status dnstt-unida.service --no-pager || true
     echo ""
-    echo "--- Proxy Status ---"
+    echo "--- EDNS Proxy Status ---"
     systemctl status dnstt-unida-proxy.service --no-pager || true
     echo ""
-    echo "--- BadVPN UDPGW Status ---"
-    systemctl status badvpn-udpgw.service --no-pager 2>/dev/null || true
+    echo "--- HEV SOCKS5 Status (TCP+UDP) ---"
+    systemctl status hev-socks5.service --no-pager 2>/dev/null || true
     pause
 }
 
@@ -463,13 +485,13 @@ view_logs() {
     echo "--- View Live Logs ---"
     echo "1) Main Tunnel Logs"
     echo "2) EDNS Proxy Logs"
-    echo "3) BadVPN UDPGW Logs"
+    echo "3) HEV SOCKS5 Server Logs"
     echo "0) Back"
     read -rp "Select option: " log_choice
     case $log_choice in
         1) journalctl -u dnstt-unida.service -f ;;
         2) journalctl -u dnstt-unida-proxy.service -f ;;
-        3) journalctl -u badvpn-udpgw.service -f ;;
+        3) journalctl -u hev-socks5.service -f ;;
         0) return ;;
         *) echo "Invalid option." ;;
     esac
@@ -478,7 +500,7 @@ view_logs() {
 restart_services() {
     header
     echo "[+] Restarting services..."
-    systemctl restart dnstt-unida.service dnstt-unida-proxy.service badvpn-udpgw.service 2>/dev/null || true
+    systemctl restart dnstt-unida.service dnstt-unida-proxy.service hev-socks5.service 2>/dev/null || true
     echo "[+] Services restarted successfully."
     pause
 }
@@ -539,19 +561,19 @@ update_script() {
 
 switch_tunnel_mode() {
     header
-    echo "--- Switch Tunnel Mode (SSH / SOCKS5) ---"
+    echo "--- Switch Tunnel Backend Mode (SSH / HEV SOCKS5) ---"
     echo "Currently, your DNSTT tunnel connects clients to:"
     if grep -q "127.0.0.1:22" /etc/systemd/system/dnstt-unida.service 2>/dev/null; then
-        echo "  --> SSH (Port 22)"
-    elif grep -q "127.0.0.1:1080" /etc/systemd/system/dnstt-unida.service 2>/dev/null; then
-        echo "  --> SOCKS5 (Port 1080)"
+        echo "  --> SSH (Port 22) [SSH Accounts]"
+    elif grep -q "127.0.0.1:7300" /etc/systemd/system/dnstt-unida.service 2>/dev/null; then
+        echo "  --> HEV SOCKS5 (Port 7300) [High-Performance TCP + Native UDP]"
     else
-        echo "  --> Unknown Port"
+        echo "  --> Custom Port"
     fi
     echo ""
     echo "Options:"
-    echo "  1) Use SSH (Port 22)"
-    echo "  2) Use SOCKS5 (Port 1080) - Installs Dante Proxy"
+    echo "  1) Use SSH Mode (Port 22)"
+    echo "  2) Use HEV SOCKS5 Mode (Port 7300) - Blazing Fast (No SSH Overhead, Native UDP)"
     echo "  0) Cancel"
     read -rp "Select mode: " mode_choice
 
@@ -571,22 +593,9 @@ switch_tunnel_mode() {
             pause
             ;;
         2)
-            echo "[+] Installing and configuring SOCKS5 (dante-server)..."
-            DEBIAN_FRONTEND=noninteractive apt-get install -y dante-server >/dev/null 2>&1
-            ETH=$(ip -4 route ls | grep default | grep -Po "(?<=dev )(\S+)" | head -1)
-            cat > /etc/danted.conf <<EOF_DANTE
-logoutput: syslog
-user.privileged: root
-user.unprivileged: nobody
-internal: 127.0.0.1 port = 1080
-external: $ETH
-socksmethod: none
-clientmethod: none
-client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
-socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp udp }
-EOF_DANTE
-            systemctl restart danted 2>/dev/null || true
-            systemctl enable danted 2>/dev/null || true
+            echo "[+] Ensuring HEV SOCKS5 server is running..."
+            systemctl restart hev-socks5.service 2>/dev/null || true
+            systemctl enable hev-socks5.service 2>/dev/null || true
             # Fix corrupted -udp port from previous bug by reading from proxy
             if [ -f /usr/local/bin/dnstt-edns-proxy.py ]; then
                 PROXY_TARGET=$(grep "^UPSTREAM_PORT=" /usr/local/bin/dnstt-edns-proxy.py | cut -d '=' -f 2)
@@ -594,10 +603,10 @@ EOF_DANTE
                     sed -i "s/-udp 127\.0\.0\.1:[0-9]*/-udp 127.0.0.1:$PROXY_TARGET/" /etc/systemd/system/dnstt-unida.service
                 fi
             fi
-            sed -i 's/ 127\.0\.0\.1:[0-9]* *$/ 127.0.0.1:1080/' /etc/systemd/system/dnstt-unida.service
+            sed -i 's/ 127\.0\.0\.1:[0-9]* *$/ 127.0.0.1:7300/' /etc/systemd/system/dnstt-unida.service
             systemctl daemon-reload
             systemctl restart dnstt-unida.service 2>/dev/null || true
-            echo "[+] Switched to SOCKS5 Mode. "
+            echo "[+] Switched to HEV SOCKS5 Mode (Port 7300)."
             pause
             ;;
         0) return ;;
@@ -608,19 +617,22 @@ EOF_DANTE
 uninstall_unida() {
     header
     echo "--- Uninstall Unida Server ---"
-    echo "WARNING: This will completely remove Unida DNSTT, proxy, BadVPN, and all configurations."
+    echo "WARNING: This will completely remove Unida DNSTT, proxy, HEV SOCKS5, and all configurations."
     read -rp "Are you sure? (y/n): " confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         echo "[+] Stopping services..."
-        systemctl disable --now dnstt-unida.service dnstt-unida-proxy.service badvpn-udpgw.service 2>/dev/null || true
+        systemctl disable --now dnstt-unida.service dnstt-unida-proxy.service hev-socks5.service badvpn-udpgw.service 2>/dev/null || true
         echo "[+] Removing files..."
         rm -f /usr/local/bin/dnstt-server
         rm -f /usr/local/bin/dnstt-edns-proxy.py
+        rm -f /usr/local/bin/hev-socks5-server
         rm -f /usr/local/bin/badvpn-udpgw
+        rm -rf /etc/hev
         rm -f /usr/local/bin/unida
         rm -rf /etc/dnstt
         rm -f /etc/systemd/system/dnstt-unida.service
         rm -f /etc/systemd/system/dnstt-unida-proxy.service
+        rm -f /etc/systemd/system/hev-socks5.service
         rm -f /etc/systemd/system/badvpn-udpgw.service
         systemctl daemon-reload
         echo "[+] Removing users..."
@@ -790,15 +802,14 @@ echo "==> Starting services..."
 systemctl daemon-reload
 systemctl enable --now dnstt-unida.service
 systemctl enable --now dnstt-unida-proxy.service
-if [ -f /etc/systemd/system/badvpn-udpgw.service ]; then
-  systemctl enable --now badvpn-udpgw.service
+if [ -f /etc/systemd/system/hev-socks5.service ]; then
+  systemctl enable --now hev-socks5.service
 fi
 
 if command -v ufw >/dev/null 2>&1; then
   ufw allow 22/tcp >/dev/null 2>&1 || true
   ufw allow 53/udp >/dev/null 2>&1 || true
   ufw allow ${PROXY_PORT}/udp >/dev/null 2>&1 || true
-  ufw allow 7300/tcp >/dev/null 2>&1 || true
   ufw reload >/dev/null 2>&1 || true
 fi
 
@@ -806,7 +817,6 @@ fi
 iptables -I INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
 iptables -I INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
 iptables -I INPUT -p udp --dport ${PROXY_PORT} -j ACCEPT 2>/dev/null || true
-iptables -I INPUT -p tcp --dport 7300 -j ACCEPT 2>/dev/null || true
 iptables -I FORWARD -j ACCEPT 2>/dev/null || true
 iptables -I FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 iptables-save > /etc/iptables.up.rules 2>/dev/null || true
@@ -816,7 +826,6 @@ if command -v firewall-cmd >/dev/null 2>&1; then
   firewall-cmd --add-port=53/udp --permanent 2>/dev/null || true
   firewall-cmd --add-port=53/tcp --permanent 2>/dev/null || true
   firewall-cmd --add-port=${PROXY_PORT}/udp --permanent 2>/dev/null || true
-  firewall-cmd --add-port=7300/tcp --permanent 2>/dev/null || true
   firewall-cmd --reload 2>/dev/null || true
 fi
 
@@ -831,7 +840,7 @@ echo "Tunnel Domain    : ${TDOMAIN}"
 echo "MTU              : ${MTU}"
 echo "dnstt-server     : 127.0.0.1:${DNSTT_PORT}"
 echo "proxy public     : UDP :${PROXY_PORT}"
-echo "badvpn-udpgw     : 127.0.0.1:7300"
+echo "HEV SOCKS5       : 127.0.0.1:7300 (High Performance TCP+UDP)"
 echo ""
 echo "Public key:"
 cat /etc/dnstt/server.pub || true
@@ -839,5 +848,6 @@ echo ""
 echo "🔥 NEW: Use the 'unida' command to manage your server!"
 echo "    Add SSH user    : unida useradd username password"
 echo "    Check status    : unida status"
+echo "    Switch backend  : unida (Option 9: SSH or HEV SOCKS5)"
 echo "    See all commands: unida help"
 echo "==============================================="

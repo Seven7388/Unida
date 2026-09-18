@@ -13,7 +13,7 @@ fi
 
 # Default values
 TDOMAIN=""
-MTU="1800"
+MTU="${MTU:-1232}"
 DNSTT_PORT="5300"
 PROXY_PORT="53"
 
@@ -61,9 +61,8 @@ if [ -z "$TDOMAIN" ]; then
       # Disable pipefail temporarily because `head -c 4` and `grep | head` can trigger SIGPIPE and kill the script under `set -e`
       set +euo pipefail
       
-      RANDOM_STR=$(tr -dc a-z0-9 </dev/urandom | head -c 4)
-      NS_PREFIX="ns-${RANDOM_STR}"
-      TUN_PREFIX="tun-${RANDOM_STR}"
+      NS_PREFIX=$(tr -dc a-m </dev/urandom | head -c 1 2>/dev/null || echo "n")
+      TUN_PREFIX=$(tr -dc n-z </dev/urandom | head -c 1 2>/dev/null || echo "t")
       
       echo "[*] Automatically generated Name Server prefix: ${NS_PREFIX}"
       echo "[*] Automatically generated Tunnel prefix: ${TUN_PREFIX}"
@@ -125,7 +124,7 @@ echo "==> MTU   : ${MTU}"
 sleep 1
 
 echo "==> Kuzima old dnstt/slowdns services kama zipo..."
-for svc in dnstt-smart dnstt dnstt-server dnstt-b dnstt-proxy dnsttloc slowdns dnstt-unida dnstt-unida-proxy badvpn-udpgw bind9 dnsmasq; do
+for svc in dnstt-smart dnstt dnstt-server dnstt-b dnstt-proxy dnsttloc slowdns dnstt-unida dnstt-unida-proxy hev-socks5 badvpn-udpgw danted bind9 dnsmasq; do
   systemctl disable --now "${svc}.service" >/dev/null 2>&1 || true
 done
 
@@ -135,12 +134,14 @@ if command -v fuser >/dev/null 2>&1; then
   fuser -k 53/tcp >/dev/null 2>&1 || true
   fuser -k 5300/udp >/dev/null 2>&1 || true
   fuser -k 7300/tcp >/dev/null 2>&1 || true
+  fuser -k 7300/udp >/dev/null 2>&1 || true
 fi
 if command -v lsof >/dev/null 2>&1; then
   kill -9 $(lsof -t -i udp:53) 2>/dev/null || true
   kill -9 $(lsof -t -i tcp:53) 2>/dev/null || true
   kill -9 $(lsof -t -i udp:5300) 2>/dev/null || true
   kill -9 $(lsof -t -i tcp:7300) 2>/dev/null || true
+  kill -9 $(lsof -t -i udp:7300) 2>/dev/null || true
 fi
 
 # Free port 53 from systemd-resolved
@@ -168,35 +169,55 @@ fi
 
 echo "==> Installing packages..."
 apt-get update -y >/dev/null 2>&1
-DEBIAN_FRONTEND=noninteractive apt-get install -y curl python3 wget git cmake make gcc g++ build-essential >/dev/null 2>&1 || true
+DEBIAN_FRONTEND=noninteractive apt-get install -y curl python3 wget git openssh-server iptables net-tools lsof cron >/dev/null 2>&1 || true
 
-echo "==> Kupakua and Compiling BadVPN UDPGW (UDP via TCP)..."
-if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
-  cd /tmp
-  git clone https://github.com/ambrop72/badvpn.git >/dev/null 2>&1 || true
-  if [ -d /tmp/badvpn ]; then
-    cd badvpn
-    cmake -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null 2>&1
-    make >/dev/null 2>&1
-    cp udpgw/badvpn-udpgw /usr/local/bin/
-    cd /tmp
-    rm -rf badvpn
-  else
-    echo "[-] BadVPN download failed, continuing without it..."
-  fi
+echo "==> Kupakua and Setting up HEV SOCKS5 Server (Ultra-low latency, TCP+UDP)..."
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64|amd64) HEV_ARCH="x86_64" ;;
+  aarch64|arm64) HEV_ARCH="arm64" ;;
+  armv7l|armhf) HEV_ARCH="arm32v7" ;;
+  i386|i686) HEV_ARCH="i686" ;;
+  *) HEV_ARCH="x86_64" ;;
+esac
+
+mkdir -p /usr/local/bin /etc/hev
+rm -f /tmp/hev-socks5-server
+if curl -fsSL "https://github.com/heiher/hev-socks5-server/releases/download/2.13.1/hev-socks5-server-linux-${HEV_ARCH}" -o /tmp/hev-socks5-server; then
+  mv /tmp/hev-socks5-server /usr/local/bin/hev-socks5-server
+  chmod +x /usr/local/bin/hev-socks5-server
+else
+  echo "[-] Failed to download HEV SOCKS5 binary directly."
 fi
 
-if [ -f /usr/local/bin/badvpn-udpgw ]; then
-  echo "==> Kuunda service /etc/systemd/system/badvpn-udpgw.service..."
-  cat >/etc/systemd/system/badvpn-udpgw.service <<EOF
+# Clean up obsolete badvpn-udpgw or danted if present
+systemctl disable --now badvpn-udpgw.service danted.service 2>/dev/null || true
+rm -f /etc/systemd/system/badvpn-udpgw.service /usr/local/bin/badvpn-udpgw 2>/dev/null || true
+
+if [ -f /usr/local/bin/hev-socks5-server ]; then
+  echo "==> Kuunda config /etc/hev/socks5.yml..."
+  cat >/etc/hev/socks5.yml <<EOF
+main:
+  workers: 4
+  port: 7300
+  listen-address: '127.0.0.1'
+  udp-port: 7300
+  udp-listen-address: '127.0.0.1'
+  listen-ipv6-only: false
+EOF
+
+  echo "==> Kuunda service /etc/systemd/system/hev-socks5.service..."
+  cat >/etc/systemd/system/hev-socks5.service <<EOF
 [Unit]
-Description=BadVPN UDPGW Service
+Description=HEV SOCKS5 High-Performance Server (TCP & UDP)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 1000 --max-connections-for-client 10
+ExecStart=/usr/local/bin/hev-socks5-server /etc/hev/socks5.yml
 Restart=always
+RestartSec=3
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -242,7 +263,7 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-echo "==> Kuunda EDNS proxy (512 <-> 1800)..."
+echo "==> Kuunda EDNS proxy (512 <-> 1232)..."
 cat >/usr/local/bin/dnstt-edns-proxy.py <<EOF_PY
 #!/usr/bin/env python3
 import socket, struct, concurrent.futures, sys
@@ -251,7 +272,7 @@ LISTEN_HOST="0.0.0.0"
 LISTEN_PORT=${PROXY_PORT}
 UPSTREAM_HOST="127.0.0.1"
 UPSTREAM_PORT=${DNSTT_PORT}
-EXTERNAL_EDNS_SIZE=1800
+EXTERNAL_EDNS_SIZE=1232
 INTERNAL_EDNS_SIZE=${MTU}
 
 def extract_and_patch_edns(data: bytes, new_size: int):
@@ -364,7 +385,7 @@ chmod +x /usr/local/bin/dnstt-edns-proxy.py
 
 cat >/etc/systemd/system/dnstt-unida-proxy.service <<EOF
 [Unit]
-Description=Unida DNSTT EDNS Proxy (512<->1800)
+Description=Unida DNSTT EDNS Proxy (512<->1232)
 After=network-online.target dnstt-unida.service
 Wants=network-online.target
 
@@ -448,14 +469,14 @@ list_users() {
 
 show_status() {
     header
-    echo "--- Tunnel Status ---"
+    echo "--- DNSTT Tunnel Status ---"
     systemctl status dnstt-unida.service --no-pager || true
     echo ""
-    echo "--- Proxy Status ---"
+    echo "--- EDNS Proxy Status ---"
     systemctl status dnstt-unida-proxy.service --no-pager || true
     echo ""
-    echo "--- BadVPN UDPGW Status ---"
-    systemctl status badvpn-udpgw.service --no-pager 2>/dev/null || true
+    echo "--- HEV SOCKS5 Status (TCP+UDP) ---"
+    systemctl status hev-socks5.service --no-pager 2>/dev/null || true
     pause
 }
 
@@ -464,13 +485,13 @@ view_logs() {
     echo "--- View Live Logs ---"
     echo "1) Main Tunnel Logs"
     echo "2) EDNS Proxy Logs"
-    echo "3) BadVPN UDPGW Logs"
+    echo "3) HEV SOCKS5 Server Logs"
     echo "0) Back"
     read -rp "Select option: " log_choice
     case $log_choice in
         1) journalctl -u dnstt-unida.service -f ;;
         2) journalctl -u dnstt-unida-proxy.service -f ;;
-        3) journalctl -u badvpn-udpgw.service -f ;;
+        3) journalctl -u hev-socks5.service -f ;;
         0) return ;;
         *) echo "Invalid option." ;;
     esac
@@ -479,7 +500,7 @@ view_logs() {
 restart_services() {
     header
     echo "[+] Restarting services..."
-    systemctl restart dnstt-unida.service dnstt-unida-proxy.service badvpn-udpgw.service 2>/dev/null || true
+    systemctl restart dnstt-unida.service dnstt-unida-proxy.service hev-socks5.service 2>/dev/null || true
     echo "[+] Services restarted successfully."
     pause
 }
@@ -494,7 +515,7 @@ show_key() {
 change_mtu() {
     header
     echo "--- Change MTU Size ---"
-    current_mtu=$(grep -o '-mtu [0-9]*' /etc/systemd/system/dnstt-unida.service | awk '{print $2}')
+    current_mtu=$(grep -o '\-mtu [0-9]*' /etc/systemd/system/dnstt-unida.service | awk '{print $2}')
     echo "Current MTU: ${current_mtu:-Unknown}"
     read -rp "Enter new MTU size (e.g., 1800, 1200): " NEW_MTU
     if [ -z "$NEW_MTU" ] || ! [[ "$NEW_MTU" =~ ^[0-9]+$ ]]; then
@@ -513,22 +534,105 @@ change_mtu() {
     pause
 }
 
+update_script() {
+    header
+    echo "--- Update Unida Script ---"
+    echo "Downloading latest version..."
+    wget -qO /tmp/unida-installer.sh "https://raw.githubusercontent.com/Seven7388/Unida/main/public/unida-installer.sh?t=$(date +%s)"
+    if [ -s /tmp/unida-installer.sh ]; then
+        sed -n '/^cat >\/usr\/local\/bin\/unida <<'"'EOF_MANAGER'"'/,/^EOF_MANAGER/p' /tmp/unida-installer.sh | sed '1d;$d' > /tmp/unida_new
+        chmod +x /tmp/unida_new
+        mv /tmp/unida_new /usr/local/bin/unida
+        echo "[+] Script updated successfully!"
+        echo ""
+        echo "=== CHANGELOG ==="
+        echo "Fetching latest changes..."
+        curl -s "https://api.github.com/repos/Seven7388/Unida/commits?per_page=3" | grep '"message":' | cut -d '"' -f 4 | sed 's/\\n.*//' | sed 's/^/- /'
+        echo "================="
+        echo ""
+        echo "[!] Restarting CLI to apply updates..."
+        sleep 2
+        exec unida
+    else
+        echo "[-] Failed to download update."
+        pause
+    fi
+}
+
+switch_tunnel_mode() {
+    header
+    echo "--- Switch Tunnel Backend Mode (SSH / HEV SOCKS5) ---"
+    echo "Currently, your DNSTT tunnel connects clients to:"
+    if grep -q "127.0.0.1:22" /etc/systemd/system/dnstt-unida.service 2>/dev/null; then
+        echo "  --> SSH (Port 22) [SSH Accounts]"
+    elif grep -q "127.0.0.1:7300" /etc/systemd/system/dnstt-unida.service 2>/dev/null; then
+        echo "  --> HEV SOCKS5 (Port 7300) [High-Performance TCP + Native UDP]"
+    else
+        echo "  --> Custom Port"
+    fi
+    echo ""
+    echo "Options:"
+    echo "  1) Use SSH Mode (Port 22)"
+    echo "  2) Use HEV SOCKS5 Mode (Port 7300) - Blazing Fast (No SSH Overhead, Native UDP)"
+    echo "  0) Cancel"
+    read -rp "Select mode: " mode_choice
+
+    case $mode_choice in
+        1)
+            # Fix corrupted -udp port from previous bug by reading from proxy
+            if [ -f /usr/local/bin/dnstt-edns-proxy.py ]; then
+                PROXY_TARGET=$(grep "^UPSTREAM_PORT=" /usr/local/bin/dnstt-edns-proxy.py | cut -d '=' -f 2)
+                if [ -n "$PROXY_TARGET" ]; then
+                    sed -i "s/-udp 127\.0\.0\.1:[0-9]*/-udp 127.0.0.1:$PROXY_TARGET/" /etc/systemd/system/dnstt-unida.service
+                fi
+            fi
+            sed -i 's/ 127\.0\.0\.1:[0-9]* *$/ 127.0.0.1:22/' /etc/systemd/system/dnstt-unida.service
+            systemctl daemon-reload
+            systemctl restart dnstt-unida.service 2>/dev/null || true
+            echo "[+] Switched to SSH Mode."
+            pause
+            ;;
+        2)
+            echo "[+] Ensuring HEV SOCKS5 server is running..."
+            systemctl restart hev-socks5.service 2>/dev/null || true
+            systemctl enable hev-socks5.service 2>/dev/null || true
+            # Fix corrupted -udp port from previous bug by reading from proxy
+            if [ -f /usr/local/bin/dnstt-edns-proxy.py ]; then
+                PROXY_TARGET=$(grep "^UPSTREAM_PORT=" /usr/local/bin/dnstt-edns-proxy.py | cut -d '=' -f 2)
+                if [ -n "$PROXY_TARGET" ]; then
+                    sed -i "s/-udp 127\.0\.0\.1:[0-9]*/-udp 127.0.0.1:$PROXY_TARGET/" /etc/systemd/system/dnstt-unida.service
+                fi
+            fi
+            sed -i 's/ 127\.0\.0\.1:[0-9]* *$/ 127.0.0.1:7300/' /etc/systemd/system/dnstt-unida.service
+            systemctl daemon-reload
+            systemctl restart dnstt-unida.service 2>/dev/null || true
+            echo "[+] Switched to HEV SOCKS5 Mode (Port 7300)."
+            pause
+            ;;
+        0) return ;;
+        *) echo "[-] Invalid option."; pause ;;
+    esac
+}
+
 uninstall_unida() {
     header
     echo "--- Uninstall Unida Server ---"
-    echo "WARNING: This will completely remove Unida DNSTT, proxy, BadVPN, and all configurations."
+    echo "WARNING: This will completely remove Unida DNSTT, proxy, HEV SOCKS5, and all configurations."
     read -rp "Are you sure? (y/n): " confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         echo "[+] Stopping services..."
-        systemctl disable --now dnstt-unida.service dnstt-unida-proxy.service badvpn-udpgw.service 2>/dev/null || true
+        systemctl disable --now dnstt-unida.service dnstt-unida-proxy.service hev-socks5.service badvpn-udpgw.service 2>/dev/null || true
         echo "[+] Removing files..."
         rm -f /usr/local/bin/dnstt-server
         rm -f /usr/local/bin/dnstt-edns-proxy.py
+        rm -f /usr/local/bin/hev-socks5-server
         rm -f /usr/local/bin/badvpn-udpgw
+        rm -rf /etc/hev
         rm -f /usr/local/bin/unida
         rm -rf /etc/dnstt
         rm -f /etc/systemd/system/dnstt-unida.service
         rm -f /etc/systemd/system/dnstt-unida-proxy.service
+        rm -f /etc/systemd/system/hev-socks5.service
         rm -f /etc/systemd/system/badvpn-udpgw.service
         systemctl daemon-reload
         echo "[+] Removing users..."
@@ -554,10 +658,12 @@ main_menu() {
         echo "  6) Restart DNSTT Services"
         echo "  7) Show Server Public Key"
         echo "  8) Change MTU Size"
-        echo "  9) Uninstall Unida Server"
+        echo "  9) Switch Tunnel Mode (SSH/SOCKS5)"
+        echo "  10) Update Unida Script"
+        echo "  11) Uninstall Unida Server"
         echo "  0) Exit"
         echo "==============================================="
-        read -rp "Select an option [0-9]: " choice
+        read -rp "Select an option [0-11]: " choice
         case $choice in
             1) create_user ;;
             2) delete_user ;;
@@ -567,7 +673,9 @@ main_menu() {
             6) restart_services ;;
             7) show_key ;;
             8) change_mtu ;;
-            9) uninstall_unida ;;
+            9) switch_tunnel_mode ;;
+            10) update_script ;;
+            11) uninstall_unida ;;
             0) exit 0 ;;
             *) echo "Invalid option"; sleep 1 ;;
         esac
@@ -596,11 +704,29 @@ sysctl -p >/dev/null 2>&1
 
 # Setup IPTables Masquerade for internet access through the VPN/SSH Tunnel
 ETH=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
+if [ -z "$ETH" ]; then
+    ETH=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+fi
+
 if [ -n "$ETH" ]; then
   iptables -t nat -A POSTROUTING -o "$ETH" -j MASQUERADE
   if [ "${PROXY_PORT}" != "53" ]; then
     iptables -t nat -A PREROUTING -i "$ETH" -p udp --dport 53 -j REDIRECT --to-ports "${PROXY_PORT}"
   fi
+else
+  iptables -t nat -A POSTROUTING -j MASQUERADE
+  if [ "${PROXY_PORT}" != "53" ]; then
+    iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports "${PROXY_PORT}"
+  fi
+fi
+
+  # Block outgoing QUIC (UDP 443) to force Instagram/YouTube to use TCP
+  # This makes DNSTT much faster by avoiding UDP fragmentation.
+  iptables -A OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+  iptables -I FORWARD -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+
+iptables -I FORWARD -j ACCEPT 2>/dev/null || true
+  iptables -I FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
   iptables-save > /etc/iptables.up.rules
 
   # Ensure it restores on boot
@@ -610,7 +736,6 @@ if [ -n "$ETH" ]; then
 iptables-restore < /etc/iptables.up.rules
 EOF
   chmod +x /etc/network/if-pre-up.d/iptables
-fi
 
 # Enable required SSH forwarding features
 cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak 2>/dev/null || true
@@ -638,8 +763,10 @@ sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd
 sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
 if ! grep -q "^PasswordAuthentication yes" /etc/ssh/sshd_config; then echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config; fi
 
+sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
 sed -i 's/^#AllowTcpForwarding.*/AllowTcpForwarding yes/g' /etc/ssh/sshd_config
 sed -i 's/^#GatewayPorts.*/GatewayPorts yes/g' /etc/ssh/sshd_config
+if ! grep -q "^PermitRootLogin yes" /etc/ssh/sshd_config; then echo "PermitRootLogin yes" >> /etc/ssh/sshd_config; fi
 if ! grep -q "^AllowTcpForwarding yes" /etc/ssh/sshd_config; then echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config; fi
 if ! grep -q "^GatewayPorts yes" /etc/ssh/sshd_config; then echo "GatewayPorts yes" >> /etc/ssh/sshd_config; fi
 if ! grep -q "^TCPKeepAlive yes" /etc/ssh/sshd_config; then echo "TCPKeepAlive yes" >> /etc/ssh/sshd_config; fi
@@ -649,6 +776,7 @@ if [ -d /etc/ssh/sshd_config.d ]; then
   find /etc/ssh/sshd_config.d/ -type f -name "*.conf" -exec sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/g' {} + 2>/dev/null || true
   find /etc/ssh/sshd_config.d/ -type f -name "*.conf" -exec sed -i 's/^KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/g' {} + 2>/dev/null || true
   cat > /etc/ssh/sshd_config.d/99-unida.conf << 'EOF'
+PermitRootLogin yes
 PasswordAuthentication yes
 PubkeyAuthentication yes
 AllowTcpForwarding yes
@@ -667,22 +795,38 @@ EOF
   chmod 644 /etc/ssh/sshd_config.d/99-unida.conf 2>/dev/null || true
 fi
 
-systemctl restart sshd || systemctl restart ssh || true
+systemctl restart ssh.socket 2>/dev/null || true
+systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
 
 echo "==> Starting services..."
 systemctl daemon-reload
 systemctl enable --now dnstt-unida.service
 systemctl enable --now dnstt-unida-proxy.service
-if [ -f /etc/systemd/system/badvpn-udpgw.service ]; then
-  systemctl enable --now badvpn-udpgw.service
+if [ -f /etc/systemd/system/hev-socks5.service ]; then
+  systemctl enable --now hev-socks5.service
 fi
 
 if command -v ufw >/dev/null 2>&1; then
   ufw allow 22/tcp >/dev/null 2>&1 || true
   ufw allow 53/udp >/dev/null 2>&1 || true
   ufw allow ${PROXY_PORT}/udp >/dev/null 2>&1 || true
-  ufw allow 7300/tcp >/dev/null 2>&1 || true
   ufw reload >/dev/null 2>&1 || true
+fi
+
+# General IPTables rules for Oracle Cloud / strict firewalls
+iptables -I INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p udp --dport ${PROXY_PORT} -j ACCEPT 2>/dev/null || true
+iptables -I FORWARD -j ACCEPT 2>/dev/null || true
+iptables -I FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+iptables-save > /etc/iptables.up.rules 2>/dev/null || true
+
+# Firewalld support (CentOS/AlmaLinux/Oracle)
+if command -v firewall-cmd >/dev/null 2>&1; then
+  firewall-cmd --add-port=53/udp --permanent 2>/dev/null || true
+  firewall-cmd --add-port=53/tcp --permanent 2>/dev/null || true
+  firewall-cmd --add-port=${PROXY_PORT}/udp --permanent 2>/dev/null || true
+  firewall-cmd --reload 2>/dev/null || true
 fi
 
 IPV4=$(curl -s4 icanhazip.com || hostname -I | awk '{print $1}')
@@ -696,7 +840,7 @@ echo "Tunnel Domain    : ${TDOMAIN}"
 echo "MTU              : ${MTU}"
 echo "dnstt-server     : 127.0.0.1:${DNSTT_PORT}"
 echo "proxy public     : UDP :${PROXY_PORT}"
-echo "badvpn-udpgw     : 127.0.0.1:7300"
+echo "HEV SOCKS5       : 127.0.0.1:7300 (High Performance TCP+UDP)"
 echo ""
 echo "Public key:"
 cat /etc/dnstt/server.pub || true
@@ -704,5 +848,6 @@ echo ""
 echo "🔥 NEW: Use the 'unida' command to manage your server!"
 echo "    Add SSH user    : unida useradd username password"
 echo "    Check status    : unida status"
+echo "    Switch backend  : unida (Option 9: SSH or HEV SOCKS5)"
 echo "    See all commands: unida help"
 echo "==============================================="
