@@ -244,7 +244,7 @@ WantedBy=multi-user.target
 EOF
 fi
 
-echo "==> Configuring Dante SOCKS5 Server (Port 1080 with PAM/System User Auth for SlipNet)..."
+echo "==> Configuring Dante SOCKS5 Server (Port 1080 - No Auth for SlipNet Direct SOCKS5)..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y dante-server >/dev/null 2>&1 || true
 
 ETH=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5}' || ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
@@ -256,7 +256,7 @@ logoutput: /var/log/danted.log
 internal: 127.0.0.1 port = 1080
 external: ${ETH}
 
-socksmethod: username
+socksmethod: none
 clientmethod: none
 
 user.privileged: root
@@ -273,7 +273,7 @@ client pass {
 socks pass {
     from: 0.0.0.0/0 to: 0.0.0.0/0
     command: bind connect udpassociate
-    socksmethod: username
+    socksmethod: none
 }
 EOF
 
@@ -622,7 +622,7 @@ show_status() {
     echo "--- Smart Protocol Multiplexer (Port 2222: Auto Route) ---"
     systemctl status dnstt-unida-router.service --no-pager 2>/dev/null || true
     echo ""
-    echo "--- Dante SOCKS5 Status (Port 1080 for SlipNet User Auth) ---"
+    echo "--- Dante SOCKS5 Status (Port 1080 - No Auth for SlipNet) ---"
     systemctl status danted.service --no-pager 2>/dev/null || true
     echo ""
     echo "--- BadVPN UDPGW Status (Port 7300 for HTTP Custom UDP) ---"
@@ -729,7 +729,7 @@ switch_tunnel_mode() {
     elif grep -q "127.0.0.1:22" /etc/systemd/system/dnstt-unida.service 2>/dev/null; then
         echo "  --> Dedicated SSH Mode (Port 22) [HTTP Custom & SSH accounts]"
     elif grep -q "127.0.0.1:1080" /etc/systemd/system/dnstt-unida.service 2>/dev/null; then
-        echo "  --> Dedicated Dante SOCKS5 Mode (Port 1080) [SlipNet SOCKS5 Direct]"
+        echo "  --> Dedicated Dante SOCKS5 Mode (Port 1080) [SlipNet SOCKS5 Direct - No Auth]"
     else
         echo "  --> Custom Port"
     fi
@@ -737,7 +737,7 @@ switch_tunnel_mode() {
     echo "Options:"
     echo "  1) Auto-Detect Mode (Port 2222) - Recommended: Both SSH & SOCKS5 work together!"
     echo "  2) Dedicated SSH Mode (Port 22) - HTTP Custom, HTTP Injector, SSH apps"
-    echo "  3) Dedicated Dante SOCKS5 Mode (Port 1080) - Direct SOCKS5 with system user auth"
+    echo "  3) Dedicated Dante SOCKS5 Mode (Port 1080) - Direct SOCKS5 (No Auth)"
     echo "  0) Cancel"
     read -rp "Select mode: " mode_choice
 
@@ -1005,7 +1005,7 @@ echo "proxy public     : UDP :${PROXY_PORT}"
 echo "Tunnel Target    : 127.0.0.1:2222 (Auto-Detect Multiplexer)"
 echo "OpenSSH          : 127.0.0.1:22 (For HTTP Custom, HTTP Injector)"
 echo "BadVPN UDPGW     : 127.0.0.1:7300 (UDP Gateway for HTTP Custom / SSH Apps)"
-echo "Dante SOCKS5     : 127.0.0.1:1080 (For SlipNet / SOCKS5 Direct with User Auth)"
+echo "Dante SOCKS5     : 127.0.0.1:1080 (For SlipNet / SOCKS5 Direct - No Auth)"
 echo ""
 echo "Public key:"
 cat /etc/dnstt/server.pub || true
