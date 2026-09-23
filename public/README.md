@@ -6,9 +6,11 @@ A robust, automated installer for setting up a DNSTT (SlowDNS) tunnel server on 
 
 - **Instant Setup:** Downloads the core DNSTT server binary, creates systemd background services, and generates keys automatically.
 - **Advanced Networking:** Automatically configures IPv4 forwarding (`ip_forward`), `iptables` NAT Masquerading, and SSH port forwarding (`AllowTcpForwarding`, `GatewayPorts`) so that clients instantly have internet access without extra manual configuration.
-- **Ultra-Fast HEV SOCKS5 (TCP + Native UDP):** Replaces legacy BadVPN with the ultra-lightweight, high-performance `hev-socks5-server` (compiled in C with coroutines). Provides full TCP and native UDP support for gaming and VoIP at fraction of the CPU and memory footprint, with zero compilation overhead.
-- **Flexible Tunnel Modes:** Easily switch between SSH Mode (Port 22) for standard SSH account setups or HEV SOCKS5 Mode (Port 7300) for high-speed direct SOCKS5 tunneling without SSH encryption overhead.
-- **Port Collision Prevention:** Automatically stops conflicting services (like `bind9`, `dnsmasq`) and proactively kills any zombie processes blocking required ports (`53`, `5300`, `7300`) ensuring a clean setup.
+- **Dual UDP & High-Speed Architecture:** 
+  - **BadVPN UDPGW (Port 7300):** Provides UDP gateway support for SSH VPN apps like HTTP Custom, HTTP Injector, and NapsternetV so that UDP diagnostics pass, and VoIP (WhatsApp/Discord) and online gaming work flawlessly over SSH SlowDNS.
+  - **Ultra-Fast HEV SOCKS5 (Port 1080):** High-performance coroutine-based SOCKS5 server for direct, lightweight TCP+UDP tunneling without SSH encryption overhead.
+- **Flexible Tunnel Modes:** Easily switch between SSH Mode (Port 22 with BadVPN UDP on 7300) for standard VPN client accounts or HEV SOCKS5 Mode (Port 1080).
+- **Port Collision Prevention:** Automatically stops conflicting services (like `bind9`, `dnsmasq`) and proactively kills any zombie processes blocking required ports (`53`, `5300`, `1080`, `7300`) ensuring a clean setup.
 - **Smart Port Routing:** If you choose to run the EDNS proxy on a custom port, `iptables` rules will automatically route default port 53 traffic incoming from apps like HTTP Injector directly to your custom port, guaranteeing client compatibility.
 - **EDNS Proxy:** Includes an intelligent Python-based EDNS UDP size proxy (`512` <-> `1800`) to ensure DNS requests pass through strict firewalls and routers smoothly.
 - **Single-File Installer:** The installer script seamlessly embeds the management terminal tool, meaning you only need one script to install everything perfectly.
@@ -60,7 +62,7 @@ When you run `unida`, an interactive menu will appear with the following options
 6. **Restart DNSTT Services**: Instantly restart all background tunnel services.
 7. **Show Server Public Key**: Display the Server's Public Key (needed for your VPN client apps).
 8. **Change MTU Size**: Dynamically update the MTU size for both the tunnel and the proxy, and auto-restart services seamlessly.
-9. **Switch Tunnel Mode (SSH / HEV SOCKS5)**: Switch your DNS tunnel backend between SSH (Port 22) and HEV SOCKS5 (Port 7300).
+9. **Switch Tunnel Mode (SSH / HEV SOCKS5)**: Switch your DNS tunnel backend between SSH (Port 22) and HEV SOCKS5 (Port 1080).
 10. **Uninstall Unida Server**: Completely remove Unida DNSTT, the proxy, HEV SOCKS5, and all configurations from your server.
 0. **Exit**: Close the manager.
 

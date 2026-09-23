@@ -133,6 +133,8 @@ if command -v fuser >/dev/null 2>&1; then
   fuser -k 53/udp >/dev/null 2>&1 || true
   fuser -k 53/tcp >/dev/null 2>&1 || true
   fuser -k 5300/udp >/dev/null 2>&1 || true
+  fuser -k 1080/tcp >/dev/null 2>&1 || true
+  fuser -k 1080/udp >/dev/null 2>&1 || true
   fuser -k 7300/tcp >/dev/null 2>&1 || true
   fuser -k 7300/udp >/dev/null 2>&1 || true
 fi
@@ -140,6 +142,8 @@ if command -v lsof >/dev/null 2>&1; then
   kill -9 $(lsof -t -i udp:53) 2>/dev/null || true
   kill -9 $(lsof -t -i tcp:53) 2>/dev/null || true
   kill -9 $(lsof -t -i udp:5300) 2>/dev/null || true
+  kill -9 $(lsof -t -i tcp:1080) 2>/dev/null || true
+  kill -9 $(lsof -t -i udp:1080) 2>/dev/null || true
   kill -9 $(lsof -t -i tcp:7300) 2>/dev/null || true
   kill -9 $(lsof -t -i udp:7300) 2>/dev/null || true
 fi
@@ -169,7 +173,7 @@ fi
 
 echo "==> Installing packages..."
 apt-get update -y >/dev/null 2>&1
-DEBIAN_FRONTEND=noninteractive apt-get install -y curl python3 wget git openssh-server iptables net-tools lsof cron >/dev/null 2>&1 || true
+DEBIAN_FRONTEND=noninteractive apt-get install -y curl python3 wget git openssh-server iptables net-tools lsof cron cmake make gcc >/dev/null 2>&1 || true
 
 echo "==> Kupakua and Setting up HEV SOCKS5 Server (Ultra-low latency, TCP+UDP)..."
 ARCH=$(uname -m)
@@ -190,18 +194,62 @@ else
   echo "[-] Failed to download HEV SOCKS5 binary directly."
 fi
 
-# Clean up obsolete badvpn-udpgw or danted if present
-systemctl disable --now badvpn-udpgw.service danted.service 2>/dev/null || true
-rm -f /etc/systemd/system/badvpn-udpgw.service /usr/local/bin/badvpn-udpgw 2>/dev/null || true
+echo "==> Setting up BadVPN UDP Gateway (Port 7300 for HTTP Custom & SSH UDP Forwarding)..."
+if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
+  BADVPN_READY=false
+  if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
+    if curl -fsSL "https://raw.githubusercontent.com/daybreakersx/premscript/master/badvpn-udpgw64" -o /usr/local/bin/badvpn-udpgw 2>/dev/null; then
+      chmod +x /usr/local/bin/badvpn-udpgw
+      if /usr/local/bin/badvpn-udpgw --help >/dev/null 2>&1 || /usr/local/bin/badvpn-udpgw --version >/dev/null 2>&1; then
+        BADVPN_READY=true
+      fi
+    fi
+  fi
+  if [ "$BADVPN_READY" = false ]; then
+    echo "==> Compiling badvpn-udpgw from source..."
+    rm -rf /tmp/badvpn
+    if git clone --depth 1 https://github.com/ambrop72/badvpn.git /tmp/badvpn >/dev/null 2>&1; then
+      mkdir -p /tmp/badvpn/build
+      cd /tmp/badvpn/build
+      cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null 2>&1
+      make -j$(nproc 2>/dev/null || echo 1) >/dev/null 2>&1
+      if [ -f udpgw/badvpn-udpgw ]; then
+        cp udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
+        chmod +x /usr/local/bin/badvpn-udpgw
+      fi
+      cd - >/dev/null 2>&1
+      rm -rf /tmp/badvpn
+    fi
+  fi
+fi
+
+if [ -f /usr/local/bin/badvpn-udpgw ]; then
+  echo "==> Creating BadVPN UDPGW service (127.0.0.1:7300)..."
+  cat >/etc/systemd/system/badvpn-udpgw.service <<EOF
+[Unit]
+Description=BadVPN UDP Gateway (Port 7300 for HTTP Custom UDP)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 1000 --max-connections-for-client 500
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
 
 if [ -f /usr/local/bin/hev-socks5-server ]; then
   echo "==> Kuunda config /etc/hev/socks5.yml..."
   cat >/etc/hev/socks5.yml <<EOF
 main:
   workers: 4
-  port: 7300
+  port: 1080
   listen-address: '127.0.0.1'
-  udp-port: 7300
+  udp-port: 1080
   udp-listen-address: '127.0.0.1'
   listen-ipv6-only: false
 EOF
@@ -475,8 +523,11 @@ show_status() {
     echo "--- EDNS Proxy Status ---"
     systemctl status dnstt-unida-proxy.service --no-pager || true
     echo ""
-    echo "--- HEV SOCKS5 Status (TCP+UDP) ---"
+    echo "--- HEV SOCKS5 Status (Port 1080 TCP+UDP) ---"
     systemctl status hev-socks5.service --no-pager 2>/dev/null || true
+    echo ""
+    echo "--- BadVPN UDPGW Status (Port 7300 for HTTP Custom UDP) ---"
+    systemctl status badvpn-udpgw.service --no-pager 2>/dev/null || true
     pause
 }
 
@@ -486,12 +537,14 @@ view_logs() {
     echo "1) Main Tunnel Logs"
     echo "2) EDNS Proxy Logs"
     echo "3) HEV SOCKS5 Server Logs"
+    echo "4) BadVPN UDPGW Logs (HTTP Custom UDP)"
     echo "0) Back"
     read -rp "Select option: " log_choice
     case $log_choice in
         1) journalctl -u dnstt-unida.service -f ;;
         2) journalctl -u dnstt-unida-proxy.service -f ;;
         3) journalctl -u hev-socks5.service -f ;;
+        4) journalctl -u badvpn-udpgw.service -f ;;
         0) return ;;
         *) echo "Invalid option." ;;
     esac
@@ -500,7 +553,7 @@ view_logs() {
 restart_services() {
     header
     echo "[+] Restarting services..."
-    systemctl restart dnstt-unida.service dnstt-unida-proxy.service hev-socks5.service 2>/dev/null || true
+    systemctl restart dnstt-unida.service dnstt-unida-proxy.service hev-socks5.service badvpn-udpgw.service 2>/dev/null || true
     echo "[+] Services restarted successfully."
     pause
 }
@@ -565,15 +618,15 @@ switch_tunnel_mode() {
     echo "Currently, your DNSTT tunnel connects clients to:"
     if grep -q "127.0.0.1:22" /etc/systemd/system/dnstt-unida.service 2>/dev/null; then
         echo "  --> SSH (Port 22) [SSH Accounts]"
-    elif grep -q "127.0.0.1:7300" /etc/systemd/system/dnstt-unida.service 2>/dev/null; then
-        echo "  --> HEV SOCKS5 (Port 7300) [High-Performance TCP + Native UDP]"
+    elif grep -q "127.0.0.1:1080" /etc/systemd/system/dnstt-unida.service 2>/dev/null; then
+        echo "  --> HEV SOCKS5 (Port 1080) [High-Performance TCP + Native UDP]"
     else
         echo "  --> Custom Port"
     fi
     echo ""
     echo "Options:"
     echo "  1) Use SSH Mode (Port 22)"
-    echo "  2) Use HEV SOCKS5 Mode (Port 7300) - Blazing Fast (No SSH Overhead, Native UDP)"
+    echo "  2) Use HEV SOCKS5 Mode (Port 1080) - Blazing Fast (No SSH Overhead, Native UDP)"
     echo "  0) Cancel"
     read -rp "Select mode: " mode_choice
 
@@ -603,10 +656,10 @@ switch_tunnel_mode() {
                     sed -i "s/-udp 127\.0\.0\.1:[0-9]*/-udp 127.0.0.1:$PROXY_TARGET/" /etc/systemd/system/dnstt-unida.service
                 fi
             fi
-            sed -i 's/ 127\.0\.0\.1:[0-9]* *$/ 127.0.0.1:7300/' /etc/systemd/system/dnstt-unida.service
+            sed -i 's/ 127\.0\.0\.1:[0-9]* *$/ 127.0.0.1:1080/' /etc/systemd/system/dnstt-unida.service
             systemctl daemon-reload
             systemctl restart dnstt-unida.service 2>/dev/null || true
-            echo "[+] Switched to HEV SOCKS5 Mode (Port 7300)."
+            echo "[+] Switched to HEV SOCKS5 Mode (Port 1080)."
             pause
             ;;
         0) return ;;
@@ -805,6 +858,9 @@ systemctl enable --now dnstt-unida-proxy.service
 if [ -f /etc/systemd/system/hev-socks5.service ]; then
   systemctl enable --now hev-socks5.service
 fi
+if [ -f /etc/systemd/system/badvpn-udpgw.service ]; then
+  systemctl enable --now badvpn-udpgw.service
+fi
 
 if command -v ufw >/dev/null 2>&1; then
   ufw allow 22/tcp >/dev/null 2>&1 || true
@@ -840,7 +896,8 @@ echo "Tunnel Domain    : ${TDOMAIN}"
 echo "MTU              : ${MTU}"
 echo "dnstt-server     : 127.0.0.1:${DNSTT_PORT}"
 echo "proxy public     : UDP :${PROXY_PORT}"
-echo "HEV SOCKS5       : 127.0.0.1:7300 (High Performance TCP+UDP)"
+echo "HEV SOCKS5       : 127.0.0.1:1080 (High Performance TCP+UDP)"
+echo "BadVPN UDPGW     : 127.0.0.1:7300 (UDP Gateway for HTTP Custom / SSH Apps)"
 echo ""
 echo "Public key:"
 cat /etc/dnstt/server.pub || true
