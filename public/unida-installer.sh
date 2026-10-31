@@ -280,6 +280,25 @@ EOF
 systemctl enable danted.service >/dev/null 2>&1 || true
 systemctl restart danted.service >/dev/null 2>&1 || true
 
+echo "==> Configuring Stunnel4 for SSL/TLS on Port 443..."
+DEBIAN_FRONTEND=noninteractive apt-get install -y stunnel4 >/dev/null 2>&1 || true
+cat >/etc/stunnel/stunnel.conf <<EOF
+pid = /var/run/stunnel4/stunnel.pid
+output = /var/log/stunnel4/stunnel.log
+foreground = no
+[unida-ssl]
+accept = 443
+connect = 127.0.0.1:2222
+cert = /etc/stunnel/stunnel.pem
+EOF
+# Generate self-signed cert if missing
+if [ ! -f /etc/stunnel/stunnel.pem ]; then
+    openssl req -new -x509 -days 365 -nodes -out /etc/stunnel/stunnel.pem -keyout /etc/stunnel/stunnel.pem -subj "/CN=unida-ssl" >/dev/null 2>&1
+    chmod 600 /etc/stunnel/stunnel.pem
+fi
+systemctl enable stunnel4.service >/dev/null 2>&1 || true
+systemctl restart stunnel4.service >/dev/null 2>&1 || true
+
 echo "==> Configuring DNSTT Smart Protocol Multiplexer (Port 2222: Auto Route SSH & SOCKS5)..."
 cat >/usr/local/bin/dnstt-multiplexer.py <<'EOF_MUX'
 #!/usr/bin/env python3
@@ -627,6 +646,9 @@ show_status() {
     echo ""
     echo "--- BadVPN UDPGW Status (Port 7300 for HTTP Custom UDP) ---"
     systemctl status badvpn-udpgw.service --no-pager 2>/dev/null || true
+    echo ""
+    echo "--- Stunnel4 Status (SSL/TLS on Port 443) ---"
+    systemctl status stunnel4.service --no-pager 2>/dev/null || true
     pause
 }
 
@@ -1006,6 +1028,7 @@ echo "Tunnel Target    : 127.0.0.1:2222 (Auto-Detect Multiplexer)"
 echo "OpenSSH          : 127.0.0.1:22 (For HTTP Custom, HTTP Injector)"
 echo "BadVPN UDPGW     : 127.0.0.1:7300 (UDP Gateway for HTTP Custom / SSH Apps)"
 echo "Dante SOCKS5     : 127.0.0.1:1080 (For SlipNet / SOCKS5 Direct - No Auth)"
+echo "Stunnel4 SSL/TLS : 0.0.0.0:443 -> 127.0.0.1:2222 (HTTPS Obfuscation)"
 echo ""
 echo "Public key:"
 cat /etc/dnstt/server.pub || true
